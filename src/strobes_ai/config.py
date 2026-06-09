@@ -76,16 +76,18 @@ class Profile:
 
     @property
     def api_prefix(self) -> str:
-        """REST/GraphQL path prefix based on deployment mode.
+        """REST path prefix.
 
-        SaaS/MSSP mounts under ``/v1/``; enterprise under ``/api/v1/``.
-        (Matches strobes/urls.py.)
+        Real Strobes deployments are fronted by nginx/ALB and expose the API
+        under ``/api/v1`` — the default, so nothing needs to be set. Use
+        ``deployment=direct`` only when hitting the Django app directly (bare
+        ``/v1``).
         """
-        return "/api/v1" if self.deployment == "enterprise" else "/v1"
+        return "/v1" if self.deployment in ("direct", "v1") else "/api/v1"
 
     @property
     def graphql_path(self) -> str:
-        return "/api/graphql/" if self.deployment == "enterprise" else "/v1/graphql/"
+        return "/graphql/" if self.deployment in ("direct", "v1") else "/api/graphql/"
 
 
 @dataclass

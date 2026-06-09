@@ -45,11 +45,12 @@ environment overrides:
 export STROBES_AI_BASE_URL=https://app.strobes.co     # your deployment
 export STROBES_AI_ORG_ID=<ORG_UUID>
 export STROBES_AI_MASTER_KEY=<40-char-hex-key>
-export STROBES_AI_DEPLOYMENT=enterprise               # 'saas' or 'enterprise'
 ```
 
-> `deployment` controls the REST/GraphQL path prefix. Behind an nginx-fronted
-> deployment that strips a `/api` prefix, use `enterprise` (gives `/api/v1`).
+> The API path prefix defaults to `/api/v1`, which is what nginx/ALB-fronted
+> Strobes deployments expose — so you normally don't set anything else. Only if
+> you hit the Django app **directly** (no proxy) set `STROBES_AI_DEPLOYMENT=direct`
+> for the bare `/v1`.
 
 ---
 

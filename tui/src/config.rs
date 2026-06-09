@@ -40,14 +40,14 @@ impl Profile {
         !self.base_url.is_empty() && !self.org_id.is_empty() && !self.master_key.is_empty()
     }
 
-    /// REST/GraphQL path prefix. SaaS mounts under `/v1`, enterprise under
-    /// `/api/v1` (which is also what an nginx-fronted deployment needs, since
-    /// nginx strips the external `/api` prefix).
+    /// REST path prefix. Real Strobes deployments are fronted by nginx/ALB and
+    /// expose the API under `/api/v1` — so that's the default and you don't need
+    /// to set anything. Use `deployment=direct` only when hitting the Django app
+    /// directly (no proxy), which serves at the bare `/v1`.
     pub fn api_prefix(&self) -> &'static str {
-        if self.deployment == "enterprise" {
-            "/api/v1"
-        } else {
-            "/v1"
+        match self.deployment.as_str() {
+            "direct" | "v1" => "/v1",
+            _ => "/api/v1",
         }
     }
 
