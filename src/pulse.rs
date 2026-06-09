@@ -49,6 +49,10 @@ pub enum AppEvent {
     Interrupt { id: String, title: String, message: String, fields: Vec<Field> },
     /// A non-error informational line (e.g. background workspace sync progress).
     Notice(String),
+    /// Credit/token usage. `final_run=false` is a live per-call delta
+    /// (`credit.update`); `final_run=true` is the authoritative run total
+    /// (from `run.completed` metrics).
+    Credits { credits: f64, tokens: i64, final_run: bool },
     Error(String),
 }
 
@@ -344,11 +348,21 @@ fn handle_frame(v: Value, app_tx: &mpsc::UnboundedSender<AppEvent>, out_tx: &mps
         return;
     }
 
+    // Credit/token usage (live per-call deltas).
+    let sub = sval(&b, "type");
+    if etype == "credit.update" || sub.as_deref() == Some("credit.update") {
+        let credits = b.get("credits_used").and_then(|x| x.as_f64()).unwrap_or(0.0);
+        let it = b.get("input_tokens").and_then(|x| x.as_i64()).unwrap_or(0);
+        let ot = b.get("output_tokens").and_then(|x| x.as_i64()).unwrap_or(0);
+        let _ = app_tx.send(AppEvent::Credits { credits, tokens: it + ot, final_run: false });
+        return;
+    }
+
     // Run lifecycle → finished.
     let terminal = etype == "run.completed"
         || etype == "run.failed"
         || (etype == "system"
-            && matches!(sval(&b, "type").as_deref(), Some("run.completed") | Some("run.failed")));
+            && matches!(sub.as_deref(), Some("run.completed") | Some("run.failed")));
 
     let item = match etype {
         "token" => Some(StreamItem {
@@ -411,6 +425,14 @@ fn handle_frame(v: Value, app_tx: &mpsc::UnboundedSender<AppEvent>, out_tx: &mps
         let _ = app_tx.send(AppEvent::Stream(it));
     }
     if terminal {
+        // Authoritative run total from metrics (if present).
+        if let Some(m) = b.get("metrics").filter(|m| m.is_object()) {
+            let credits = m.get("credits_used").and_then(|x| x.as_f64()).unwrap_or(0.0);
+            let tokens = m.get("total_tokens").and_then(|x| x.as_i64()).unwrap_or(0);
+            if credits > 0.0 || tokens > 0 {
+                let _ = app_tx.send(AppEvent::Credits { credits, tokens, final_run: true });
+            }
+        }
         let label = if etype.ends_with("failed") || sval(&b, "type").as_deref() == Some("run.failed") {
             format!("failed: {}", sval(&b, "error").unwrap_or_default())
         } else {

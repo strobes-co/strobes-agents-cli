@@ -85,6 +85,13 @@ that workspace's files into a local sandbox so the agent's `workspace_get_meta` 
 Model picker ids: `4` Haiku 4.5 · `18` Sonnet 4.6 · `21` Opus 4.7 (Bedrock), or
 your org's BYOM id.
 
+### Credits & tokens
+
+The status bar shows **AI credits + token usage**: the current run's usage while
+it streams (`◈ 0.036 cr · 1.8k tok`), and the **session total** (`◈ Σ …`) once
+idle — accumulated from the backend's `credit.update` events and the
+`run.completed` metrics.
+
 ## How it maps to the backend
 
 | CLI piece | Backend counterpart |

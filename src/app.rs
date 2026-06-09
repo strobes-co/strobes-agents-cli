@@ -89,6 +89,10 @@ pub struct App {
     pub has_workspace: bool,
     slash_commands: Vec<crate::api::SlashCmd>,
     slash_sel: usize,
+    run_credits: f64,
+    run_tokens: i64,
+    session_credits: f64,
+    session_tokens: i64,
 }
 
 impl App {
@@ -115,6 +119,10 @@ impl App {
             has_workspace: false,
             slash_commands: Vec::new(),
             slash_sel: 0,
+            run_credits: 0.0,
+            run_tokens: 0,
+            session_credits: 0.0,
+            session_tokens: 0,
         };
         app.sys("Strobes Agents AI — Ratatui client");
         app.sys("Enter: send · Ctrl-C: cancel/quit · Esc: quit · PgUp/PgDn: scroll · Ctrl-T: thinking · Ctrl-R: markdown");
@@ -238,6 +246,22 @@ impl App {
             AppEvent::RunStarted => {
                 self.running = true;
                 self.status = "running…".into();
+                self.run_credits = 0.0;
+                self.run_tokens = 0;
+            }
+            AppEvent::Credits { credits, tokens, final_run } => {
+                if final_run {
+                    // Authoritative run total → fold into the session and show
+                    // it as the run's figure.
+                    self.session_credits += credits;
+                    self.session_tokens += tokens;
+                    self.run_credits = credits;
+                    self.run_tokens = tokens;
+                } else {
+                    // Live per-call delta.
+                    self.run_credits += credits;
+                    self.run_tokens += tokens;
+                }
             }
             AppEvent::RunFinished(label) => {
                 self.running = false;
@@ -642,8 +666,17 @@ impl App {
         } else {
             truncate(&self.title, 48)
         };
+        // Credits: show the current run's usage while running, else the
+        // session total.
+        let credits = if self.running && self.run_credits > 0.0 {
+            format!("◈ {:.3} cr · {}", self.run_credits, fmt_tokens(self.run_tokens))
+        } else if self.session_credits > 0.0 {
+            format!("◈ Σ {:.3} cr · {}", self.session_credits, fmt_tokens(self.session_tokens))
+        } else {
+            String::new()
+        };
         let mut text = format!(
-            " {dot} {chat}  ·  {}  ·  md:{}  think:{}",
+            " {dot} {chat}  ·  {}  ·  {credits}  ·  md:{}  think:{}",
             self.status,
             if self.markdown { "on" } else { "off" },
             if self.show_thinking { "on" } else { "off" },
@@ -1024,6 +1057,14 @@ fn md_to_owned(md: &str) -> Vec<Line<'static>> {
 
 fn short(id: &str) -> String {
     if id.len() > 8 { format!("{}…", &id[..8]) } else { id.to_string() }
+}
+
+fn fmt_tokens(t: i64) -> String {
+    if t >= 1000 {
+        format!("{:.1}k tok", t as f64 / 1000.0)
+    } else {
+        format!("{t} tok")
+    }
 }
 
 fn truncate(s: &str, n: usize) -> String {

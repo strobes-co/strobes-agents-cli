@@ -402,6 +402,7 @@ fn describe(ev: &pulse::AppEvent) -> String {
         RunStarted => "run started".into(),
         RunFinished(l) => format!("run finished: {l}"),
         Notice(n) => format!("notice: {n}"),
+        Credits { credits, tokens, final_run } => format!("credits {credits:.4} tokens {tokens} final={final_run}"),
         Error(e) => format!("error: {e}"),
         LocalToolDone { name, ms, exit, err } => {
             format!("local tool {name} done {ms}ms exit={exit:?} err={err:?}")
