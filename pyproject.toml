@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "strobes-ai-cli"
+version = "0.1.0"
+description = "Strobes Agents AI — a local, terminal-native client for remote Strobes workspaces (a Claude-Code-style CLI)."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Proprietary" }
+authors = [{ name = "Strobes Security" }]
+keywords = ["strobes", "pentest", "ai", "agents", "cli", "security"]
+
+dependencies = [
+    "typer>=0.12",
+    "rich>=13.7",
+    "prompt_toolkit>=3.0.43",
+    "httpx>=0.27",
+    "websockets>=12.0",
+    "platformdirs>=4.0",
+]
+
+[project.optional-dependencies]
+# Browser bridge needs Playwright. Kept optional so the chat/shell core
+# stays light. Install with:  pip install 'strobes-ai-cli[browser]'
+browser = ["playwright>=1.44"]
+# Nicer local PTY handling on POSIX. stdlib pty works without it.
+pty = ["ptyprocess>=0.7"]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "ruff>=0.5"]
+
+[project.scripts]
+strobes-ai = "strobes_ai.cli:main"
+strobes-ai-bridge = "strobes_ai.bridges.supervisor:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+strobes_ai = ["py.typed"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"

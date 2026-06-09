@@ -1,0 +1,28 @@
+# Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Rust
+/tui/target/
+tui/target/
+
+# Local config / secrets (the CLI stores the MasterKey under the user's
+# config dir, never in the repo — but ignore any stray copies just in case)
+config.json
+*.env
+.env
+
+# OS / editor
+.DS_Store
+*.swp
+*~
+.idea/
+.vscode/

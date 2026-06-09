@@ -1,0 +1,421 @@
+//! Pulse chat WebSocket client.
+//!
+//! Connects to `ws/<org>/pulse/<thread>/?api_key=` and speaks the PulseConsumer
+//! protocol. The consumer forwards FLAT StreamEvents (top-level `type`, fields
+//! in `data` for ephemeral events or `payload` for persisted ones) — there is
+//! no `pulse_event` wrapper on the client side. When the session is CLI_LOCAL
+//! (`context.client_type == "cli"`), the backend emits `tool.local_execute`
+//! events instead of running code in the cloud; we run them locally and reply
+//! with `tool.local_result`, making this machine the sandbox.
+
+use anyhow::Result;
+use futures_util::{SinkExt, StreamExt};
+use serde_json::{json, Value};
+use tokio::sync::mpsc;
+use tokio_tungstenite::tungstenite::Message;
+
+use crate::config::Profile;
+use crate::local;
+
+/// A normalized, render-ready item derived from a StreamEvent.
+#[derive(Debug, Clone)]
+pub struct StreamItem {
+    pub kind: String, // token | thinking | tool_start | tool_output | tool_failed | task | system | approval | interrupt | note
+    pub agent: Option<String>,
+    pub text: Option<String>,
+    pub tool_name: Option<String>,
+    pub detail: Option<String>,
+    pub status: Option<String>,
+    pub local: bool,
+}
+
+/// A single form field requested by `request_human_input`.
+#[derive(Debug, Clone)]
+pub struct Field {
+    pub key: String,
+    pub label: String,
+    pub ftype: String, // text | password | number | select | textarea | checkbox | ...
+}
+
+#[derive(Debug, Clone)]
+pub enum AppEvent {
+    Connected,
+    Disconnected(String),
+    Stream(StreamItem),
+    RunStarted,
+    RunFinished(String), // "completed" | "failed: ..."
+    LocalToolDone { name: String, ms: u128, exit: Option<i32>, err: Option<String> },
+    /// The agent called `request_human_input` and is blocked awaiting a reply.
+    Interrupt { id: String, title: String, message: String, fields: Vec<Field> },
+    /// A non-error informational line (e.g. background workspace sync progress).
+    Notice(String),
+    Error(String),
+}
+
+/// Handle used by the UI to send frames to the server.
+#[derive(Clone)]
+pub struct PulseHandle {
+    out: mpsc::UnboundedSender<String>,
+    workspace_id: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    llm_model: Option<i64>,
+}
+
+impl PulseHandle {
+    /// Bind/rebind the workspace used in the send context (mid-session).
+    pub fn set_workspace(&self, id: Option<String>) {
+        if let Ok(mut w) = self.workspace_id.lock() {
+            *w = id;
+        }
+    }
+
+    pub fn send_user_message(&self, text: &str) {
+        let mut ctx = json!({ "client_type": "cli" });
+        if let Some(ws) = self.workspace_id.lock().ok().and_then(|w| w.clone()) {
+            ctx["workspace_id"] = json!(ws);
+        }
+        if let Some(m) = self.llm_model {
+            ctx["llm_model"] = json!(m);
+        }
+        let frame = json!({ "type": "send_message", "text": text, "context": ctx });
+        let _ = self.out.send(frame.to_string());
+    }
+
+    pub fn cancel(&self) {
+        let _ = self.out.send(json!({ "type": "run.cancel" }).to_string());
+    }
+
+    /// Answer a `request_human_input` interrupt.
+    pub fn respond_interrupt(&self, interrupt_id: &str, response: Value) {
+        let frame = json!({
+            "type": "interrupt.response",
+            "interrupt_id": interrupt_id,
+            "response_data": response,
+        });
+        let _ = self.out.send(frame.to_string());
+    }
+}
+
+/// Connect and spawn the read/write tasks. Returns a handle for the UI.
+pub async fn connect(
+    profile: &Profile,
+    thread_id: &str,
+    app_tx: mpsc::UnboundedSender<AppEvent>,
+    llm_model: Option<i64>,
+) -> Result<PulseHandle> {
+    let url = profile.pulse_ws_url(thread_id)?;
+    let (ws_stream, _resp) = tokio_tungstenite::connect_async(&url).await?;
+    let (mut write, mut read) = ws_stream.split();
+
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
+
+    // Writer task: drain frames to the socket.
+    tokio::spawn(async move {
+        while let Some(frame) = out_rx.recv().await {
+            if write.send(Message::Text(frame)).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // Periodic ping to keep the connection warm.
+    {
+        let ping_tx = out_tx.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                if ping_tx.send(json!({ "type": "ping" }).to_string()).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+
+    // Reader task: parse frames and translate to AppEvents.
+    {
+        let out_tx = out_tx.clone();
+        let app_tx = app_tx.clone();
+        tokio::spawn(async move {
+            let _ = app_tx.send(AppEvent::Connected);
+            while let Some(msg) = read.next().await {
+                match msg {
+                    Ok(Message::Text(txt)) => {
+                        if let Ok(v) = serde_json::from_str::<Value>(&txt) {
+                            handle_frame(v, &app_tx, &out_tx);
+                        }
+                    }
+                    Ok(Message::Close(_)) | Err(_) => break,
+                    _ => {}
+                }
+            }
+            let _ = app_tx.send(AppEvent::Disconnected("connection closed".into()));
+        });
+    }
+
+    Ok(PulseHandle {
+        out: out_tx,
+        workspace_id: std::sync::Arc::new(std::sync::Mutex::new(profile.workspace_id.clone())),
+        llm_model,
+    })
+}
+
+/// Structured fields live in `data` (ephemeral) or `payload` (persisted).
+fn blob(ev: &Value) -> Value {
+    if ev.get("data").map(|d| d.is_object()).unwrap_or(false) {
+        ev["data"].clone()
+    } else if ev.get("payload").map(|d| d.is_object()).unwrap_or(false) {
+        ev["payload"].clone()
+    } else {
+        json!({})
+    }
+}
+
+fn sval(v: &Value, key: &str) -> Option<String> {
+    v.get(key).and_then(|x| x.as_str()).map(|s| s.to_string())
+}
+
+/// A concise, human-readable summary of a tool's arguments for the call line.
+fn concise_args(tool: &str, v: &Value) -> String {
+    let pick = |k: &str| v.get(k).and_then(|x| x.as_str()).map(|s| s.to_string());
+    let chosen = match tool {
+        "execute_command" => pick("command"),
+        "execute_code" => {
+            let lang = pick("language").unwrap_or_else(|| "python".into());
+            pick("code").map(|c| format!("{lang}: {c}"))
+        }
+        t if t.starts_with("browser_") => pick("url").or_else(|| pick("selector")).or_else(|| pick("script")),
+        "spawn_subagent" => pick("agent_id").or_else(|| pick("task")),
+        _ => None,
+    };
+    let s = chosen.unwrap_or_else(|| {
+        if v.is_null() || (v.is_object() && v.as_object().map(|o| o.is_empty()).unwrap_or(false)) {
+            String::new()
+        } else {
+            v.to_string()
+        }
+    });
+    let s = s.replace('\n', " ");
+    if s.chars().count() > 120 {
+        format!("{}…", s.chars().take(120).collect::<String>())
+    } else {
+        s
+    }
+}
+
+fn compact(v: &Value, limit: usize) -> String {
+    let s = match v {
+        Value::String(s) => s.clone(),
+        Value::Null => String::new(),
+        other => other.to_string(),
+    };
+    let s = s.replace('\n', " ");
+    if s.chars().count() > limit {
+        let mut t: String = s.chars().take(limit).collect();
+        t.push('…');
+        t
+    } else {
+        s
+    }
+}
+
+fn handle_frame(v: Value, app_tx: &mpsc::UnboundedSender<AppEvent>, out_tx: &mpsc::UnboundedSender<String>) {
+    let mtype = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+    match mtype {
+        "message_sent" => {
+            let queued = v.get("queued").and_then(|q| q.as_bool()).unwrap_or(false);
+            if queued {
+                let _ = app_tx.send(AppEvent::Stream(StreamItem {
+                    kind: "note".into(), agent: None,
+                    text: Some("queued — will be injected after the current turn".into()),
+                    tool_name: None, detail: None, status: None, local: false,
+                }));
+            } else {
+                let _ = app_tx.send(AppEvent::RunStarted);
+            }
+            return;
+        }
+        "pong" => return,
+        "error" => {
+            let detail = sval(&v, "detail")
+                .or_else(|| sval(&v, "error"))
+                .or_else(|| sval(&v, "reason"))
+                .unwrap_or_else(|| v.to_string());
+            let _ = app_tx.send(AppEvent::Error(detail));
+            let _ = app_tx.send(AppEvent::RunFinished("failed".into()));
+            return;
+        }
+        "pulse_event" => {
+            // Defensive: handle a wrapped form too.
+            let inner = v.get("data").or_else(|| v.get("event")).cloned().unwrap_or(Value::Null);
+            if inner.is_object() {
+                return handle_frame(inner, app_tx, out_tx);
+            }
+            return;
+        }
+        _ => {}
+    }
+
+    // Otherwise this frame IS a flat StreamEvent.
+    let etype = mtype;
+    let b = blob(&v);
+    let status = sval(&b, "status");
+    let agent = sval(&v, "agentName");
+
+    // CLI_LOCAL tool execution.
+    if etype == "tool" && status.as_deref() == Some("local_execute") {
+        let tool_name = sval(&b, "toolName").unwrap_or_default();
+        let request_id = sval(&b, "requestId").unwrap_or_default();
+        let input = b.get("input").cloned().unwrap_or(json!({}));
+        let arg_summary = concise_args(&tool_name, &input);
+        let _ = app_tx.send(AppEvent::Stream(StreamItem {
+            kind: "tool_start".into(),
+            agent,
+            text: None,
+            tool_name: Some(tool_name.clone()),
+            detail: Some(arg_summary),
+            status: Some("local_execute".into()),
+            local: true,
+        }));
+        let app_tx = app_tx.clone();
+        let out_tx = out_tx.clone();
+        tokio::spawn(async move {
+            let start = std::time::Instant::now();
+            let res = local::run_tool(&tool_name, &input).await;
+            let ms = start.elapsed().as_millis();
+            let frame = if let Some(err) = &res.error {
+                json!({ "type": "tool.local_error", "payload": {
+                    "request_id": request_id, "tool_name": tool_name,
+                    "error": err, "error_type": "Error" }})
+            } else {
+                json!({ "type": "tool.local_result", "payload": {
+                    "request_id": request_id, "tool_name": tool_name,
+                    "output": res.output, "exit_code": res.exit_code, "duration_ms": ms }})
+            };
+            let _ = out_tx.send(frame.to_string());
+            let _ = app_tx.send(AppEvent::LocalToolDone {
+                name: tool_name, ms, exit: res.exit_code, err: res.error,
+            });
+        });
+        return;
+    }
+
+    // Blocking approval — auto-approve in the TUI (configurable later).
+    if etype == "approval" && status.as_deref() == Some("requested") {
+        let approval_id = sval(&b, "approvalId").or_else(|| sval(&b, "approval_id")).unwrap_or_default();
+        let _ = out_tx.send(
+            json!({ "type": "approval.response", "approval_id": approval_id, "decision": "approved" })
+                .to_string(),
+        );
+        let _ = app_tx.send(AppEvent::Stream(StreamItem {
+            kind: "approval".into(), agent, text: sval(&b, "preview"),
+            tool_name: None, detail: sval(&b, "module"), status: Some("requested".into()), local: false,
+        }));
+        return;
+    }
+
+    // request_human_input → blocking interrupt.
+    if etype == "interrupt" {
+        match status.as_deref() {
+            Some("requested") => {
+                let id = sval(&b, "interruptId").or_else(|| sval(&b, "interrupt_id")).unwrap_or_default();
+                let title = sval(&b, "title").unwrap_or_else(|| "Input requested".into());
+                let message = sval(&b, "message").unwrap_or_default();
+                let mut fields = Vec::new();
+                if let Some(fs) = b.get("formSchema").and_then(|x| x.get("fields")).and_then(|x| x.as_array()) {
+                    for f in fs {
+                        let key = sval(f, "key").unwrap_or_else(|| "value".into());
+                        let label = sval(f, "label").unwrap_or_else(|| key.clone());
+                        let ftype = sval(f, "type").unwrap_or_else(|| "text".into());
+                        fields.push(Field { key, label, ftype });
+                    }
+                }
+                if fields.is_empty() {
+                    fields.push(Field { key: "value".into(), label: "response".into(), ftype: "text".into() });
+                }
+                let _ = app_tx.send(AppEvent::Interrupt { id, title, message, fields });
+            }
+            Some(other) => {
+                let _ = app_tx.send(AppEvent::Stream(StreamItem {
+                    kind: "note".into(), agent: None, text: Some(format!("interrupt {other}")),
+                    tool_name: None, detail: None, status: None, local: false,
+                }));
+            }
+            None => {}
+        }
+        return;
+    }
+
+    // Run lifecycle → finished.
+    let terminal = etype == "run.completed"
+        || etype == "run.failed"
+        || (etype == "system"
+            && matches!(sval(&b, "type").as_deref(), Some("run.completed") | Some("run.failed")));
+
+    let item = match etype {
+        "token" => Some(StreamItem {
+            kind: "token".into(), agent,
+            text: sval(&v, "content").or_else(|| sval(&b, "text")).or_else(|| sval(&b, "content")),
+            tool_name: None, detail: None, status: None, local: false,
+        }),
+        "thinking" => Some(StreamItem {
+            kind: "thinking".into(), agent,
+            text: sval(&v, "content").or_else(|| sval(&b, "text")).or_else(|| sval(&b, "content")),
+            tool_name: None, detail: None, status: None, local: false,
+        }),
+        "tool" => {
+            let name = sval(&b, "toolName");
+            match status.as_deref() {
+                Some("start") => {
+                    let detail = concise_args(name.as_deref().unwrap_or(""), b.get("arguments").unwrap_or(&Value::Null));
+                    Some(StreamItem {
+                        kind: "tool_start".into(), agent, text: None, tool_name: name,
+                        detail: Some(detail), status: Some("start".into()), local: false,
+                    })
+                }
+                Some("output") => Some(StreamItem {
+                    kind: "tool_output".into(), agent, text: None, tool_name: name,
+                    detail: Some(compact(b.get("result").unwrap_or(&Value::Null), 600)),
+                    status: b.get("durationMs").map(|d| format!("{d}ms")), local: false,
+                }),
+                Some("failed") => Some(StreamItem {
+                    kind: "tool_failed".into(), agent, text: None, tool_name: name,
+                    detail: sval(&b, "error"), status: Some("failed".into()), local: false,
+                }),
+                _ => None,
+            }
+        }
+        "task" => Some(StreamItem {
+            kind: "task".into(), agent,
+            text: sval(&b, "title").or_else(|| sval(&b, "taskId")),
+            tool_name: None, detail: sval(&b, "error"), status: sval(&b, "status"), local: false,
+        }),
+        "artifact" => Some(StreamItem {
+            kind: "note".into(), agent,
+            text: Some(format!("artifact {}: {}", sval(&b, "status").unwrap_or_default(), sval(&b, "name").unwrap_or_default())),
+            tool_name: None, detail: sval(&b, "downloadUrl"), status: None, local: false,
+        }),
+        "system" => {
+            let kind = sval(&b, "type").unwrap_or_default();
+            Some(StreamItem {
+                kind: "system".into(), agent, text: Some(kind),
+                tool_name: None, detail: None, status: None, local: false,
+            })
+        }
+        s if s.starts_with("run.") => Some(StreamItem {
+            kind: "system".into(), agent, text: Some(s.to_string()),
+            tool_name: None, detail: None, status: None, local: false,
+        }),
+        _ => None,
+    };
+
+    if let Some(it) = item {
+        let _ = app_tx.send(AppEvent::Stream(it));
+    }
+    if terminal {
+        let label = if etype.ends_with("failed") || sval(&b, "type").as_deref() == Some("run.failed") {
+            format!("failed: {}", sval(&b, "error").unwrap_or_default())
+        } else {
+            "completed".into()
+        };
+        let _ = app_tx.send(AppEvent::RunFinished(label));
+    }
+}
