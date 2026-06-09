@@ -1,4 +1,4 @@
-//! `strobes-tui` — a Ratatui terminal client for Strobes Agents AI.
+//! `strobes` — a Ratatui terminal client for Strobes Agents AI.
 //!
 //! Reuses the same `~/.config/strobes-ai/config.json` as the Python CLI, so
 //! `strobes-ai login` configures this client too. The `chat` subcommand opens
@@ -29,7 +29,7 @@ use app::App;
 use config::Config;
 
 #[derive(Parser)]
-#[command(name = "strobes-tui", about = "Ratatui client for Strobes Agents AI")]
+#[command(name = "strobes", about = "Ratatui client for Strobes Agents AI")]
 struct Cli {
     #[command(subcommand)]
     cmd: Option<Cmd>,
@@ -212,7 +212,7 @@ async fn cmd_bind(
     if download {
         download_workspace(cfg, &profile, &ws_id, dir).await?;
     } else {
-        println!("(run `strobes-tui pull` to download its files locally)");
+        println!("(run `strobes pull` to download its files locally)");
     }
     Ok(())
 }

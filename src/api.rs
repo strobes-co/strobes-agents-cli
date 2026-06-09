@@ -124,7 +124,7 @@ impl ApiClient {
     pub fn new(profile: Profile) -> Result<Self> {
         let http = reqwest::Client::builder()
             .danger_accept_invalid_certs(!profile.verify_tls)
-            .user_agent("strobes-tui/0.1")
+            .user_agent("strobes-cli/0.1")
             .build()?;
         Ok(Self { profile, http })
     }

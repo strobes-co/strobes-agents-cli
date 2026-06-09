@@ -1,12 +1,12 @@
 [package]
-name = "strobes-tui"
+name = "strobes-agents-cli"
 version = "0.1.0"
 edition = "2021"
-description = "Strobes Agents AI — Ratatui terminal client for remote Strobes workspaces"
+description = "Strobes Agents AI — a Ratatui terminal client for remote Strobes workspaces"
 license = "Proprietary"
 
 [[bin]]
-name = "strobes-tui"
+name = "strobes"
 path = "src/main.rs"
 
 [dependencies]
