@@ -33,9 +33,9 @@ use config::Config;
 struct Cli {
     #[command(subcommand)]
     cmd: Option<Cmd>,
-    /// Config profile name
-    #[arg(long, global = true)]
-    profile: Option<String>,
+    /// Tenant to use for this run (defaults to the configured default tenant).
+    #[arg(long, visible_alias = "profile", global = true)]
+    tenant: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -51,6 +51,35 @@ enum Cmd {
         /// Force the thread picker / create a new thread instead of resuming.
         #[arg(long)]
         new: bool,
+    },
+    /// Configure credentials interactively (or pass flags to skip prompts).
+    Login {
+        /// Deployment base URL, e.g. https://app.strobes.co
+        #[arg(long)]
+        base_url: Option<String>,
+        /// Organization UUID.
+        #[arg(long)]
+        org_id: Option<String>,
+        /// 40-char MasterKey.
+        #[arg(long)]
+        master_key: Option<String>,
+        /// Path style: blank/proxy = /api/v1, `direct` = bare /v1.
+        #[arg(long)]
+        deployment: Option<String>,
+        /// Skip the post-save connectivity check.
+        #[arg(long)]
+        no_verify: bool,
+    },
+    /// List configured tenants (the default is marked with ★).
+    Tenants,
+    /// Show AI credit usage (org total + per-workspace breakdown).
+    Credits {
+        /// Scope to a single workspace.
+        #[arg(long, short)]
+        workspace: Option<String>,
+        /// Scope to a single chat thread.
+        #[arg(long, short)]
+        thread: Option<String>,
     },
     /// Show the active profile and connectivity.
     Status,
@@ -100,50 +129,192 @@ enum Cmd {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     let mut cfg = Config::load();
-    if let Some(p) = &cli.profile {
-        cfg.current_profile = p.clone();
-    }
-    let profile = cfg.current();
+    // Select the tenant for this run without mutating the stored default.
+    let tenant = cli.tenant.clone().unwrap_or_else(|| cfg.current_profile.clone());
+    let profile = cfg.profile_for(&tenant);
 
     match cli.cmd.unwrap_or(Cmd::Chat { thread: None, workspace: None, model: None, new: false }) {
+        Cmd::Login { base_url, org_id, master_key, deployment, no_verify } => {
+            cmd_login(&mut cfg, &tenant, base_url, org_id, master_key, deployment, no_verify).await
+        }
+        Cmd::Tenants => cmd_tenants(&cfg),
+        Cmd::Credits { workspace, thread } => cmd_credits(&profile, workspace, thread).await,
         Cmd::Status => cmd_status(&profile).await,
         Cmd::Workspaces => cmd_workspaces(&profile).await,
         Cmd::Threads => cmd_threads(&profile).await,
         Cmd::Bind { workspace, new, name, download, dir } => {
-            cmd_bind(&mut cfg, profile, workspace, new, name, download, dir).await
+            cmd_bind(&mut cfg, &tenant, profile, workspace, new, name, download, dir).await
         }
         Cmd::Pull { workspace, dir } => cmd_pull(&mut cfg, &profile, workspace, dir).await,
         Cmd::Chat { thread, workspace, model, new } => {
-            let mut profile = profile;
-            if let Some(w) = workspace {
-                profile.workspace_id = Some(w);
-            }
-            // Resolve a thread: explicit > picker/create (when --new or none bound).
-            let explicit = if new { None } else { thread.or(profile.thread_id.clone()) };
-            let thread_id = match explicit {
-                Some(t) => t,
-                None => resolve_thread_interactive(&profile).await?,
-            };
-            // Persist the binding to the stored profile.
-            {
-                let name = cfg.current_profile.clone();
-                let p = cfg.profile_mut(&name);
-                p.thread_id = Some(thread_id.clone());
-                if profile.workspace_id.is_some() {
-                    p.workspace_id = profile.workspace_id.clone();
-                }
-                let _ = cfg.save();
-            }
-            run_chat(profile, thread_id, model).await
+            // Enter the alternate screen ONCE for the whole interactive flow
+            // (pickers + chat) and restore ONCE, so switching between workspace,
+            // thread, and chat never flashes the normal terminal.
+            let mut terminal = ratatui::init();
+            let _ = execute!(stdout(), EnableMouseCapture);
+            let r = chat_flow(&mut terminal, &mut cfg, &tenant, profile, thread, workspace, new, model).await;
+            let _ = execute!(stdout(), DisableMouseCapture);
+            ratatui::restore();
+            r
         }
         Cmd::Probe { thread, send, secs, model } => cmd_probe(&profile, &thread, send, secs, model).await,
     }
 }
 
-/// Show a thread picker (with a "new thread" option) and return a thread id,
-/// creating one via REST if requested.
-async fn resolve_thread_interactive(profile: &config::Profile) -> Result<String> {
+/// The interactive chat flow: pick a workspace → thread (unless given), persist
+/// the binding, then run the chat UI — all on one already-initialized terminal.
+async fn chat_flow(
+    terminal: &mut ratatui::DefaultTerminal,
+    cfg: &mut Config,
+    tenant: &str,
+    mut profile: config::Profile,
+    thread: Option<String>,
+    workspace: Option<String>,
+    new: bool,
+    model: Option<i64>,
+) -> Result<()> {
+    if let Some(w) = &workspace {
+        profile.workspace_id = Some(w.clone());
+    }
+    // Only an explicit --thread skips the pickers; a plain run always offers
+    // workspace → thread selection (the stored thread_id is not auto-resumed).
+    let explicit = if new { None } else { thread };
+    // `initial_msg` is auto-sent on connect (used to seed a new workspace's
+    // setup chat with the user's prompt).
+    let mut initial_msg: Option<String> = None;
+    let thread_id = match explicit {
+        Some(t) => t,
+        None => {
+            // Esc on the thread picker steps back to the workspace picker; Esc on
+            // the workspace picker (or ^C anywhere) quits cleanly.
+            let ws_flag = workspace.is_some();
+            loop {
+                if !ws_flag {
+                    match resolve_workspace_interactive(terminal, tenant, &profile).await? {
+                        WsChoice::Pick(w) => profile.workspace_id = w,
+                        WsChoice::Created { id, setup_thread, prompt } => {
+                            profile.workspace_id = Some(id);
+                            if let Some(t) = setup_thread {
+                                // Jump straight into the setup chat with the prompt.
+                                initial_msg = prompt;
+                                break t;
+                            }
+                            // No setup thread → fall through to the thread picker.
+                        }
+                        WsChoice::Quit => return Ok(()),
+                    }
+                }
+                match resolve_thread_interactive(terminal, tenant, &profile).await? {
+                    ThreadChoice::Pick(t) => break t,
+                    ThreadChoice::Quit => return Ok(()),
+                    // No workspace picker to go back to when --workspace was given.
+                    ThreadChoice::Back if ws_flag => return Ok(()),
+                    ThreadChoice::Back => continue,
+                }
+            }
+        }
+    };
+    // Persist the binding to the selected tenant's profile.
+    {
+        let p = cfg.profile_mut(tenant);
+        p.thread_id = Some(thread_id.clone());
+        if profile.workspace_id.is_some() {
+            p.workspace_id = profile.workspace_id.clone();
+        }
+        let _ = cfg.save();
+    }
+    run_chat(terminal, tenant, profile, thread_id, model, initial_msg).await
+}
+
+/// Show a workspace picker over the available workspaces and return the chosen
+/// workspace id. A leading "No workspace" entry (and an empty list) yields None,
+/// leaving the chat unscoped. The currently-bound workspace is marked with ✓.
+/// First-screen workspace choice. Esc/^C both quit the app cleanly (there's no
+/// earlier screen to step back to).
+enum WsChoice {
+    Pick(Option<String>),
+    /// A freshly-created workspace: bind it, open its setup thread, and send the
+    /// optional setup prompt as the first message.
+    Created {
+        id: String,
+        setup_thread: Option<String>,
+        prompt: Option<String>,
+    },
+    Quit,
+}
+
+/// One-line "authenticated …" subtitle shown under the banner art.
+fn auth_line(p: &config::Profile, tenant: &str) -> String {
+    let org = if p.org_id.len() > 8 { &p.org_id[..8] } else { &p.org_id };
+    format!("✔ authenticated · tenant: {tenant} · {} · org {org}", p.base_url)
+}
+
+async fn resolve_workspace_interactive(
+    terminal: &mut ratatui::DefaultTerminal,
+    tenant: &str,
+    profile: &config::Profile,
+) -> Result<WsChoice> {
     require_complete(profile)?;
+    let auth = auth_line(profile, tenant);
+    let client = api::ApiClient::new(profile.clone())?;
+    let workspaces = client.list_workspaces().await.unwrap_or_default();
+    let cur = profile.workspace_id.as_deref();
+    // Item 0 = create new, item 1 = no workspace, then existing workspaces.
+    let mut labels = vec![
+        "➕  New workspace".to_string(),
+        "↪  No workspace (all threads)".to_string(),
+    ];
+    for w in &workspaces {
+        let name = if w.name.is_empty() { "(unnamed)" } else { &w.name };
+        let mark = if Some(w.id.as_str()) == cur { "  ✓" } else { "" };
+        labels.push(format!("{name}   [{}]{mark}", w.status));
+    }
+    loop {
+        match picker::select_with(terminal, "Select a workspace", &labels, &auth).await? {
+            picker::Nav::Item(0) => {
+                // Ask for a name and an optional setup prompt; Esc on the name
+                // cancels back to the picker.
+                let name = match picker::prompt_text(terminal, "New workspace — name", "", &auth).await? {
+                    Some(n) => n.trim().to_string(),
+                    None => continue,
+                };
+                let name = if name.is_empty() { "CLI Workspace".to_string() } else { name };
+                let prompt = picker::prompt_text(
+                    terminal,
+                    "Setup prompt — what should this workspace do? (optional)",
+                    "",
+                    &auth,
+                )
+                .await?
+                .map(|p| p.trim().to_string())
+                .filter(|p| !p.is_empty());
+                let (id, setup_thread) = client.create_workspace(&name).await?;
+                return Ok(WsChoice::Created { id, setup_thread, prompt });
+            }
+            picker::Nav::Item(1) => return Ok(WsChoice::Pick(None)),
+            picker::Nav::Item(i) => return Ok(WsChoice::Pick(Some(workspaces[i - 2].id.clone()))),
+            // Esc on the first screen quits cleanly (no prior screen to return to).
+            picker::Nav::Back | picker::Nav::Quit => return Ok(WsChoice::Quit),
+        }
+    }
+}
+
+/// Second-screen thread choice. Esc steps back to the workspace picker; ^C quits.
+enum ThreadChoice {
+    Pick(String),
+    Back,
+    Quit,
+}
+
+/// Show a thread picker (with a "new thread" option) and return the chosen
+/// thread id, creating one via REST if requested.
+async fn resolve_thread_interactive(
+    terminal: &mut ratatui::DefaultTerminal,
+    tenant: &str,
+    profile: &config::Profile,
+) -> Result<ThreadChoice> {
+    require_complete(profile)?;
+    let auth = auth_line(profile, tenant);
     let client = api::ApiClient::new(profile.clone())?;
     // Scope to the bound workspace if there is one.
     let threads = client
@@ -158,21 +329,22 @@ async fn resolve_thread_interactive(profile: &config::Profile) -> Result<String>
         labels.push(format!("{title}   [{}]{last}", t.status));
     }
 
-    let choice = picker::select("Select a thread", &labels).await?;
-    match choice {
-        None => Err(anyhow!("cancelled")),
-        Some(0) => {
+    match picker::select_with(terminal, "Select a thread", &labels, &auth).await? {
+        picker::Nav::Item(0) => {
             let id = client
                 .create_thread("CLI session", profile.workspace_id.as_deref())
                 .await?;
-            Ok(id)
+            Ok(ThreadChoice::Pick(id))
         }
-        Some(i) => Ok(threads[i - 1].id.clone()),
+        picker::Nav::Item(i) => Ok(ThreadChoice::Pick(threads[i - 1].id.clone())),
+        picker::Nav::Back => Ok(ThreadChoice::Back),
+        picker::Nav::Quit => Ok(ThreadChoice::Quit),
     }
 }
 
 async fn cmd_bind(
     cfg: &mut Config,
+    tenant: &str,
     profile: config::Profile,
     workspace: Option<String>,
     new: bool,
@@ -199,13 +371,12 @@ async fn cmd_bind(
             .map(|w| format!("{}   [{}]", if w.name.is_empty() { "(unnamed)" } else { &w.name }, w.status))
             .collect();
         match picker::select("Select a workspace", &labels).await? {
-            Some(i) => workspaces[i].id.clone(),
-            None => return Err(anyhow!("cancelled")),
+            picker::Nav::Item(i) => workspaces[i].id.clone(),
+            picker::Nav::Back | picker::Nav::Quit => return Ok(()),
         }
     };
 
-    let pname = cfg.current_profile.clone();
-    cfg.profile_mut(&pname).workspace_id = Some(ws_id.clone());
+    cfg.profile_mut(tenant).workspace_id = Some(ws_id.clone());
     cfg.save()?;
     println!("✔ bound workspace {ws_id}");
 
@@ -425,11 +596,134 @@ fn trunc(s: &str, n: usize) -> String {
     if s.chars().count() > n { format!("{}…", s.chars().take(n).collect::<String>()) } else { s.to_string() }
 }
 
+/// Read one line from stdin, showing the current value (redacted if secret) as
+/// the default. An empty entry keeps the current value.
+fn prompt_line(label: &str, current: &str, secret: bool) -> Result<String> {
+    use std::io::Write;
+    let hint = if current.is_empty() {
+        String::new()
+    } else if secret {
+        format!(" [{}]", config::redact(current))
+    } else {
+        format!(" [{current}]")
+    };
+    print!("{label}{hint}: ");
+    std::io::stdout().flush()?;
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    let line = line.trim().to_string();
+    Ok(if line.is_empty() { current.to_string() } else { line })
+}
+
+/// Configure the active profile's credentials. Any field passed as a flag is
+/// used verbatim; the rest are prompted for interactively.
+async fn cmd_login(
+    cfg: &mut Config,
+    tenant: &str,
+    base_url: Option<String>,
+    org_id: Option<String>,
+    master_key: Option<String>,
+    deployment: Option<String>,
+    no_verify: bool,
+) -> Result<()> {
+    let pname = tenant.to_string();
+    let had_default = cfg.has_default();
+    let cur = cfg.profile_mut(&pname).clone();
+    let interactive = base_url.is_none() && org_id.is_none() && master_key.is_none();
+    if interactive {
+        println!("Configuring tenant '{pname}' — press Enter to keep the current value.");
+    }
+
+    let base_url = match base_url {
+        Some(v) => v,
+        None => prompt_line("Base URL (e.g. https://app.strobes.co)", &cur.base_url, false)?,
+    };
+    let org_id = match org_id {
+        Some(v) => v,
+        None => prompt_line("Org ID (UUID)", &cur.org_id, false)?,
+    };
+    let master_key = match master_key {
+        Some(v) => v,
+        None => prompt_line("Master key", &cur.master_key, true)?,
+    };
+    let deployment = match deployment {
+        Some(v) => v,
+        None if interactive => {
+            prompt_line("Deployment (blank = proxy /api/v1, 'direct' = /v1)", &cur.deployment, false)?
+        }
+        None => cur.deployment.clone(),
+    };
+
+    {
+        let p = cfg.profile_mut(&pname);
+        p.base_url = base_url.trim().trim_end_matches('/').to_string();
+        p.org_id = org_id.trim().to_string();
+        p.master_key = master_key.trim().to_string();
+        p.deployment = deployment.trim().to_string();
+    }
+    cfg.save()?;
+    let path = config::config_dir().join("config.json");
+    println!("\n✔ saved tenant '{pname}' → {}", path.display());
+
+    let saved = cfg.profile_mut(&pname).clone();
+    // The first tenant with usable credentials becomes the default.
+    if saved.is_complete() && !had_default {
+        cfg.current_profile = pname.clone();
+        cfg.save()?;
+        println!("★ '{pname}' is now the default tenant.");
+    } else if saved.is_complete() && cfg.current_profile != pname {
+        println!(
+            "• default tenant remains '{}' — run any command with `--tenant {pname}` to use this one.",
+            cfg.current_profile
+        );
+    }
+    if std::env::var("STROBES_AI_BASE_URL").is_ok()
+        || std::env::var("STROBES_AI_MASTER_KEY").is_ok()
+        || std::env::var("STROBES_AI_ORG_ID").is_ok()
+    {
+        println!("⚠ STROBES_AI_* env vars are set and will override this file at runtime.");
+    }
+    if no_verify {
+        return Ok(());
+    }
+    if !saved.is_complete() {
+        println!("⚠ profile still incomplete (need base_url, org_id and master_key).");
+        return Ok(());
+    }
+    use std::io::Write;
+    print!("Testing connection… ");
+    std::io::stdout().flush()?;
+    match api::ApiClient::new(saved)?.ping().await {
+        Ok(_) => println!("✔ connection OK"),
+        Err(e) => println!("✗ connection failed: {e}"),
+    }
+    Ok(())
+}
+
+/// List configured tenants, marking the default with ★.
+fn cmd_tenants(cfg: &Config) -> Result<()> {
+    let names = cfg.tenants();
+    if names.is_empty() {
+        println!("no tenants configured — run `strobes --tenant <name> login`");
+        return Ok(());
+    }
+    for name in &names {
+        let p = cfg.profile_for(name);
+        let mark = if *name == cfg.current_profile { "★" } else { " " };
+        println!("{mark} {name}\t{}\t{}", p.org_id, p.base_url);
+    }
+    println!("\n★ = default tenant. Override per-run with `--tenant <name>`.");
+    Ok(())
+}
+
 async fn cmd_status(p: &config::Profile) -> Result<()> {
     println!("base_url    {}", if p.base_url.is_empty() { "(unset)" } else { &p.base_url });
     println!("org_id      {}", if p.org_id.is_empty() { "(unset)" } else { &p.org_id });
     println!("master_key  {}", config::redact(&p.master_key));
     println!("deployment  {}", p.deployment);
+    if let (Some(ip), Some(host)) = (p.resolve_override(), p.host()) {
+        println!("resolve     {host} → {ip} (DNS bypass)");
+    }
     println!("workspace   {}", p.workspace_id.clone().unwrap_or_else(|| "(none)".into()));
     println!("thread      {}", p.thread_id.clone().unwrap_or_else(|| "(none)".into()));
     if p.is_complete() {
@@ -441,15 +735,91 @@ async fn cmd_status(p: &config::Profile) -> Result<()> {
     Ok(())
 }
 
+/// Compact token count (e.g. 1.8k, 2.5M).
+fn fmt_tok(n: i64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1e6)
+    } else if n >= 1_000 {
+        format!("{:.1}k", n as f64 / 1e3)
+    } else {
+        n.to_string()
+    }
+}
+
+/// Map of workspace id → lifetime credits consumed (one credits API call).
+async fn workspace_credits_map(client: &api::ApiClient) -> std::collections::HashMap<String, f64> {
+    client
+        .get_credits(None, None)
+        .await
+        .map(|s| s.by_workspace.into_iter().map(|w| (w.workspace_id, w.credits)).collect())
+        .unwrap_or_default()
+}
+
+async fn cmd_credits(
+    p: &config::Profile,
+    workspace: Option<String>,
+    thread: Option<String>,
+) -> Result<()> {
+    require_complete(p)?;
+    let client = api::ApiClient::new(p.clone())?;
+    let sum = client.get_credits(workspace.as_deref(), thread.as_deref()).await?;
+
+    let scope = match (&workspace, &thread) {
+        (_, Some(t)) => format!("thread {}", &t[..8.min(t.len())]),
+        (Some(w), _) => format!("workspace {}", &w[..8.min(w.len())]),
+        _ => "organization".into(),
+    };
+    println!(
+        "◈ {scope}:  {:.3} credits · {} tokens · {} runs",
+        sum.credits,
+        fmt_tok(sum.tokens),
+        sum.runs
+    );
+
+    if !sum.by_workspace.is_empty() {
+        let names: std::collections::HashMap<String, String> = client
+            .list_workspaces()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|w| (w.id, w.name))
+            .collect();
+        println!("\nby workspace:");
+        for w in &sum.by_workspace {
+            let name = match names.get(&w.workspace_id) {
+                Some(n) if !n.is_empty() => n.clone(),
+                Some(_) => "(unnamed)".into(),
+                None => "(deleted)".into(),
+            };
+            println!(
+                "  {:>8.3} cr · {:>7} tok · {:>3} runs   {}",
+                w.credits,
+                fmt_tok(w.tokens),
+                w.runs,
+                name
+            );
+        }
+    }
+    Ok(())
+}
+
 async fn cmd_workspaces(p: &config::Profile) -> Result<()> {
     require_complete(p)?;
-    let rows = api::ApiClient::new(p.clone())?.list_workspaces().await?;
+    let client = api::ApiClient::new(p.clone())?;
+    let rows = client.list_workspaces().await?;
     if rows.is_empty() {
         println!("(no workspaces)");
     }
-    for w in rows {
+    let (counts, credits) =
+        tokio::join!(workspace_thread_counts(&client, &rows), workspace_credits_map(&client));
+    for (i, w) in rows.iter().enumerate() {
         let bound = if Some(&w.id) == p.workspace_id.as_ref() { " ●" } else { "" };
-        println!("{}  {}{}  [{}]", w.id, w.name, bound, w.status);
+        let tcount = match counts.get(i).copied().flatten() {
+            Some(n) => format!("{n} threads"),
+            None => "? threads".into(),
+        };
+        let cr = credits.get(&w.id).copied().unwrap_or(0.0);
+        println!("{}  {}{}  [{}]  {}  · ◈ {cr:.2} cr", w.id, w.name, bound, w.status, tcount);
     }
     Ok(())
 }
@@ -469,7 +839,7 @@ async fn cmd_threads(p: &config::Profile) -> Result<()> {
 
 fn require_complete(p: &config::Profile) -> Result<()> {
     if !p.is_complete() {
-        return Err(anyhow!("profile incomplete — run `strobes-ai login` first"));
+        return Err(anyhow!("profile incomplete — run `strobes login` first"));
     }
     Ok(())
 }
@@ -485,8 +855,37 @@ enum Defer {
     BindWorkspace(String),
 }
 
-async fn fetch_title(client: &api::ApiClient, thread_id: &str, app: &mut App) {
-    if let Ok(threads) = client.list_threads(None).await {
+/// Load a thread's history, active-run state and title into the app, running
+/// the independent round-trips concurrently. Used when switching threads.
+async fn load_thread_data(
+    client: &api::ApiClient,
+    thread_id: &str,
+    ws_scope: Option<&str>,
+    app: &mut App,
+) {
+    let (events_res, threads_res, run_res, credits_res) = tokio::join!(
+        client.get_thread_events(thread_id, 0, 2000),
+        client.list_threads(ws_scope),
+        client.get_thread_history(thread_id, 1),
+        client.get_credits(None, Some(thread_id)),
+    );
+    if let Ok(c) = credits_res {
+        app.set_thread_credits(c.credits, c.tokens);
+    }
+    match events_res {
+        Ok(events) if !events.is_empty() => app.seed_history_events(events),
+        _ => {
+            if let Ok(hist) = client.get_thread_history(thread_id, 100).await {
+                app.seed_history(hist.messages);
+            }
+        }
+    }
+    if let Ok(hist) = run_res {
+        if let Some(run) = hist.active_run {
+            app.note_active_run(&run.status);
+        }
+    }
+    if let Ok(threads) = threads_res {
         if let Some(t) = threads.into_iter().find(|t| t.id == thread_id) {
             if !t.title.is_empty() {
                 app.set_title(t.title);
@@ -495,46 +894,88 @@ async fn fetch_title(client: &api::ApiClient, thread_id: &str, app: &mut App) {
     }
 }
 
-async fn load_history(client: &api::ApiClient, thread_id: &str, app: &mut App) {
-    match client.get_thread_events(thread_id, 0, 2000).await {
-        Ok(events) if !events.is_empty() => app.seed_history_events(events),
-        _ => {
-            if let Ok(hist) = client.get_thread_history(thread_id, 100).await {
-                app.seed_history(hist.messages);
-            }
-        }
-    }
-    if let Ok(hist) = client.get_thread_history(thread_id, 1).await {
-        if let Some(run) = hist.active_run {
-            app.note_active_run(&run.status);
-        }
-    }
-}
-
-async fn run_chat(profile: config::Profile, thread_id: String, model: Option<i64>) -> Result<()> {
+async fn run_chat(
+    terminal: &mut ratatui::DefaultTerminal,
+    tenant: &str,
+    profile: config::Profile,
+    thread_id: String,
+    model: Option<i64>,
+    initial_msg: Option<String>,
+) -> Result<()> {
     require_complete(&profile)?;
 
     let mut profile = profile;
     let client = api::ApiClient::new(profile.clone())?;
-    let mut app = App::new(thread_id.clone(), profile.base_url.clone());
+    let mut app = App::new(thread_id.clone(), profile.base_url.clone(), tenant.to_string(), profile.org_id.clone());
     app.has_workspace = profile.workspace_id.is_some();
 
-    load_history(&client, &thread_id, &mut app).await;
-    fetch_title(&client, &thread_id, &mut app).await;
-    if let Ok(cmds) = client.list_slash_commands().await {
-        app.set_slash_commands(cmds);
-    }
-
+    // Fire the independent startup round-trips (history, title, slash-commands,
+    // active-run, and the WebSocket connect) concurrently so the UI appears in
+    // ~one round-trip instead of four-plus sequential ones.
     let (tx, mut rx) = mpsc::unbounded_channel::<pulse::AppEvent>();
     let mut app_tx = tx.clone(); // for background tasks (workspace sync) to post UI events
-    let mut handle = pulse::connect(&profile, &thread_id, tx, model).await?;
+    let ws_scope = profile.workspace_id.clone();
+    let (conn, events_res, threads_res, cmds_res, run_res, ws_res, credits_res) = tokio::join!(
+        pulse::connect(&profile, &thread_id, tx, model),
+        client.get_thread_events(&thread_id, 0, 2000),
+        client.list_threads(ws_scope.as_deref()),
+        client.list_slash_commands(),
+        client.get_thread_history(&thread_id, 1),
+        client.list_workspaces(),
+        client.get_credits(None, Some(&thread_id)),
+    );
+    let mut handle = conn?;
+    // Resolve the bound workspace's name for the top-right indicator.
+    if let (Some(wid), Ok(wss)) = (ws_scope.as_deref(), &ws_res) {
+        if let Some(w) = wss.iter().find(|w| w.id == wid) {
+            app.set_workspace_name(w.name.clone());
+        }
+    }
+    // Seed this thread's lifetime credit usage.
+    if let Ok(c) = credits_res {
+        app.set_thread_credits(c.credits, c.tokens);
+    }
+
+    // Apply the fetched data (in-memory, fast).
+    match events_res {
+        Ok(events) if !events.is_empty() => app.seed_history_events(events),
+        _ => {
+            if let Ok(hist) = client.get_thread_history(&thread_id, 100).await {
+                app.seed_history(hist.messages);
+            }
+        }
+    }
+    if let Ok(hist) = run_res {
+        if let Some(run) = hist.active_run {
+            app.note_active_run(&run.status);
+        }
+    }
+    if let Ok(threads) = threads_res {
+        if let Some(t) = threads.into_iter().find(|t| t.id == thread_id) {
+            if !t.title.is_empty() {
+                app.set_title(t.title);
+            }
+        }
+    }
+    if let Ok(cmds) = cmds_res {
+        app.set_slash_commands(cmds);
+    }
 
     if let Some(ws) = profile.workspace_id.clone() {
         spawn_workspace_sync(profile.clone(), ws, app_tx.clone());
     }
 
-    let mut terminal = ratatui::init();
-    let _ = execute!(stdout(), EnableMouseCapture);
+    // Auto-send the setup prompt for a freshly-created workspace.
+    if let Some(msg) = initial_msg {
+        let msg = msg.trim().to_string();
+        if !msg.is_empty() {
+            app.echo_user(&msg);
+            handle.send_user_message(&msg);
+            app.running = true;
+            app.status = "sending…".into();
+        }
+    }
+
     let mut events = EventStream::new();
     let mut viewport_h: u16 = 20;
 
@@ -555,7 +996,20 @@ async fn run_chat(profile: config::Profile, thread_id: String, model: Option<i64
                         if app.overlay_active() {
                             // ----- overlay navigation -----
                             match k.code {
-                                KeyCode::Esc => { app.overlay_esc(); }
+                                KeyCode::Esc => {
+                                    // Back-stack: detail → list, chat → threads →
+                                    // workspaces → exit. Findings/approvals just
+                                    // close back to chat.
+                                    if app.overlay_detail_open() {
+                                        app.overlay_esc();
+                                    } else if app.overlay_kind() == Some(app::OverlayKind::Threads) {
+                                        defer = Some(Defer::Workspaces);
+                                    } else if app.overlay_kind() == Some(app::OverlayKind::Workspaces) {
+                                        quit = true;
+                                    } else {
+                                        app.overlay_esc();
+                                    }
+                                }
                                 KeyCode::Up | KeyCode::Char('k') => app.overlay_move(true),
                                 KeyCode::Down | KeyCode::Char('j') => app.overlay_move(false),
                                 KeyCode::PageUp => app.overlay_page(true, viewport_h),
@@ -597,7 +1051,9 @@ async fn run_chat(profile: config::Profile, thread_id: String, model: Option<i64
                         } else {
                             // ----- normal chat -----
                             match k.code {
-                                KeyCode::Esc => quit = true,
+                                // Esc steps back into navigation (threads →
+                                // workspaces) instead of quitting; ^C quits.
+                                KeyCode::Esc => defer = Some(Defer::Threads),
                                 KeyCode::Char('c') if ctrl => { if app.running { handle.cancel(); } else { quit = true; } }
                                 KeyCode::Char('t') if ctrl => app.show_thinking = !app.show_thinking,
                                 KeyCode::Char('r') if ctrl => app.markdown = !app.markdown,
@@ -649,8 +1105,8 @@ async fn run_chat(profile: config::Profile, thread_id: String, model: Option<i64
         // Deferred (awaiting / reconnecting) actions happen here, after the
         // select block has released its borrow on `rx`.
         match defer {
-            Some(Defer::Workspaces) => match client.list_workspaces().await {
-                Ok(ws) => app.open_overlay(app::OverlayKind::Workspaces, "Workspaces".into(), workspace_items(ws, &profile)),
+            Some(Defer::Workspaces) => match workspace_overlay_items(&client, &profile).await {
+                Ok(items) => app.open_overlay(app::OverlayKind::Workspaces, "Workspaces".into(), items),
                 Err(e) => app.on_app_event(pulse::AppEvent::Error(e.to_string())),
             },
             Some(Defer::Threads) => {
@@ -668,10 +1124,10 @@ async fn run_chat(profile: config::Profile, thread_id: String, model: Option<i64
                     Ok(fs) => app.open_overlay(app::OverlayKind::Findings, "Findings".into(), finding_items(fs)),
                     Err(e) => app.on_app_event(pulse::AppEvent::Error(e.to_string())),
                 },
-                None => match client.list_workspaces().await {
-                    Ok(ws) => {
+                None => match workspace_overlay_items(&client, &profile).await {
+                    Ok(items) => {
                         app.notice("pick a workspace, then press ^F for its findings");
-                        app.open_overlay(app::OverlayKind::Workspaces, "Workspaces".into(), workspace_items(ws, &profile));
+                        app.open_overlay(app::OverlayKind::Workspaces, "Workspaces".into(), items);
                     }
                     Err(e) => app.on_app_event(pulse::AppEvent::Error(e.to_string())),
                 },
@@ -681,18 +1137,88 @@ async fn run_chat(profile: config::Profile, thread_id: String, model: Option<i64
                     Ok(aps) => app.open_overlay(app::OverlayKind::Approvals, "Approvals".into(), approval_items(aps)),
                     Err(e) => app.on_app_event(pulse::AppEvent::Error(e.to_string())),
                 },
-                None => match client.list_workspaces().await {
-                    Ok(ws) => {
+                None => match workspace_overlay_items(&client, &profile).await {
+                    Ok(items) => {
                         app.notice("pick a workspace, then press ^A for its approvals");
-                        app.open_overlay(app::OverlayKind::Workspaces, "Workspaces".into(), workspace_items(ws, &profile));
+                        app.open_overlay(app::OverlayKind::Workspaces, "Workspaces".into(), items);
                     }
                     Err(e) => app.on_app_event(pulse::AppEvent::Error(e.to_string())),
                 },
             },
+            Some(Defer::BindWorkspace(sel)) if sel == "__new_ws__" => {
+                // Create a workspace: ask for a name + optional setup prompt,
+                // then jump into its setup chat (sending the prompt).
+                let auth = auth_line(&profile, tenant);
+                let name = match picker::prompt_text(terminal, "New workspace — name", "", &auth).await {
+                    Ok(Some(n)) => {
+                        let n = n.trim().to_string();
+                        if n.is_empty() { "CLI Workspace".to_string() } else { n }
+                    }
+                    _ => {
+                        app.close_overlay();
+                        String::new()
+                    }
+                };
+                if !name.is_empty() {
+                    let prompt = picker::prompt_text(
+                        terminal,
+                        "Setup prompt — what should this workspace do? (optional)",
+                        "",
+                        &auth,
+                    )
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|p| p.trim().to_string())
+                    .filter(|p| !p.is_empty());
+
+                    match client.create_workspace(&name).await {
+                        Ok((new_id, setup)) => {
+                            profile.workspace_id = Some(new_id.clone());
+                            handle.set_workspace(Some(new_id.clone()));
+                            app.has_workspace = true;
+                            app.set_workspace_name(name.clone());
+                            spawn_workspace_sync(profile.clone(), new_id.clone(), app_tx.clone());
+                            app.notice(&format!("✔ created workspace {name} — opening setup chat…"));
+                            match setup {
+                                Some(setup_tid) => {
+                                    // Switch the live connection to the setup thread.
+                                    let (ntx, nrx) = mpsc::unbounded_channel::<pulse::AppEvent>();
+                                    let nclone = ntx.clone();
+                                    match pulse::connect(&profile, &setup_tid, ntx, model).await {
+                                        Ok(nh) => {
+                                            handle = nh;
+                                            rx = nrx;
+                                            app_tx = nclone;
+                                            app.reset_for_thread(setup_tid.clone());
+                                            load_thread_data(&client, &setup_tid, profile.workspace_id.as_deref(), &mut app).await;
+                                            app.set_workspace_name(name.clone());
+                                            if let Some(p) = &prompt {
+                                                app.echo_user(p);
+                                                handle.send_user_message(p);
+                                                app.running = true;
+                                                app.status = "sending…".into();
+                                            }
+                                        }
+                                        Err(e) => app.on_app_event(pulse::AppEvent::Error(format!("open setup chat failed: {e}"))),
+                                    }
+                                }
+                                None => app.close_overlay(),
+                            }
+                        }
+                        Err(e) => app.on_app_event(pulse::AppEvent::Error(format!("create workspace failed: {e}"))),
+                    }
+                }
+            }
             Some(Defer::BindWorkspace(id)) => {
                 profile.workspace_id = Some(id.clone());
                 handle.set_workspace(Some(id.clone()));
                 app.has_workspace = true;
+                if let Ok(wss) = client.list_workspaces().await {
+                    if let Some(w) = wss.iter().find(|w| w.id == id) {
+                        app.set_workspace_name(w.name.clone());
+                    }
+                }
                 app.notice(&format!("✔ bound workspace {} — ^F findings · ^A approvals", &id[..8.min(id.len())]));
                 // Sync the workspace files locally IN THE BACKGROUND so the
                 // agent's local tools see the real files without freezing the UI.
@@ -730,8 +1256,7 @@ async fn run_chat(profile: config::Profile, thread_id: String, model: Option<i64
                             rx = nrx;
                             app_tx = nclone;
                             app.reset_for_thread(new_thread.clone());
-                            load_history(&client, &new_thread, &mut app).await;
-                            fetch_title(&client, &new_thread, &mut app).await;
+                            load_thread_data(&client, &new_thread, profile.workspace_id.as_deref(), &mut app).await;
                         }
                         Err(e) => app.on_app_event(pulse::AppEvent::Error(format!("switch failed: {e}"))),
                     }
@@ -741,8 +1266,6 @@ async fn run_chat(profile: config::Profile, thread_id: String, model: Option<i64
         }
     };
 
-    let _ = execute!(stdout(), DisableMouseCapture);
-    ratatui::restore();
     res
 }
 
@@ -819,17 +1342,57 @@ fn thread_items(ts: Vec<api::Thread>, current: &str, in_workspace: bool) -> Vec<
     items
 }
 
-fn workspace_items(ws: Vec<api::Workspace>, profile: &config::Profile) -> Vec<app::OverlayItem> {
-    ws.into_iter()
-        .map(|w| {
-            let bound = if Some(&w.id) == profile.workspace_id.as_ref() { " ●" } else { "" };
-            let name = if w.name.is_empty() { "(unnamed)".into() } else { w.name.clone() };
-            let label = format!("{name}{bound}  · {}", w.status);
-            let detail = vec![name, format!("status: {}", w.status), format!("id: {}", w.id),
-                String::new(), "Press Enter to bind this workspace (enables ^F / ^A).".into()];
-            app::OverlayItem { label, detail, action: Some(w.id) }
-        })
+fn workspace_items(
+    ws: Vec<api::Workspace>,
+    counts: &[Option<usize>],
+    credits: &std::collections::HashMap<String, f64>,
+    profile: &config::Profile,
+) -> Vec<app::OverlayItem> {
+    let mut items = vec![app::OverlayItem {
+        label: "➕  New workspace".to_string(),
+        detail: vec![
+            "Press Enter to create a new workspace.".into(),
+            "The AI setup chat opens to configure & name it.".into(),
+        ],
+        action: Some("__new_ws__".into()),
+    }];
+    items.extend(ws.into_iter().enumerate().map(|(i, w)| {
+        let bound = if Some(&w.id) == profile.workspace_id.as_ref() { " ●" } else { "" };
+        let name = if w.name.is_empty() { "(unnamed)".into() } else { w.name.clone() };
+        let tcount = match counts.get(i).copied().flatten() {
+            Some(n) => format!("{n} threads"),
+            None => "? threads".into(),
+        };
+        let cr = credits.get(&w.id).copied().unwrap_or(0.0);
+        let label = format!("{name}{bound}  · {} · {tcount} · ◈ {cr:.2} cr", w.status);
+        let detail = vec![name, format!("status: {}", w.status), format!("threads: {tcount}"),
+            format!("credits: {cr:.3}"),
+            format!("id: {}", w.id),
+            String::new(), "Press Enter to bind this workspace (enables ^F / ^A).".into()];
+        app::OverlayItem { label, detail, action: Some(w.id) }
+    }));
+    items
+}
+
+/// Count threads per workspace concurrently (one `list_threads` call each).
+async fn workspace_thread_counts(client: &api::ApiClient, ws: &[api::Workspace]) -> Vec<Option<usize>> {
+    let futs: Vec<_> = ws.iter().map(|w| client.list_threads(Some(&w.id))).collect();
+    futures_util::future::join_all(futs)
+        .await
+        .into_iter()
+        .map(|r| r.ok().map(|t| t.len()))
         .collect()
+}
+
+/// List workspaces and build overlay items including per-workspace thread counts.
+async fn workspace_overlay_items(
+    client: &api::ApiClient,
+    profile: &config::Profile,
+) -> Result<Vec<app::OverlayItem>> {
+    let ws = client.list_workspaces().await?;
+    let (counts, credits) =
+        tokio::join!(workspace_thread_counts(client, &ws), workspace_credits_map(client));
+    Ok(workspace_items(ws, &counts, &credits, profile))
 }
 
 #[cfg(test)]
