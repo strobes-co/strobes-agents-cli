@@ -55,7 +55,7 @@ impl Profile {
     pub fn http_base(&self) -> Result<String> {
         let mut base = self.base_url.trim().trim_end_matches('/').to_string();
         if base.is_empty() {
-            return Err(anyhow!("base_url is empty — run `strobes-ai login` first"));
+            return Err(anyhow!("base_url is empty — run `strobes login` first"));
         }
         if !base.contains("://") {
             base = format!("https://{base}");
@@ -88,6 +88,65 @@ impl Profile {
             self.master_key
         ))
     }
+
+    /// Host portion of the base URL (no scheme or port).
+    pub fn host(&self) -> Option<String> {
+        let base = self.http_base().ok()?;
+        url::Url::parse(&base).ok()?.host_str().map(|s| s.to_string())
+    }
+
+    /// Dev-mode fast path: a static IP to dial for the configured host,
+    /// bypassing the OS resolver. This sidesteps the ~5s macOS mDNS timeout for
+    /// `.local` names (which `getaddrinfo` resolves via multicast and which
+    /// ignore `/etc/hosts`). Resolution order:
+    ///   1. `STROBES_AI_RESOLVE` env — `"1.2.3.4"` or `"host:1.2.3.4"`.
+    ///   2. for a `.local` host, the IP read straight out of `/etc/hosts`.
+    /// Returns `None` for ordinary hosts, so normal DNS is used unchanged.
+    pub fn resolve_override(&self) -> Option<std::net::IpAddr> {
+        let host = self.host()?;
+        if let Ok(raw) = std::env::var("STROBES_AI_RESOLVE") {
+            let raw = raw.trim();
+            if !raw.is_empty() {
+                // "host:ip" (host must match) or bare "ip".
+                let ip_str = match raw.rsplit_once(':') {
+                    Some((h, ip)) if h.eq_ignore_ascii_case(&host) => ip,
+                    Some((h, _)) if !h.is_empty() => return None, // override targets another host
+                    _ => raw,
+                };
+                if let Ok(ip) = ip_str.trim().parse() {
+                    return Some(ip);
+                }
+            }
+        }
+        if host.ends_with(".local") {
+            return hosts_file_lookup(&host);
+        }
+        None
+    }
+}
+
+/// Parse the OS hosts file for the first IP statically mapped to `host`.
+fn hosts_file_lookup(host: &str) -> Option<std::net::IpAddr> {
+    let path = if cfg!(windows) {
+        r"C:\Windows\System32\drivers\etc\hosts"
+    } else {
+        "/etc/hosts"
+    };
+    let text = std::fs::read_to_string(path).ok()?;
+    for line in text.lines() {
+        let line = line.split('#').next().unwrap_or("");
+        let mut cols = line.split_whitespace();
+        let ip = match cols.next() {
+            Some(ip) => ip,
+            None => continue,
+        };
+        if cols.any(|name| name.eq_ignore_ascii_case(host)) {
+            if let Ok(addr) = ip.parse() {
+                return Some(addr);
+            }
+        }
+    }
+    None
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -144,11 +203,13 @@ impl Config {
 
     /// Active profile with environment-variable overrides applied.
     pub fn current(&self) -> Profile {
-        let mut p = self
-            .profiles
-            .get(&self.current_profile)
-            .cloned()
-            .unwrap_or_default();
+        self.profile_for(&self.current_profile)
+    }
+
+    /// Resolve a named tenant's profile with environment-variable overrides
+    /// applied. Unknown names yield an empty profile (overridable by env).
+    pub fn profile_for(&self, name: &str) -> Profile {
+        let mut p = self.profiles.get(name).cloned().unwrap_or_default();
         if let Ok(v) = std::env::var("STROBES_AI_BASE_URL") {
             p.base_url = v;
         }
@@ -162,6 +223,26 @@ impl Config {
             p.deployment = v;
         }
         p
+    }
+
+    /// Names of configured (credential-complete) tenants, sorted.
+    pub fn tenants(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .profiles
+            .iter()
+            .filter(|(_, p)| p.is_complete())
+            .map(|(n, _)| n.clone())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Whether the current default tenant has usable credentials.
+    pub fn has_default(&self) -> bool {
+        self.profiles
+            .get(&self.current_profile)
+            .map(|p| p.is_complete())
+            .unwrap_or(false)
     }
 
     pub fn profile_mut(&mut self, name: &str) -> &mut Profile {
