@@ -18,6 +18,32 @@ pub struct Workspace {
     pub created_at: Option<String>,
 }
 
+/// AI credit usage totals (and optional per-workspace breakdown).
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct CreditsSummary {
+    #[serde(default)]
+    pub credits: f64,
+    #[serde(default)]
+    pub tokens: i64,
+    #[serde(default)]
+    pub runs: i64,
+    #[serde(default)]
+    pub by_workspace: Vec<WorkspaceCredits>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct WorkspaceCredits {
+    #[serde(default)]
+    pub workspace_id: String,
+    #[serde(default)]
+    pub credits: f64,
+    #[serde(default)]
+    pub tokens: i64,
+    #[serde(default)]
+    pub runs: i64,
+}
+
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Thread {
     pub id: String,
@@ -122,10 +148,20 @@ pub struct ApiClient {
 
 impl ApiClient {
     pub fn new(profile: Profile) -> Result<Self> {
-        let http = reqwest::Client::builder()
+        let mut builder = reqwest::Client::builder()
             .danger_accept_invalid_certs(!profile.verify_tls)
-            .user_agent("strobes-cli/0.1")
-            .build()?;
+            .user_agent("strobes-cli/0.1");
+        // Dev fast path: pin the host to a static IP to skip slow (.local/mDNS) DNS.
+        if let (Some(ip), Some(host), Ok(base)) =
+            (profile.resolve_override(), profile.host(), profile.http_base())
+        {
+            let port = url::Url::parse(&base)
+                .ok()
+                .and_then(|u| u.port_or_known_default())
+                .unwrap_or(80);
+            builder = builder.resolve(&host, std::net::SocketAddr::new(ip, port));
+        }
+        let http = builder.build()?;
         Ok(Self { profile, http })
     }
 
@@ -172,6 +208,7 @@ impl ApiClient {
         let v = self.get_json(&path).await?;
         Ok(serde_json::from_value(v).unwrap_or_default())
     }
+
 
     /// Existing conversation + active-run state for a thread (for chat startup).
     pub async fn get_thread_history(&self, thread_id: &str, limit: u32) -> Result<ThreadHistory> {
@@ -224,6 +261,28 @@ impl ApiClient {
             .and_then(|u| u.as_str())
             .map(|s| s.to_string())
             .ok_or_else(|| anyhow!("no download url returned: {v}"))
+    }
+
+    /// AI credit usage totals, optionally scoped to a workspace and/or thread.
+    pub async fn get_credits(
+        &self,
+        workspace_id: Option<&str>,
+        thread_id: Option<&str>,
+    ) -> Result<CreditsSummary> {
+        let mut qs: Vec<String> = Vec::new();
+        if let Some(w) = workspace_id {
+            qs.push(format!("workspace_id={w}"));
+        }
+        if let Some(t) = thread_id {
+            qs.push(format!("thread_id={t}"));
+        }
+        let mut path = self.org_path("/cli/credits/");
+        if !qs.is_empty() {
+            path.push('?');
+            path.push_str(&qs.join("&"));
+        }
+        let v = self.get_json(&path).await?;
+        Ok(serde_json::from_value(v).unwrap_or_default())
     }
 
     pub async fn create_thread(&self, title: &str, workspace_id: Option<&str>) -> Result<String> {

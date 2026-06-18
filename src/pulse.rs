@@ -100,6 +100,33 @@ impl PulseHandle {
 }
 
 /// Connect and spawn the read/write tasks. Returns a handle for the UI.
+/// Open the pulse WebSocket. For a plain `ws://` URL with a dev resolve
+/// override active, dial the static IP directly (keeping the `Host` header from
+/// the URL) so we skip the slow `.local`/mDNS lookup. Otherwise use the normal
+/// resolver. `wss://` always uses the standard path.
+async fn dial_ws(
+    url: &str,
+    profile: &Profile,
+) -> Result<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>>
+{
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let parsed = url::Url::parse(url)?;
+    let is_tls = parsed.scheme() == "wss";
+    if !is_tls {
+        if let Some(ip) = profile.resolve_override() {
+            let port = parsed.port().unwrap_or(80);
+            let tcp = tokio::net::TcpStream::connect((ip, port)).await?;
+            let req = url.into_client_request()?; // preserves Host + api_key query
+            let (ws, _resp) =
+                tokio_tungstenite::client_async(req, tokio_tungstenite::MaybeTlsStream::Plain(tcp))
+                    .await?;
+            return Ok(ws);
+        }
+    }
+    let (ws, _resp) = tokio_tungstenite::connect_async(url).await?;
+    Ok(ws)
+}
+
 pub async fn connect(
     profile: &Profile,
     thread_id: &str,
@@ -107,7 +134,7 @@ pub async fn connect(
     llm_model: Option<i64>,
 ) -> Result<PulseHandle> {
     let url = profile.pulse_ws_url(thread_id)?;
-    let (ws_stream, _resp) = tokio_tungstenite::connect_async(&url).await?;
+    let ws_stream = dial_ws(&url, profile).await?;
     let (mut write, mut read) = ws_stream.split();
 
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();

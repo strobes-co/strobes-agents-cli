@@ -64,9 +64,17 @@ pub async fn run_tool(tool_name: &str, input: &serde_json::Value) -> LocalResult
 
 async fn run_shell(command: &str) -> LocalResult {
     let dir = ensure_sandbox();
-    let out = Command::new("/bin/bash")
-        .arg("-lc")
-        .arg(command)
+    // Use the native shell: cmd.exe on Windows, login bash elsewhere.
+    let mut cmd = if cfg!(windows) {
+        let mut c = Command::new("cmd");
+        c.arg("/C").arg(command);
+        c
+    } else {
+        let mut c = Command::new("/bin/bash");
+        c.arg("-lc").arg(command);
+        c
+    };
+    let out = cmd
         .current_dir(&dir)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -76,8 +84,10 @@ async fn run_shell(command: &str) -> LocalResult {
 }
 
 async fn run_code(code: &str, lang: &str) -> LocalResult {
+    // The Python launcher is `python` on Windows, `python3` elsewhere.
+    let python = if cfg!(windows) { "python" } else { "python3" };
     let (program, args, suffix): (&str, Vec<&str>, &str) = match lang.to_lowercase().as_str() {
-        "python" | "python3" | "py" => ("python3", vec![], ".py"),
+        "python" | "python3" | "py" => (python, vec![], ".py"),
         "bash" | "sh" | "shell" => ("bash", vec![], ".sh"),
         "javascript" | "js" | "node" => ("node", vec![], ".js"),
         "ruby" => ("ruby", vec![], ".rb"),
@@ -139,11 +149,23 @@ fn finish(out: std::io::Result<std::process::Output>) -> LocalResult {
 fn meta_json() -> String {
     let dir = sandbox_dir();
     let file_count = std::fs::read_dir(&dir).map(|d| d.count()).unwrap_or(0);
+    // Shell + user vary by platform (Windows has no SHELL/USER).
+    let (shell, user) = if cfg!(windows) {
+        (
+            std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".into()),
+            std::env::var("USERNAME").unwrap_or_default(),
+        )
+    } else {
+        (
+            std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into()),
+            std::env::var("USER").unwrap_or_default(),
+        )
+    };
     let mut meta = serde_json::json!({
         "working_directory": dir.to_string_lossy(),
         "platform": std::env::consts::OS,
-        "shell": std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into()),
-        "user": std::env::var("USER").unwrap_or_default(),
+        "shell": shell,
+        "user": user,
         "entry_count": file_count,
         "note": "Files synced locally from the remote workspace. Use shell (ls/find/cat) to inspect.",
     });
