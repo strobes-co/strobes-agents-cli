@@ -17,19 +17,16 @@ mod pulse;
 use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
 use crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEventKind,
-    KeyModifiers, MouseEventKind,
+    Event, EventStream, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind,
 };
-use crossterm::execute;
 use futures_util::StreamExt;
-use std::io::stdout;
 use tokio::sync::mpsc;
 
 use app::App;
 use config::Config;
 
 #[derive(Parser)]
-#[command(name = "strobes", about = "Ratatui client for Strobes Agents AI")]
+#[command(name = "strobes", version, about = "Ratatui client for Strobes Agents AI")]
 struct Cli {
     #[command(subcommand)]
     cmd: Option<Cmd>,
@@ -70,6 +67,12 @@ enum Cmd {
         #[arg(long)]
         no_verify: bool,
     },
+    /// Update the CLI to the latest release (downloads + replaces the binary).
+    Update {
+        /// Reinstall even if already on the latest version.
+        #[arg(long)]
+        force: bool,
+    },
     /// List configured tenants (the default is marked with ★).
     Tenants,
     /// Show AI credit usage (org total + per-workspace breakdown).
@@ -108,6 +111,16 @@ enum Cmd {
         #[arg(long)]
         dir: Option<String>,
     },
+    /// Upload local file(s) to a workspace.
+    Push {
+        /// Local file paths to upload.
+        files: Vec<String>,
+        #[arg(long, short)]
+        workspace: Option<String>,
+        /// Destination dir/prefix inside the workspace (default: file name at root).
+        #[arg(long)]
+        dir: Option<String>,
+    },
     /// Headless probe: connect, stream events to stdout, run local tools.
     /// Used to verify the WS + local-execution path without the TUI.
     Probe {
@@ -137,6 +150,7 @@ async fn main() -> Result<()> {
         Cmd::Login { base_url, org_id, master_key, deployment, no_verify } => {
             cmd_login(&mut cfg, &tenant, base_url, org_id, master_key, deployment, no_verify).await
         }
+        Cmd::Update { force } => cmd_update(force).await,
         Cmd::Tenants => cmd_tenants(&cfg),
         Cmd::Credits { workspace, thread } => cmd_credits(&profile, workspace, thread).await,
         Cmd::Status => cmd_status(&profile).await,
@@ -146,14 +160,16 @@ async fn main() -> Result<()> {
             cmd_bind(&mut cfg, &tenant, profile, workspace, new, name, download, dir).await
         }
         Cmd::Pull { workspace, dir } => cmd_pull(&mut cfg, &profile, workspace, dir).await,
+        Cmd::Push { files, workspace, dir } => cmd_push(&cfg, &profile, files, workspace, dir).await,
         Cmd::Chat { thread, workspace, model, new } => {
             // Enter the alternate screen ONCE for the whole interactive flow
             // (pickers + chat) and restore ONCE, so switching between workspace,
             // thread, and chat never flashes the normal terminal.
             let mut terminal = ratatui::init();
-            let _ = execute!(stdout(), EnableMouseCapture);
+            // NOTE: we deliberately do NOT capture the mouse — that lets the
+            // terminal's native click-drag selection + copy work (scrolling is
+            // via PgUp/PgDn/↑↓; ^Y copies the whole transcript).
             let r = chat_flow(&mut terminal, &mut cfg, &tenant, profile, thread, workspace, new, model).await;
-            let _ = execute!(stdout(), DisableMouseCapture);
             ratatui::restore();
             r
         }
@@ -401,6 +417,99 @@ async fn cmd_pull(
     download_workspace(cfg, profile, &ws_id, dir).await
 }
 
+async fn cmd_push(
+    cfg: &Config,
+    profile: &config::Profile,
+    files: Vec<String>,
+    workspace: Option<String>,
+    dir: Option<String>,
+) -> Result<()> {
+    require_complete(profile)?;
+    if files.is_empty() {
+        return Err(anyhow!("nothing to upload — usage: strobes push <file…> [--workspace <id>] [--dir <dest>]"));
+    }
+    let ws = workspace
+        .or_else(|| profile.workspace_id.clone())
+        .ok_or_else(|| anyhow!("no workspace — pass --workspace <UUID> or run `bind` first"))?;
+    let client = api::ApiClient::new(profile.clone())?;
+    let prefix = dir
+        .map(|d| format!("{}/", d.trim_matches('/')))
+        .filter(|d| d.len() > 1)
+        .unwrap_or_default();
+    let sync_roots = workspace_sync_roots(cfg, &ws);
+    for f in &files {
+        let dest = upload_one(&client, &ws, f, &prefix, &sync_roots).await?;
+        println!("✔ {f} → {dest}");
+    }
+    for root in &sync_roots {
+        println!("↕ mirrored into {}", root.display());
+    }
+    println!("done — {} file(s) → workspace {}", files.len(), &ws[..8.min(ws.len())]);
+    Ok(())
+}
+
+/// Read a local file and upload it to `ws` under `prefix`. Returns the dest path.
+///
+/// After the remote upload, the file is mirrored into each of `sync_roots`
+/// (the active workspace sandbox and/or a bound local folder) at `dest`, so the
+/// local copy the agent sees stays in sync — unless the source already *is*
+/// that file.
+async fn upload_one(
+    client: &api::ApiClient,
+    ws: &str,
+    local: &str,
+    prefix: &str,
+    sync_roots: &[std::path::PathBuf],
+) -> Result<String> {
+    let path = std::path::Path::new(local);
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| anyhow!("bad file name: {local}"))?;
+    let bytes = std::fs::read(path).map_err(|e| anyhow!("read {local}: {e}"))?;
+    let dest = format!("{prefix}{name}");
+    client.upload_workspace_file(ws, &dest, bytes.clone()).await?;
+    for root in sync_roots {
+        mirror_into_folder(root, &dest, path, &bytes);
+    }
+    Ok(dest)
+}
+
+/// Local folders that mirror a workspace: the per-workspace sandbox the chat
+/// agent reads from (`config_dir()/workspaces/<ws>`) plus any explicitly bound
+/// folder. Only dirs that already exist are returned, so a stray upload never
+/// pre-creates the sandbox and tricks `spawn_workspace_sync` into skipping the
+/// initial download. Deduplicated.
+fn workspace_sync_roots(cfg: &Config, ws: &str) -> Vec<std::path::PathBuf> {
+    let mut roots: Vec<std::path::PathBuf> = Vec::new();
+    let sandbox = config::config_dir().join("workspaces").join(ws);
+    if sandbox.is_dir() {
+        roots.push(sandbox);
+    }
+    if let Some(d) = cfg.workspace_dirs.get(ws) {
+        let p = std::path::PathBuf::from(d);
+        if !roots.contains(&p) {
+            roots.push(p);
+        }
+    }
+    roots
+}
+
+/// Write `bytes` into `root/dest`, creating parent dirs. No-op if the source
+/// file already resolves to that destination (avoids copying onto itself).
+fn mirror_into_folder(root: &std::path::Path, dest: &str, src: &std::path::Path, bytes: &[u8]) {
+    let target = root.join(dest);
+    if let (Ok(a), Ok(b)) = (src.canonicalize(), target.canonicalize()) {
+        if a == b {
+            return; // already in place
+        }
+    }
+    if let Some(parent) = target.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&target, bytes);
+}
+
 /// Download a workspace zip and extract it to a local folder, recording the
 /// folder binding in config.
 /// Download the workspace zip and extract it into `target`. Returns file count.
@@ -523,7 +632,18 @@ fn spawn_workspace_sync(
                     Err(e) => { let _ = tx.send(pulse::AppEvent::Error(format!("extract task failed: {e}"))); }
                 }
             }
-            Err(e) => { let _ = tx.send(pulse::AppEvent::Error(format!("workspace download failed: {e}"))); }
+            Err(e) => {
+                // An empty workspace (nothing to zip) is benign — show a notice,
+                // not a red error. Detect the backend's "no files" case / 404.
+                let msg = e.to_string();
+                if msg.contains("No files found to download") || msg.contains("HTTP 404") {
+                    let _ = tx.send(pulse::AppEvent::Notice(
+                        "workspace has no files yet — nothing to sync".into(),
+                    ));
+                } else {
+                    let _ = tx.send(pulse::AppEvent::Error(format!("workspace download failed: {e}")));
+                }
+            }
         }
     });
 }
@@ -727,9 +847,17 @@ async fn cmd_status(p: &config::Profile) -> Result<()> {
     println!("workspace   {}", p.workspace_id.clone().unwrap_or_else(|| "(none)".into()));
     println!("thread      {}", p.thread_id.clone().unwrap_or_else(|| "(none)".into()));
     if p.is_complete() {
-        match api::ApiClient::new(p.clone())?.ping().await {
+        let client = api::ApiClient::new(p.clone())?;
+        let (ping, latest) = tokio::join!(client.ping(), latest_release_version());
+        match ping {
             Ok(_) => println!("\n✔ connection OK"),
             Err(e) => println!("\n✗ connection failed: {e}"),
+        }
+        match latest {
+            Some(v) if version_is_newer(&v, env!("CARGO_PKG_VERSION")) => {
+                println!("⬆ update available: v{v} (current v{}) — run `strobes update`", env!("CARGO_PKG_VERSION"));
+            }
+            _ => println!("✔ up to date (v{})", env!("CARGO_PKG_VERSION")),
         }
     }
     Ok(())
@@ -853,8 +981,68 @@ enum Defer {
     Approvals,
     Files,
     OpenFiles,
+    UploadFiles(Vec<std::path::PathBuf>),
     SwitchThread(String),
     BindWorkspace(String),
+}
+
+/// If the input is one or more existing local file paths (e.g. a file dragged
+/// onto the terminal, which inserts its path), return them — so a plain run can
+/// upload instead of sending the path as a chat message. Returns None for
+/// normal text. Handles `~`, quotes and backslash-escaped spaces.
+fn parse_dragged_paths(input: &str) -> Option<Vec<std::path::PathBuf>> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // Tokenize respecting quotes and backslash escapes (how terminals quote
+    // dropped paths with spaces).
+    let mut tokens: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let (mut sq, mut dq) = (false, false);
+    let mut chars = trimmed.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' if !sq => {
+                if let Some(n) = chars.next() {
+                    cur.push(n);
+                }
+            }
+            '\'' if !dq => sq = !sq,
+            '"' if !sq => dq = !dq,
+            c if c.is_whitespace() && !sq && !dq => {
+                if !cur.is_empty() {
+                    tokens.push(std::mem::take(&mut cur));
+                }
+            }
+            c => cur.push(c),
+        }
+    }
+    if !cur.is_empty() {
+        tokens.push(cur);
+    }
+    if tokens.is_empty() {
+        return None;
+    }
+    let mut paths = Vec::new();
+    for t in tokens {
+        // Only treat path-like tokens (with a separator or ~) as drops, so a
+        // normal word/bare filename isn't mistaken for an upload.
+        let pathy = t.contains('/') || t.contains('\\') || t.starts_with('~');
+        if !pathy {
+            return None;
+        }
+        let p = if let Some(rest) = t.strip_prefix("~/") {
+            dirs::home_dir().map(|h| h.join(rest)).unwrap_or_else(|| std::path::PathBuf::from(&t))
+        } else {
+            std::path::PathBuf::from(&t)
+        };
+        if !p.is_file() {
+            return None;
+        }
+        paths.push(p);
+    }
+    Some(paths)
 }
 
 /// Load a thread's history, active-run state and title into the app, running
@@ -967,6 +1155,21 @@ async fn run_chat(
         spawn_workspace_sync(profile.clone(), ws, app_tx.clone());
     }
 
+    // Background: suggest an update if a newer release is published.
+    {
+        let tx = app_tx.clone();
+        tokio::spawn(async move {
+            if let Some(latest) = latest_release_version().await {
+                if version_is_newer(&latest, env!("CARGO_PKG_VERSION")) {
+                    let _ = tx.send(pulse::AppEvent::Notice(format!(
+                        "⬆ update available: v{latest} (you have v{}) — run `strobes update`",
+                        env!("CARGO_PKG_VERSION")
+                    )));
+                }
+            }
+        });
+    }
+
     // Auto-send the setup prompt for a freshly-created workspace.
     if let Some(msg) = initial_msg {
         let msg = msg.trim().to_string();
@@ -980,6 +1183,8 @@ async fn run_chat(
 
     let mut events = EventStream::new();
     let mut viewport_h: u16 = 20;
+    // Drives the working-spinner animation while a turn is running.
+    let mut ticker = tokio::time::interval(std::time::Duration::from_millis(120));
 
     let res = loop {
         terminal.draw(|f| {
@@ -1023,7 +1228,9 @@ async fn run_chat(
                                         _ => {}
                                     }
                                 }
-                                KeyCode::Char('c') if ctrl => { if app.running { handle.cancel(); } }
+                                // ^C exits the app from any picker/overlay (cancels
+                                // an in-flight run first if one is active).
+                                KeyCode::Char('c') if ctrl => { if app.running { handle.cancel(); } else { quit = true; } }
                                 _ => {}
                             }
                         } else if app.awaiting_input() {
@@ -1065,16 +1272,33 @@ async fn run_chat(
                                 KeyCode::Char('a') if ctrl => defer = Some(Defer::Approvals),
                                 KeyCode::Char('l') if ctrl => defer = Some(Defer::Files),
                                 KeyCode::Char('e') if ctrl => defer = Some(Defer::OpenFiles),
+                                KeyCode::Char('y') if ctrl => {
+                                    let text = app.transcript_plaintext();
+                                    match copy_to_clipboard(&text) {
+                                        Ok(_) => app.notice("copied transcript to clipboard"),
+                                        Err(e) => app.on_app_event(pulse::AppEvent::Error(format!("copy failed: {e}"))),
+                                    }
+                                }
                                 KeyCode::Char(c) => app.input.push(c),
                                 KeyCode::Backspace => { app.input.pop(); }
                                 KeyCode::Enter => {
                                     let text = app.input.trim().to_string();
                                     if !text.is_empty() {
-                                        app.echo_user(&text);
-                                        handle.send_user_message(&text);
-                                        app.input.clear();
-                                        app.running = true;
-                                        app.status = "sending…".into();
+                                        // Dragged local file path(s) + a bound
+                                        // workspace → upload instead of sending.
+                                        match parse_dragged_paths(&text) {
+                                            Some(paths) if app.has_workspace => {
+                                                defer = Some(Defer::UploadFiles(paths));
+                                                app.input.clear();
+                                            }
+                                            _ => {
+                                                app.echo_user(&text);
+                                                handle.send_user_message(&text);
+                                                app.input.clear();
+                                                app.running = true;
+                                                app.status = "sending…".into();
+                                            }
+                                        }
                                     }
                                 }
                                 KeyCode::PageUp => app.page(true, viewport_h),
@@ -1098,6 +1322,13 @@ async fn run_chat(
                 match maybe_app {
                     Some(ev) => app.on_app_event(ev),
                     None => quit = true,
+                }
+            }
+            _ = ticker.tick() => {
+                // Advance the spinner only while running; ratatui's diff means
+                // an idle redraw writes nothing.
+                if app.running {
+                    app.tick();
                 }
             }
         }
@@ -1169,6 +1400,33 @@ async fn run_chat(
                     Err(e) => app.on_app_event(pulse::AppEvent::Error(format!("open failed: {e}"))),
                 }
             }
+            Some(Defer::UploadFiles(paths)) => match profile.workspace_id.clone() {
+                Some(ws) => {
+                    // Mirror dropped files into the live workspace sandbox (what
+                    // the agent reads) and any bound folder, so local + remote
+                    // stay in sync.
+                    let sync_roots = workspace_sync_roots(&Config::load(), &ws);
+                    let mut ok = 0usize;
+                    for path in &paths {
+                        let p = path.to_string_lossy().to_string();
+                        match upload_one(&client, &ws, &p, "", &sync_roots).await {
+                            Ok(dest) => {
+                                ok += 1;
+                                app.notice(&format!("⬆ uploaded {dest}"));
+                            }
+                            Err(e) => app.on_app_event(pulse::AppEvent::Error(format!("upload failed: {e}"))),
+                        }
+                    }
+                    if ok > 0 {
+                        let where_to = match sync_roots.first() {
+                            Some(r) => format!(" (synced to {})", r.display()),
+                            None => String::new(),
+                        };
+                        app.notice(&format!("✔ {ok} file(s) uploaded to the workspace{where_to}"));
+                    }
+                }
+                None => app.notice("bind a workspace first, then drop files to upload"),
+            },
             Some(Defer::BindWorkspace(sel)) if sel == "__new_ws__" => {
                 // Create a workspace: ask for a name + optional setup prompt,
                 // then jump into its setup chat (sending the prompt).
@@ -1372,6 +1630,182 @@ fn open_in_file_manager(dir: &std::path::Path) -> Result<()> {
         .spawn()
         .map_err(|e| anyhow!("could not launch {program}: {e}"))?;
     Ok(())
+}
+
+/// Copy text to the system clipboard (pbcopy / clip / wl-copy|xclip|xsel).
+fn copy_to_clipboard(text: &str) -> Result<()> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let tools: &[(&str, &[&str])] = if cfg!(target_os = "macos") {
+        &[("pbcopy", &[])]
+    } else if cfg!(target_os = "windows") {
+        &[("clip", &[])]
+    } else {
+        &[("wl-copy", &[]), ("xclip", &["-selection", "clipboard"]), ("xsel", &["--clipboard", "--input"])]
+    };
+    let mut last = anyhow!("no clipboard tool available");
+    for (prog, args) in tools {
+        match Command::new(prog)
+            .args(*args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(mut child) => {
+                if let Some(mut stdin) = child.stdin.take() {
+                    stdin.write_all(text.as_bytes()).ok();
+                }
+                let _ = child.wait();
+                return Ok(());
+            }
+            Err(e) => last = anyhow!("{prog}: {e}"),
+        }
+    }
+    Err(last)
+}
+
+/// Latest published release version (no leading `v`) from GitHub, or None.
+async fn latest_release_version() -> Option<String> {
+    let client = reqwest::Client::builder()
+        .user_agent(concat!("strobes-cli/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .ok()?;
+    let v: serde_json::Value = client
+        .get("https://api.github.com/repos/strobes-co/strobes-agents-cli/releases/latest")
+        .send()
+        .await
+        .ok()?
+        .json()
+        .await
+        .ok()?;
+    v.get("tag_name")
+        .and_then(|t| t.as_str())
+        .map(|s| s.trim_start_matches('v').to_string())
+}
+
+/// Release target triple for this platform (matches the published assets).
+fn release_target() -> Option<&'static str> {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", "aarch64") => Some("aarch64-apple-darwin"),
+        ("macos", "x86_64") => Some("x86_64-apple-darwin"),
+        ("linux", "x86_64") => Some("x86_64-unknown-linux-gnu"),
+        ("windows", "x86_64") => Some("x86_64-pc-windows-msvc"),
+        _ => None,
+    }
+}
+
+/// Self-update: download the latest release for this platform and replace the
+/// running binary in place. Headless — no TUI.
+async fn cmd_update(force: bool) -> Result<()> {
+    let current = env!("CARGO_PKG_VERSION");
+    println!("strobes v{current}");
+    let latest = latest_release_version()
+        .await
+        .ok_or_else(|| anyhow!("could not reach GitHub to check the latest release"))?;
+    if !force && !version_is_newer(&latest, current) {
+        println!("✔ already up to date (v{current}).");
+        return Ok(());
+    }
+    let target = release_target()
+        .ok_or_else(|| anyhow!("no prebuilt release for {}/{} — build from source",
+            std::env::consts::OS, std::env::consts::ARCH))?;
+    let url = format!(
+        "https://github.com/strobes-co/strobes-agents-cli/releases/latest/download/strobes-{target}.tar.gz"
+    );
+    println!("↓ downloading v{latest} ({target})…");
+    let bytes = reqwest::Client::builder()
+        .user_agent(concat!("strobes-cli/", env!("CARGO_PKG_VERSION")))
+        .build()?
+        .get(&url)
+        .send()
+        .await?
+        .error_for_status()?
+        .bytes()
+        .await?;
+
+    let tmp = std::env::temp_dir().join(format!("strobes-update-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp)?;
+    let tgz = tmp.join("strobes.tar.gz");
+    std::fs::write(&tgz, &bytes)?;
+    // Extract via the system `tar` (present on macOS/Linux and Windows 10+).
+    let ok = std::process::Command::new("tar")
+        .arg("-xzf")
+        .arg(&tgz)
+        .arg("-C")
+        .arg(&tmp)
+        .status()
+        .map_err(|e| anyhow!("tar not available ({e}); extract manually from {url}"))?
+        .success();
+    if !ok {
+        return Err(anyhow!("failed to extract the release archive"));
+    }
+    let binname = if cfg!(windows) { "strobes.exe" } else { "strobes" };
+    let newbin = tmp.join(format!("strobes-{target}")).join(binname);
+    if !newbin.exists() {
+        return Err(anyhow!("binary missing after extraction: {}", newbin.display()));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&newbin, std::fs::Permissions::from_mode(0o755))?;
+    }
+
+    let cur_exe = std::env::current_exe()?;
+    replace_running_exe(&newbin, &cur_exe)?;
+    let _ = std::fs::remove_dir_all(&tmp);
+
+    println!("✔ updated to v{latest} → {}", cur_exe.display());
+    println!("  restart `strobes` to use it.");
+    Ok(())
+}
+
+/// Replace the (possibly running) executable at `cur_exe` with `newbin`.
+fn replace_running_exe(newbin: &std::path::Path, cur_exe: &std::path::Path) -> Result<()> {
+    let dir = cur_exe.parent().ok_or_else(|| anyhow!("cannot resolve install dir"))?;
+    if cfg!(windows) {
+        // Windows can't overwrite a running .exe; move it aside first.
+        let old = cur_exe.with_extension("old");
+        let _ = std::fs::remove_file(&old);
+        std::fs::rename(cur_exe, &old)
+            .map_err(|e| anyhow!("cannot move current exe aside ({e})"))?;
+        std::fs::copy(newbin, cur_exe).map_err(|e| anyhow!("cannot place new exe ({e})"))?;
+        Ok(())
+    } else {
+        // Stage in the same dir, then atomic-rename over the target (works even
+        // while the old binary is running).
+        let staged = dir.join(".strobes-update.tmp");
+        std::fs::copy(newbin, &staged).map_err(|e| {
+            anyhow!("cannot write to {} ({e}). Re-run with sudo, or your install dir isn't writable.", dir.display())
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755));
+        }
+        std::fs::rename(&staged, cur_exe).map_err(|e| {
+            let _ = std::fs::remove_file(&staged);
+            anyhow!("cannot replace {} ({e}). The install dir likely needs sudo.", cur_exe.display())
+        })?;
+        Ok(())
+    }
+}
+
+/// True if dotted-numeric `latest` is newer than `current`.
+fn version_is_newer(latest: &str, current: &str) -> bool {
+    fn parts(s: &str) -> Vec<u64> {
+        s.split('.')
+            .map(|p| p.chars().take_while(|c| c.is_ascii_digit()).collect::<String>().parse().unwrap_or(0))
+            .collect()
+    }
+    let (l, c) = (parts(latest), parts(current));
+    for i in 0..l.len().max(c.len()) {
+        let (lv, cv) = (l.get(i).copied().unwrap_or(0), c.get(i).copied().unwrap_or(0));
+        if lv != cv {
+            return lv > cv;
+        }
+    }
+    false
 }
 
 fn finding_items(fs: Vec<api::Finding>) -> Vec<app::OverlayItem> {
