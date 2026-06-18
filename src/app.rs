@@ -47,6 +47,7 @@ pub enum OverlayKind {
     Approvals,
     Threads,
     Workspaces,
+    Files,
 }
 
 /// One row in an overlay browser. `detail` lines are shown when the row is
@@ -695,7 +696,7 @@ impl App {
             let star = if self.has_workspace { "" } else { "*" };
             // ^F/^A are always offered; without a bound workspace they open the
             // workspace picker first (marked with *).
-            format!("  ^W workspaces · ^O threads · ^F findings{star} · ^A approvals{star} · ^T thinking · ^R md · Esc back · ^C quit")
+            format!("  ^W workspaces · ^O threads · ^F findings{star} · ^A approvals{star} · ^L files · ^E open · ^T thinking · ^R md · Esc back · ^C quit")
         };
         f.render_widget(
             Paragraph::new(text).style(Style::default().fg(Color::DarkGray)),
@@ -1098,7 +1099,7 @@ impl App {
     pub fn overlay_enter(&mut self) -> Option<(OverlayKind, String)> {
         let o = self.overlay.as_mut()?;
         match o.kind {
-            OverlayKind::Findings | OverlayKind::Approvals => {
+            OverlayKind::Findings | OverlayKind::Approvals | OverlayKind::Files => {
                 o.detail_open = !o.detail_open;
                 o.dscroll = 0;
                 None
