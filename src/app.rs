@@ -93,6 +93,12 @@ pub struct App {
     task_label: Option<String>,
     // "authenticated …" subtitle (cached for the overlay banner).
     auth_line: String,
+    // Animation frame for the working spinner.
+    spinner: usize,
+    // When the current turn started (for the elapsed timer).
+    run_started: Option<std::time::Instant>,
+    // Elapsed of the last completed turn (shown briefly when idle).
+    last_elapsed: Option<std::time::Duration>,
     slash_commands: Vec<crate::api::SlashCmd>,
     slash_sel: usize,
     run_credits: f64,
@@ -106,13 +112,18 @@ pub struct App {
 }
 
 /// ASCII banner shown at the top of a fresh chat transcript and the pickers.
-pub const BANNER: &str = r#" ███████╗████████╗██████╗  ██████╗ ██████╗ ███████╗███████╗
- ██╔════╝╚══██╔══╝██╔══██╗██╔═══██╗██╔══██╗██╔════╝██╔════╝
- ███████╗   ██║   ██████╔╝██║   ██║██████╔╝█████╗  ███████╗
- ╚════██║   ██║   ██╔══██╗██║   ██║██╔══██╗██╔══╝  ╚════██║
- ███████║   ██║   ██║  ██║╚██████╔╝██████╔╝███████╗███████║
- ╚══════╝   ╚═╝   ╚═╝  ╚═╝ ╚═════╝ ╚═════╝ ╚══════╝╚══════╝
-            A G E N T S   A I  ·  terminal client"#;
+/// The subtitle carries the build version (via `concat!` + `env!`).
+pub const BANNER: &str = concat!(
+    " ███████╗████████╗██████╗  ██████╗ ██████╗ ███████╗███████╗\n",
+    " ██╔════╝╚══██╔══╝██╔══██╗██╔═══██╗██╔══██╗██╔════╝██╔════╝\n",
+    " ███████╗   ██║   ██████╔╝██║   ██║██████╔╝█████╗  ███████╗\n",
+    " ╚════██║   ██║   ██╔══██╗██║   ██║██╔══██╗██╔══╝  ╚════██║\n",
+    " ███████║   ██║   ██║  ██║╚██████╔╝██████╔╝███████╗███████║\n",
+    " ╚══════╝   ╚═╝   ╚═╝  ╚═╝ ╚═════╝ ╚═════╝ ╚══════╝╚══════╝\n",
+    "            A G E N T S   A I  ·  v",
+    env!("CARGO_PKG_VERSION"),
+    "  ·  terminal client",
+);
 
 impl App {
     pub fn new(thread_id: String, base: String, tenant: String, org_id: String) -> Self {
@@ -123,7 +134,7 @@ impl App {
             status: "connecting…".into(),
             connected: false,
             running: false,
-            show_thinking: true,
+            show_thinking: false,
             markdown: true,
             scroll: 0,
             max_scroll: 0,
@@ -139,6 +150,9 @@ impl App {
             workspace_name: None,
             task_label: None,
             auth_line: String::new(),
+            spinner: 0,
+            run_started: None,
+            last_elapsed: None,
             slash_commands: Vec::new(),
             slash_sel: 0,
             run_credits: 0.0,
@@ -284,6 +298,9 @@ impl App {
                 self.status = "running…".into();
                 self.run_credits = 0.0;
                 self.run_tokens = 0;
+                if self.run_started.is_none() {
+                    self.run_started = Some(std::time::Instant::now());
+                }
             }
             AppEvent::Credits { credits, tokens, final_run } => {
                 if final_run {
@@ -303,7 +320,9 @@ impl App {
             }
             AppEvent::RunFinished(label) => {
                 self.running = false;
-                self.status = format!("idle ({label})");
+                self.last_elapsed = self.run_started.take().map(|t| t.elapsed());
+                let took = self.last_elapsed.map(|d| format!(" · {}", fmt_elapsed(d))).unwrap_or_default();
+                self.status = format!("idle ({label}){took}");
                 self.rule(&label);
             }
             AppEvent::Notice(n) => self.notice(&n),
@@ -545,7 +564,19 @@ impl App {
         }
         if let Some(s) = &self.stream {
             if s.thinking {
-                self.render_thinking(&s.buf, &mut out);
+                if self.show_thinking {
+                    self.render_thinking(&s.buf, &mut out);
+                } else {
+                    // Collapsed: a live "thinking…" indicator with elapsed time.
+                    let el = self
+                        .run_started
+                        .map(|t| format!("  {}", fmt_elapsed(t.elapsed())))
+                        .unwrap_or_default();
+                    out.push(Line::from(Span::styled(
+                        format!("✻ thinking…{el}"),
+                        Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+                    )));
+                }
             } else {
                 if cur_agent.as_deref() != Some(s.agent.as_str()) {
                     blank(&mut out);
@@ -554,6 +585,8 @@ impl App {
                 self.render_md(&s.buf, &mut out);
             }
         }
+        #[cfg(windows)]
+        out.iter_mut().for_each(win_safe_line);
         out
     }
 
@@ -653,7 +686,7 @@ impl App {
                 .block(
                     TuiBlock::default()
                         .borders(Borders::ALL)
-                        .title(format!(" {} ({count}) — Enter view/select · {esc_hint} ", o.title))
+                        .title(format!(" {} ({count}) — Enter view/select · {esc_hint} · ^C quit ", o.title))
                         .border_style(Style::default().fg(Color::Magenta)),
                 )
                 .highlight_style(Style::default().fg(Color::Black).bg(Color::Magenta).add_modifier(Modifier::BOLD))
@@ -689,17 +722,17 @@ impl App {
                 Some(OverlayKind::Workspaces) => "Esc → quit",
                 _ => "Esc close",
             };
-            format!("  ↑/↓ move · Enter view/select · {back}")
+            format!("  ↑/↓ move · Enter view/select · {back} · ^C quit")
         } else if self.pending.is_some() {
             "  type your answer · Enter submit".to_string()
         } else {
             let star = if self.has_workspace { "" } else { "*" };
             // ^F/^A are always offered; without a bound workspace they open the
             // workspace picker first (marked with *).
-            format!("  ^W workspaces · ^O threads · ^F findings{star} · ^A approvals{star} · ^L files · ^E open · ^T thinking · ^R md · Esc back · ^C quit")
+            format!("  ^W workspaces · ^O threads · ^F findings{star} · ^A approvals{star} · ^L files · ^E open · ^Y copy · ^T thinking · ^R md · Esc back · ^C quit")
         };
         f.render_widget(
-            Paragraph::new(text).style(Style::default().fg(Color::DarkGray)),
+            Paragraph::new(win_safe(&text).into_owned()).style(Style::default().fg(Color::DarkGray)),
             area,
         );
     }
@@ -758,7 +791,7 @@ impl App {
             .title(title)
             .border_style(Style::default().fg(color))
             .padding(Padding::horizontal(1));
-        f.render_widget(Paragraph::new(format!("› {}", self.input)).block(block), area);
+        f.render_widget(Paragraph::new(win_safe(&format!("› {}", self.input)).into_owned()).block(block), area);
     }
 
     fn draw_status(&self, f: &mut Frame, area: Rect) {
@@ -781,9 +814,19 @@ impl App {
         }
         let credits = credit_parts.join("  ");
 
+        // Working spinner while a turn is running (covers tool/http waits).
+        const SPIN: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+        let status = if self.running {
+            let el = self
+                .run_started
+                .map(|t| format!("  {}", fmt_elapsed(t.elapsed())))
+                .unwrap_or_default();
+            format!("{} {}{el}", SPIN[self.spinner % SPIN.len()], self.status)
+        } else {
+            self.status.clone()
+        };
         let left = format!(
-            " {dot} {chat}  ·  {}  ·  md:{}  think:{}",
-            self.status,
+            " {dot} {chat}  ·  {status}  ·  md:{}  think:{}",
             if self.markdown { "on" } else { "off" },
             if self.show_thinking { "on" } else { "off" },
         );
@@ -792,18 +835,19 @@ impl App {
         if credits.is_empty() {
             let max = area.width as usize;
             let text: String = left.chars().take(max).collect();
-            f.render_widget(Paragraph::new(text).style(style), area);
+            f.render_widget(Paragraph::new(win_safe(&text).into_owned()).style(style), area);
             return;
         }
         // Reserve the right side for credits; clip only the left (title) side.
+        // (win_safe maps each glyph 1:1 to a char, so widths are unchanged.)
         let cr = format!("{credits} ");
         let cr_w = cr.chars().count() as u16 + 1;
         let parts = Layout::horizontal([Constraint::Min(1), Constraint::Length(cr_w)]).split(area);
         let left_max = parts[0].width as usize;
         let left_txt: String = left.chars().take(left_max).collect();
-        f.render_widget(Paragraph::new(left_txt).style(style), parts[0]);
+        f.render_widget(Paragraph::new(win_safe(&left_txt).into_owned()).style(style), parts[0]);
         f.render_widget(
-            Paragraph::new(cr).style(style).alignment(ratatui::layout::Alignment::Right),
+            Paragraph::new(win_safe(&cr).into_owned()).style(style).alignment(ratatui::layout::Alignment::Right),
             parts[1],
         );
     }
@@ -977,6 +1021,35 @@ impl App {
         self.thread_tokens = tokens;
     }
 
+    /// Advance the working-spinner animation (called on a timer while running).
+    pub fn tick(&mut self) {
+        self.spinner = self.spinner.wrapping_add(1);
+    }
+
+    /// Plain-text dump of the whole conversation (for ^Y → clipboard).
+    pub fn transcript_plaintext(&self) -> String {
+        let mut out = String::new();
+        for b in &self.blocks {
+            match b {
+                Block::User(t) => out.push_str(&format!("You: {t}\n")),
+                Block::Assistant { agent, md } => out.push_str(&format!("{agent}: {md}\n")),
+                Block::Thinking(t) => out.push_str(&format!("[thinking] {t}\n")),
+                Block::Plain(line) => {
+                    for sp in &line.spans {
+                        out.push_str(&sp.content);
+                    }
+                    out.push('\n');
+                }
+                Block::Rule(t) => out.push_str(&format!("{t}\n")),
+            }
+        }
+        if let Some(s) = &self.stream {
+            out.push_str(&s.buf);
+            out.push('\n');
+        }
+        out
+    }
+
     // ---- slash-command autocomplete -----------------------------------
 
     pub fn set_slash_commands(&mut self, cmds: Vec<crate::api::SlashCmd>) {
@@ -1147,6 +1220,10 @@ impl App {
         self.last_task = None;
         self.last_tool = None;
         self.follow = true;
+        // Start the turn's elapsed timer at send (covers the wait before the
+        // server's run.started arrives).
+        self.run_started = Some(std::time::Instant::now());
+        self.last_elapsed = None;
     }
 
     /// Push a dim labelled separator (run boundaries, history/live markers).
@@ -1202,6 +1279,66 @@ fn fmt_tokens(t: i64) -> String {
         format!("{:.1}k tok", t as f64 / 1000.0)
     } else {
         format!("{t} tok")
+    }
+}
+
+/// Windows console renders many decorative glyphs as double-width while
+/// ratatui counts them as one cell — that desyncs the grid and leaves ghost
+/// text. Map the offenders to width-1 ASCII on Windows only.
+#[cfg(windows)]
+fn win_glyph(c: char) -> Option<&'static str> {
+    Some(match c {
+        '●' | '◆' | '⏺' | '◇' | '✻' | '◈' | '⛁' | '⊞' | '◐' | '★' => "*",
+        '○' => "o",
+        '⎿' => "L",
+        '▷' | '➤' | '›' | '↪' => ">",
+        '✔' => "+",
+        '✗' => "x",
+        '⚠' => "!",
+        '➕' => "+",
+        '⬆' => "^",
+        '⟳' => "~",
+        '·' => "-",
+        _ => return None,
+    })
+}
+
+/// Replace ambiguous-width glyphs with ASCII (Windows only; identity elsewhere).
+#[allow(unused_variables)]
+fn win_safe(s: &str) -> std::borrow::Cow<'_, str> {
+    #[cfg(windows)]
+    {
+        if s.chars().any(|c| win_glyph(c).is_some()) {
+            let mut out = String::with_capacity(s.len());
+            for c in s.chars() {
+                match win_glyph(c) {
+                    Some(rep) => out.push_str(rep),
+                    None => out.push(c),
+                }
+            }
+            return std::borrow::Cow::Owned(out);
+        }
+    }
+    std::borrow::Cow::Borrowed(s)
+}
+
+#[cfg(windows)]
+fn win_safe_line(line: &mut Line<'static>) {
+    for span in line.spans.iter_mut() {
+        if span.content.chars().any(|c| win_glyph(c).is_some()) {
+            let replaced = win_safe(&span.content).into_owned();
+            span.content = std::borrow::Cow::Owned(replaced);
+        }
+    }
+}
+
+/// Human elapsed time: 8s · 1:07 · 12:30.
+fn fmt_elapsed(d: std::time::Duration) -> String {
+    let s = d.as_secs();
+    if s < 60 {
+        format!("{s}s")
+    } else {
+        format!("{}:{:02}", s / 60, s % 60)
     }
 }
 
