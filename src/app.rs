@@ -10,7 +10,7 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block as TuiBlock, Borders, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block as TuiBlock, Borders, Clear, List, ListItem, ListState, Padding, Paragraph, Wrap},
     Frame,
 };
 
@@ -47,6 +47,7 @@ pub enum OverlayKind {
     Approvals,
     Threads,
     Workspaces,
+    Files,
 }
 
 /// One row in an overlay browser. `detail` lines are shown when the row is
@@ -87,16 +88,34 @@ pub struct App {
     last_tool: Option<String>,
     overlay: Option<Overlay>,
     pub has_workspace: bool,
+    // Shown top-right in the transcript: where work is running.
+    workspace_name: Option<String>,
+    task_label: Option<String>,
+    // "authenticated …" subtitle (cached for the overlay banner).
+    auth_line: String,
     slash_commands: Vec<crate::api::SlashCmd>,
     slash_sel: usize,
     run_credits: f64,
     run_tokens: i64,
     session_credits: f64,
     session_tokens: i64,
+    // Lifetime usage for THIS thread (from cli/credits at open, kept current as
+    // each run completes).
+    thread_credits: f64,
+    thread_tokens: i64,
 }
 
+/// ASCII banner shown at the top of a fresh chat transcript and the pickers.
+pub const BANNER: &str = r#" ███████╗████████╗██████╗  ██████╗ ██████╗ ███████╗███████╗
+ ██╔════╝╚══██╔══╝██╔══██╗██╔═══██╗██╔══██╗██╔════╝██╔════╝
+ ███████╗   ██║   ██████╔╝██║   ██║██████╔╝█████╗  ███████╗
+ ╚════██║   ██║   ██╔══██╗██║   ██║██╔══██╗██╔══╝  ╚════██║
+ ███████║   ██║   ██║  ██║╚██████╔╝██████╔╝███████╗███████║
+ ╚══════╝   ╚═╝   ╚═╝  ╚═╝ ╚═════╝ ╚═════╝ ╚══════╝╚══════╝
+            A G E N T S   A I  ·  terminal client"#;
+
 impl App {
-    pub fn new(thread_id: String, base: String) -> Self {
+    pub fn new(thread_id: String, base: String, tenant: String, org_id: String) -> Self {
         let mut app = Self {
             blocks: Vec::new(),
             stream: None,
@@ -117,14 +136,31 @@ impl App {
             last_tool: None,
             overlay: None,
             has_workspace: false,
+            workspace_name: None,
+            task_label: None,
+            auth_line: String::new(),
             slash_commands: Vec::new(),
             slash_sel: 0,
             run_credits: 0.0,
             run_tokens: 0,
             session_credits: 0.0,
             session_tokens: 0,
+            thread_credits: 0.0,
+            thread_tokens: 0,
         };
-        app.sys("Strobes Agents AI — Ratatui client");
+        // Banner (cyan) + the authenticated tenant on top.
+        for line in BANNER.lines() {
+            app.blocks.push(Block::Plain(Line::from(Span::styled(
+                line.to_string(),
+                Style::default().fg(Color::Cyan),
+            ))));
+        }
+        let org = if org_id.len() > 8 { &org_id[..8] } else { &org_id };
+        app.auth_line = format!("✔ authenticated · tenant: {tenant} · {} · org {org}", app.base);
+        app.blocks.push(Block::Plain(Line::from(Span::styled(
+            format!("  {}", app.auth_line),
+            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+        ))));
         app.sys("Enter: send · Ctrl-C: cancel/quit · Esc: quit · PgUp/PgDn: scroll · Ctrl-T: thinking · Ctrl-R: markdown");
         app
     }
@@ -251,10 +287,12 @@ impl App {
             }
             AppEvent::Credits { credits, tokens, final_run } => {
                 if final_run {
-                    // Authoritative run total → fold into the session and show
-                    // it as the run's figure.
+                    // Authoritative run total → fold into the session and thread
+                    // lifetime, and show it as the run's figure.
                     self.session_credits += credits;
                     self.session_tokens += tokens;
+                    self.thread_credits += credits;
+                    self.thread_tokens += tokens;
                     self.run_credits = credits;
                     self.run_tokens = tokens;
                 } else {
@@ -438,6 +476,7 @@ impl App {
                     format!("◇ {title}"),
                     Style::default().fg(Color::Yellow).add_modifier(Modifier::DIM),
                 ))));
+                self.task_label = Some(title.clone());
                 self.last_task = Some(title);
                 self.last_tool = None;
                 self.follow = true;
@@ -553,6 +592,8 @@ impl App {
         ])
         .split(f.area());
         if self.overlay.is_some() {
+            // Close the chat view: show only the picker, anchored to the bottom
+            // of the screen (just above the input bar).
             self.draw_overlay(f, chunks[0]);
         } else {
             self.draw_transcript(f, chunks[0]);
@@ -593,30 +634,69 @@ impl App {
             let mut state = ListState::default();
             state.select(Some(o.sel));
             let count = o.items.len();
+            // Anchor the picker to the bottom of the area (just above the input),
+            // sized to its contents but capped to the available height.
+            let needed = (count as u16).saturating_add(2);
+            let h = needed.clamp(3, area.height.max(3));
+            let oarea = Rect {
+                x: area.x,
+                y: area.y + area.height.saturating_sub(h),
+                width: area.width,
+                height: h,
+            };
+            let esc_hint = match o.kind {
+                OverlayKind::Threads => "Esc → workspaces",
+                OverlayKind::Workspaces => "Esc quit",
+                _ => "Esc close",
+            };
             let list = List::new(items)
                 .block(
                     TuiBlock::default()
                         .borders(Borders::ALL)
-                        .title(format!(" {} ({count}) — Enter view/select · Esc close ", o.title))
+                        .title(format!(" {} ({count}) — Enter view/select · {esc_hint} ", o.title))
                         .border_style(Style::default().fg(Color::Magenta)),
                 )
                 .highlight_style(Style::default().fg(Color::Black).bg(Color::Magenta).add_modifier(Modifier::BOLD))
                 .highlight_symbol("➤ ");
+            // ASCII banner (+ authenticated line) above the bottom-anchored picker.
+            let top_h = area.height.saturating_sub(h);
+            if top_h >= 3 {
+                let mut banner: Vec<Line<'static>> = BANNER
+                    .lines()
+                    .map(|l| Line::from(Span::styled(l.to_string(), Style::default().fg(Color::Cyan))))
+                    .collect();
+                if !self.auth_line.is_empty() {
+                    banner.push(Line::from(Span::styled(
+                        format!("  {}", self.auth_line),
+                        Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                    )));
+                }
+                f.render_widget(
+                    Paragraph::new(banner),
+                    Rect { x: area.x, y: area.y, width: area.width, height: top_h },
+                );
+            }
             let mut s = state;
-            f.render_stateful_widget(list, area, &mut s);
+            f.render_widget(Clear, oarea);
+            f.render_stateful_widget(list, oarea, &mut s);
         }
     }
 
     fn draw_hint(&self, f: &mut Frame, area: Rect) {
         let text = if self.overlay.is_some() {
-            "  ↑/↓ move · Enter view/select · Esc close".to_string()
+            let back = match self.overlay_kind() {
+                Some(OverlayKind::Threads) => "Esc → workspaces",
+                Some(OverlayKind::Workspaces) => "Esc → quit",
+                _ => "Esc close",
+            };
+            format!("  ↑/↓ move · Enter view/select · {back}")
         } else if self.pending.is_some() {
             "  type your answer · Enter submit".to_string()
         } else {
             let star = if self.has_workspace { "" } else { "*" };
             // ^F/^A are always offered; without a bound workspace they open the
             // workspace picker first (marked with *).
-            format!("  ^W workspaces · ^O threads · ^F findings{star} · ^A approvals{star} · ^T thinking · ^R md · Esc quit")
+            format!("  ^W workspaces · ^O threads · ^F findings{star} · ^A approvals{star} · ^L files · ^E open · ^T thinking · ^R md · Esc back · ^C quit")
         };
         f.render_widget(
             Paragraph::new(text).style(Style::default().fg(Color::DarkGray)),
@@ -625,13 +705,34 @@ impl App {
     }
 
     fn draw_transcript(&mut self, f: &mut Frame, area: Rect) {
+        // Inner padding so messages don't touch the borders.
+        const PAD_X: u16 = 2;
+        const PAD_Y: u16 = 1;
         let lines = self.build_lines();
-        let block = TuiBlock::default()
+        let mut block = TuiBlock::default()
             .borders(Borders::ALL)
             .title(" transcript ")
-            .border_style(Style::default().fg(Color::Cyan));
-        let inner_w = area.width.saturating_sub(2);
-        let inner_h = area.height.saturating_sub(2);
+            .border_style(Style::default().fg(Color::Cyan))
+            .padding(Padding::new(PAD_X, PAD_X, PAD_Y, PAD_Y));
+        // Top-right: where work runs — workspace · current task.
+        let mut loc: Vec<String> = Vec::new();
+        if let Some(ws) = &self.workspace_name {
+            loc.push(format!("⊞ {}", truncate(ws, 28)));
+        }
+        if let Some(t) = &self.task_label {
+            loc.push(format!("▷ {}", truncate(t, 32)));
+        }
+        if !loc.is_empty() {
+            block = block.title_top(
+                Line::from(Span::styled(
+                    format!(" {} ", loc.join("  ·  ")),
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                ))
+                .right_aligned(),
+            );
+        }
+        let inner_w = area.width.saturating_sub(2 + 2 * PAD_X);
+        let inner_h = area.height.saturating_sub(2 + 2 * PAD_Y);
 
         let para = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
         let total = para.line_count(inner_w) as u16;
@@ -655,7 +756,8 @@ impl App {
         let block = TuiBlock::default()
             .borders(Borders::ALL)
             .title(title)
-            .border_style(Style::default().fg(color));
+            .border_style(Style::default().fg(color))
+            .padding(Padding::horizontal(1));
         f.render_widget(Paragraph::new(format!("› {}", self.input)).block(block), area);
     }
 
@@ -666,29 +768,43 @@ impl App {
         } else {
             truncate(&self.title, 48)
         };
-        // Credits: show the current run's usage while running, else the
-        // session total.
-        let credits = if self.running && self.run_credits > 0.0 {
-            format!("◈ {:.3} cr · {}", self.run_credits, fmt_tokens(self.run_tokens))
-        } else if self.session_credits > 0.0 {
-            format!("◈ Σ {:.3} cr · {}", self.session_credits, fmt_tokens(self.session_tokens))
-        } else {
-            String::new()
-        };
-        let mut text = format!(
-            " {dot} {chat}  ·  {}  ·  {credits}  ·  md:{}  think:{}",
+        // Live credit utilization: the current run's usage while it streams,
+        // plus the running session total. Pinned to the right so it is never
+        // clipped by a long thread title.
+        let mut credit_parts: Vec<String> = Vec::new();
+        if self.running && self.run_credits > 0.0 {
+            credit_parts.push(format!("◈ {:.3} cr · {}", self.run_credits, fmt_tokens(self.run_tokens)));
+        }
+        // Lifetime usage for this chat (⛁), kept live as runs complete.
+        if self.thread_credits > 0.0 {
+            credit_parts.push(format!("⛁ {:.3} cr · {}", self.thread_credits, fmt_tokens(self.thread_tokens)));
+        }
+        let credits = credit_parts.join("  ");
+
+        let left = format!(
+            " {dot} {chat}  ·  {}  ·  md:{}  think:{}",
             self.status,
             if self.markdown { "on" } else { "off" },
             if self.show_thinking { "on" } else { "off" },
         );
-        // Hard-clip to the bar width so the title can never overflow/overlap.
-        let max = area.width as usize;
-        if text.chars().count() > max {
-            text = text.chars().take(max).collect();
+        let style = Style::default().fg(Color::Black).bg(Color::Cyan);
+
+        if credits.is_empty() {
+            let max = area.width as usize;
+            let text: String = left.chars().take(max).collect();
+            f.render_widget(Paragraph::new(text).style(style), area);
+            return;
         }
+        // Reserve the right side for credits; clip only the left (title) side.
+        let cr = format!("{credits} ");
+        let cr_w = cr.chars().count() as u16 + 1;
+        let parts = Layout::horizontal([Constraint::Min(1), Constraint::Length(cr_w)]).split(area);
+        let left_max = parts[0].width as usize;
+        let left_txt: String = left.chars().take(left_max).collect();
+        f.render_widget(Paragraph::new(left_txt).style(style), parts[0]);
         f.render_widget(
-            Paragraph::new(text).style(Style::default().fg(Color::Black).bg(Color::Cyan)),
-            area,
+            Paragraph::new(cr).style(style).alignment(ratatui::layout::Alignment::Right),
+            parts[1],
         );
     }
 
@@ -834,12 +950,31 @@ impl App {
         self.overlay.is_some()
     }
 
+    pub fn overlay_kind(&self) -> Option<OverlayKind> {
+        self.overlay.as_ref().map(|o| o.kind)
+    }
+
+    pub fn overlay_detail_open(&self) -> bool {
+        self.overlay.as_ref().map(|o| o.detail_open).unwrap_or(false)
+    }
+
     pub fn close_overlay(&mut self) {
         self.overlay = None;
     }
 
     pub fn set_title(&mut self, title: String) {
         self.title = title;
+    }
+
+    /// Name of the bound workspace (shown top-right in the transcript).
+    pub fn set_workspace_name(&mut self, name: String) {
+        self.workspace_name = if name.is_empty() { None } else { Some(name) };
+    }
+
+    /// Seed the current thread's lifetime credit usage (from the credits API).
+    pub fn set_thread_credits(&mut self, credits: f64, tokens: i64) {
+        self.thread_credits = credits;
+        self.thread_tokens = tokens;
     }
 
     // ---- slash-command autocomplete -----------------------------------
@@ -964,7 +1099,7 @@ impl App {
     pub fn overlay_enter(&mut self) -> Option<(OverlayKind, String)> {
         let o = self.overlay.as_mut()?;
         match o.kind {
-            OverlayKind::Findings | OverlayKind::Approvals => {
+            OverlayKind::Findings | OverlayKind::Approvals | OverlayKind::Files => {
                 o.detail_open = !o.detail_open;
                 o.dscroll = 0;
                 None
@@ -1000,6 +1135,9 @@ impl App {
         self.follow = true;
         self.thread_id = thread_id;
         self.title = String::new();
+        self.task_label = None;
+        self.thread_credits = 0.0;
+        self.thread_tokens = 0;
         self.sys("Strobes Agents AI — Ratatui client");
     }
 

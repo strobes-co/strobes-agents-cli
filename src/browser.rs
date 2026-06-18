@@ -12,6 +12,7 @@ use chromiumoxide::browser::{Browser, BrowserConfig};
 use chromiumoxide::page::Page;
 use futures_util::StreamExt;
 use serde_json::Value;
+use std::path::PathBuf;
 use std::sync::OnceLock;
 use tokio::sync::Mutex;
 
@@ -28,8 +29,26 @@ fn cell() -> &'static Mutex<Option<Session>> {
 
 async fn ensure(guard: &mut Option<Session>) -> Result<&mut Session> {
     if guard.is_none() {
+        // Resolve a Chrome/Chromium binary. Missing → auto-install (opt-in) or
+        // a clear, platform-specific install message the agent/user can act on.
+        let chrome = match find_chrome() {
+            Some(p) => p,
+            None => {
+                if std::env::var("STROBES_AI_BROWSER_AUTOINSTALL").as_deref() == Ok("1") {
+                    autoinstall_chrome().await.map_err(|e| {
+                        anyhow!("Chrome auto-install failed: {e}\n\n{}", install_instructions())
+                    })?
+                } else {
+                    return Err(anyhow!("{}", install_instructions()));
+                }
+            }
+        };
         let headless = std::env::var("STROBES_AI_BROWSER_HEADLESS").as_deref() == Ok("1");
+        // Per-process profile dir so we never wedge on a stale SingletonLock.
+        let profile = std::env::temp_dir().join(format!("strobes-chrome-{}", std::process::id()));
         let mut builder = BrowserConfig::builder()
+            .chrome_executable(&chrome)
+            .user_data_dir(&profile)
             .arg("--no-sandbox")
             .arg("--disable-dev-shm-usage");
         if !headless {
@@ -46,6 +65,145 @@ async fn ensure(guard: &mut Option<Session>) -> Result<&mut Session> {
     Ok(guard.as_mut().unwrap())
 }
 
+/// Where auto-installed Chrome for Testing lives.
+fn chrome_cache_dir() -> PathBuf {
+    crate::config::config_dir().join("chrome")
+}
+
+/// Chrome for Testing platform key + the binary path inside its zip.
+fn cft_platform() -> Option<&'static str> {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", "aarch64") => Some("mac-arm64"),
+        ("macos", "x86_64") => Some("mac-x64"),
+        ("linux", "x86_64") => Some("linux64"),
+        ("windows", "x86_64") => Some("win64"),
+        _ => None,
+    }
+}
+
+fn cft_binary_rel(platform: &str) -> PathBuf {
+    match platform {
+        "mac-arm64" | "mac-x64" => PathBuf::from(format!("chrome-{platform}"))
+            .join("Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing"),
+        "win64" => PathBuf::from("chrome-win64").join("chrome.exe"),
+        _ => PathBuf::from(format!("chrome-{platform}")).join("chrome"),
+    }
+}
+
+/// First Chrome/Chromium found: `STROBES_AI_CHROME`, our cached install, common
+/// system locations, then `PATH`.
+fn find_chrome() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("STROBES_AI_CHROME") {
+        let p = PathBuf::from(p);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    if let Some(plat) = cft_platform() {
+        let p = chrome_cache_dir().join(cft_binary_rel(plat));
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    for p in system_candidates() {
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    for name in ["google-chrome", "google-chrome-stable", "chromium", "chromium-browser", "chrome"] {
+        if let Some(p) = which(name) {
+            return Some(p);
+        }
+    }
+    None
+}
+
+fn system_candidates() -> Vec<PathBuf> {
+    match std::env::consts::OS {
+        "macos" => vec![
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome".into(),
+            "/Applications/Chromium.app/Contents/MacOS/Chromium".into(),
+            "/Applications/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing".into(),
+        ],
+        "windows" => vec![
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe".into(),
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe".into(),
+        ],
+        _ => vec![
+            "/usr/bin/google-chrome".into(),
+            "/usr/bin/google-chrome-stable".into(),
+            "/usr/bin/chromium".into(),
+            "/usr/bin/chromium-browser".into(),
+            "/snap/bin/chromium".into(),
+        ],
+    }
+}
+
+fn which(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    let name = if cfg!(windows) { format!("{name}.exe") } else { name.to_string() };
+    std::env::split_paths(&path)
+        .map(|d| d.join(&name))
+        .find(|p| p.is_file())
+}
+
+/// Platform-specific guidance returned when no browser is available.
+fn install_instructions() -> String {
+    let how = match std::env::consts::OS {
+        "macos" => "Install Google Chrome:\n  • brew install --cask google-chrome\n  • or download https://www.google.com/chrome/",
+        "windows" => "Install Google Chrome:\n  • winget install -e --id Google.Chrome\n  • or download https://www.google.com/chrome/",
+        "linux" => "Install Chrome/Chromium:\n  • Debian/Ubuntu: sudo apt install -y chromium   (or google-chrome-stable)\n  • Fedora: sudo dnf install -y chromium\n  • or download https://www.google.com/chrome/",
+        _ => "Install Google Chrome / Chromium from https://www.google.com/chrome/",
+    };
+    format!(
+        "Google Chrome / Chromium is required for browser_* tools but none was found.\n\n{how}\n\n\
+         Already installed elsewhere? Point at it: STROBES_AI_CHROME=/path/to/chrome\n\
+         Or auto-download a self-contained Chrome for Testing: set STROBES_AI_BROWSER_AUTOINSTALL=1 and retry."
+    )
+}
+
+/// Download + cache a self-contained Chrome for Testing build (opt-in).
+async fn autoinstall_chrome() -> Result<PathBuf> {
+    let plat = cft_platform().ok_or_else(|| {
+        anyhow!("auto-install is unavailable on {}/{}", std::env::consts::OS, std::env::consts::ARCH)
+    })?;
+    let dest = chrome_cache_dir().join(cft_binary_rel(plat));
+    if dest.exists() {
+        return Ok(dest);
+    }
+    let manifest: Value = reqwest::get(
+        "https://googlechromelabs.github.io/chrome-for-testing/last-known-good-versions-with-downloads.json",
+    )
+    .await?
+    .json()
+    .await?;
+    let url = manifest["channels"]["Stable"]["downloads"]["chrome"]
+        .as_array()
+        .and_then(|arr| arr.iter().find(|d| d["platform"].as_str() == Some(plat)))
+        .and_then(|d| d["url"].as_str())
+        .ok_or_else(|| anyhow!("no Chrome for Testing build for {plat}"))?
+        .to_string();
+
+    let bytes = reqwest::get(&url).await?.bytes().await?;
+    let dir = chrome_cache_dir();
+    std::fs::create_dir_all(&dir)?;
+    let cursor = std::io::Cursor::new(bytes.to_vec());
+    let mut zip = zip::ZipArchive::new(cursor)?;
+    zip.extract(&dir)?;
+
+    #[cfg(unix)]
+    if dest.exists() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perm = std::fs::metadata(&dest)?.permissions();
+        perm.set_mode(0o755);
+        std::fs::set_permissions(&dest, perm)?;
+    }
+    if !dest.exists() {
+        return Err(anyhow!("extracted Chrome for Testing but binary missing at {}", dest.display()));
+    }
+    Ok(dest)
+}
+
 fn s<'a>(input: &'a Value, key: &str) -> &'a str {
     input.get(key).and_then(|v| v.as_str()).unwrap_or("")
 }
@@ -54,9 +212,8 @@ fn s<'a>(input: &'a Value, key: &str) -> &'a str {
 /// an error string on failure (incl. "Chrome not found").
 pub async fn handle(cmd: &str, input: &Value) -> std::result::Result<String, String> {
     let mut guard = cell().lock().await;
-    let sess = ensure(&mut guard)
-        .await
-        .map_err(|e| format!("browser launch failed: {e} (is Google Chrome / Chromium installed?)"))?;
+    // ensure() returns a clear, actionable message when Chrome is missing.
+    let sess = ensure(&mut guard).await.map_err(|e| e.to_string())?;
     run(cmd, input, sess).await.map_err(|e| e.to_string())
 }
 
