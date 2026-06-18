@@ -148,15 +148,21 @@ pub async fn select_with(
 
 /// Banner lines (cyan art + an optional green "authenticated …" subtitle).
 fn banner_lines(auth: &str) -> Vec<Line<'static>> {
-    let mut v: Vec<Line<'static>> = crate::app::BANNER
-        .lines()
-        .map(|l| Line::from(Span::styled(l.to_string(), Style::default().fg(Color::Cyan))))
-        .collect();
-    if !auth.is_empty() {
-        v.push(Line::from(Span::styled(
-            format!("  {auth}"),
-            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
-        )));
+    // Left indent + a blank top line so the art isn't jammed into the corner.
+    const LEFT: &str = "   ";
+    let mut v: Vec<Line<'static>> = vec![Line::default()];
+    v.extend(crate::app::BANNER.lines().map(|l| {
+        Line::from(Span::styled(format!("{LEFT}{l}"), Style::default().fg(Color::Cyan)))
+    }));
+    // `auth` may carry extra context lines (e.g. the selected workspace) joined
+    // with '\n'; the first is the auth line (green), the rest are cyan context.
+    for (i, line) in auth.split('\n').filter(|l| !l.is_empty()).enumerate() {
+        let style = if i == 0 {
+            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+        };
+        v.push(Line::from(Span::styled(format!("{LEFT}{line}"), style)));
     }
     v
 }

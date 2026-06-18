@@ -149,6 +149,17 @@ fn hosts_file_lookup(host: &str) -> Option<std::net::IpAddr> {
     None
 }
 
+/// How often (and how recently) a workspace has been opened from this machine,
+/// used to surface frequently-used workspaces at the top of the picker.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WorkspaceUsage {
+    #[serde(default)]
+    pub count: u64,
+    /// Unix seconds of the most recent open (0 if never recorded).
+    #[serde(default)]
+    pub last_opened: u64,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default = "default_profile_name")]
@@ -158,6 +169,9 @@ pub struct Config {
     /// Local folders bound to workspaces (workspace_id -> absolute path).
     #[serde(default)]
     pub workspace_dirs: BTreeMap<String, String>,
+    /// Per-workspace open counts (workspace_id -> usage), for "recent" ranking.
+    #[serde(default)]
+    pub workspace_usage: BTreeMap<String, WorkspaceUsage>,
 }
 
 fn default_profile_name() -> String {
@@ -199,6 +213,30 @@ impl Config {
         let json = serde_json::to_string_pretty(self)?;
         std::fs::write(&path, json)?;
         Ok(())
+    }
+
+    /// Record that a workspace was opened (bumps its count + last-opened time).
+    pub fn record_workspace_open(&mut self, ws_id: &str) {
+        if ws_id.is_empty() {
+            return;
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let u = self.workspace_usage.entry(ws_id.to_string()).or_default();
+        u.count += 1;
+        u.last_opened = now;
+    }
+
+    /// How many times a workspace has been opened from this machine.
+    pub fn workspace_open_count(&self, ws_id: &str) -> u64 {
+        self.workspace_usage.get(ws_id).map(|u| u.count).unwrap_or(0)
+    }
+
+    /// Most-recent-open timestamp for a workspace (0 if never opened).
+    pub fn workspace_last_opened(&self, ws_id: &str) -> u64 {
+        self.workspace_usage.get(ws_id).map(|u| u.last_opened).unwrap_or(0)
     }
 
     /// Active profile with environment-variable overrides applied.
@@ -258,4 +296,42 @@ pub fn redact(secret: &str) -> String {
         return "*".repeat(secret.len());
     }
     format!("{}…{}", &secret[..4], &secret[secret.len() - 4..])
+}
+
+#[cfg(test)]
+mod usage_tests {
+    use super::*;
+
+    #[test]
+    fn records_and_counts_opens() {
+        let mut c = Config::default();
+        assert_eq!(c.workspace_open_count("a"), 0);
+        c.record_workspace_open("a");
+        c.record_workspace_open("a");
+        c.record_workspace_open("b");
+        assert_eq!(c.workspace_open_count("a"), 2);
+        assert_eq!(c.workspace_open_count("b"), 1);
+        assert!(c.workspace_last_opened("a") > 0);
+        // empty ids are ignored
+        c.record_workspace_open("");
+        assert_eq!(c.workspace_open_count(""), 0);
+    }
+
+    #[test]
+    fn ranks_most_opened_first() {
+        let mut c = Config::default();
+        c.record_workspace_open("low");
+        c.record_workspace_open("mid");
+        c.record_workspace_open("mid");
+        for _ in 0..3 {
+            c.record_workspace_open("high");
+        }
+        let mut ids = vec!["never", "low", "high", "mid"];
+        ids.sort_by(|a, b| {
+            c.workspace_open_count(b)
+                .cmp(&c.workspace_open_count(a))
+                .then(c.workspace_last_opened(b).cmp(&c.workspace_last_opened(a)))
+        });
+        assert_eq!(ids, vec!["high", "mid", "low", "never"]);
+    }
 }

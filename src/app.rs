@@ -18,6 +18,14 @@ use serde_json::{Map, Value};
 
 use crate::pulse::{AppEvent, Field, StreamItem};
 
+/// Execution state of a tool call, driving its dot colour/animation.
+#[derive(Clone, Copy, PartialEq)]
+enum ToolStatus {
+    Running,
+    Done,
+    Failed,
+}
+
 /// One transcript entry.
 enum Block {
     User(String),
@@ -25,6 +33,9 @@ enum Block {
     Thinking(String),
     Plain(Line<'static>),
     Rule(String),
+    /// A tool call line ("⏺ name(args)") with a live status: the dot blinks
+    /// while Running, then turns green (Done) or red (Failed).
+    Tool { name: String, detail: String, status: ToolStatus },
 }
 
 struct Stream {
@@ -63,15 +74,41 @@ struct Overlay {
     kind: OverlayKind,
     title: String,
     items: Vec<OverlayItem>,
+    /// Position of the cursor within the *filtered* (visible) list.
     sel: usize,
     detail_open: bool,
     dscroll: u16,
+    /// Type-to-search filter (case-insensitive substring over item labels).
+    filter: String,
+}
+
+impl Overlay {
+    /// Indices into `items` that match the current filter (all when empty).
+    fn visible(&self) -> Vec<usize> {
+        if self.filter.is_empty() {
+            return (0..self.items.len()).collect();
+        }
+        let needle = self.filter.to_lowercase();
+        self.items
+            .iter()
+            .enumerate()
+            .filter(|(_, it)| it.label.to_lowercase().contains(&needle))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// The real `items` index under the cursor (maps sel → filtered item).
+    fn current(&self) -> Option<usize> {
+        self.visible().get(self.sel).copied()
+    }
 }
 
 pub struct App {
     blocks: Vec<Block>,
     stream: Option<Stream>,
     pub input: String,
+    /// Byte offset of the edit cursor within `input` (always on a char boundary).
+    input_cursor: usize,
     pub status: String,
     pub connected: bool,
     pub running: bool,
@@ -80,6 +117,9 @@ pub struct App {
     pub scroll: u16,
     pub max_scroll: u16,
     pub follow: bool,
+    /// The user scrolled up to read; suppress auto-scroll (even while output
+    /// streams) until they return to the bottom.
+    pub pinned: bool,
     pub thread_id: String,
     pub title: String,
     pub base: String,
@@ -131,6 +171,7 @@ impl App {
             blocks: Vec::new(),
             stream: None,
             input: String::new(),
+            input_cursor: 0,
             status: "connecting…".into(),
             connected: false,
             running: false,
@@ -139,6 +180,7 @@ impl App {
             scroll: 0,
             max_scroll: 0,
             follow: true,
+            pinned: false,
             thread_id,
             title: String::new(),
             base,
@@ -162,17 +204,19 @@ impl App {
             thread_credits: 0.0,
             thread_tokens: 0,
         };
-        // Banner (cyan) + the authenticated tenant on top.
+        // Banner (cyan) + the authenticated tenant on top, indented to match
+        // the picker pages.
+        const LEFT: &str = "   ";
         for line in BANNER.lines() {
             app.blocks.push(Block::Plain(Line::from(Span::styled(
-                line.to_string(),
+                format!("{LEFT}{line}"),
                 Style::default().fg(Color::Cyan),
             ))));
         }
         let org = if org_id.len() > 8 { &org_id[..8] } else { &org_id };
         app.auth_line = format!("✔ authenticated · tenant: {tenant} · {} · org {org}", app.base);
         app.blocks.push(Block::Plain(Line::from(Span::styled(
-            format!("  {}", app.auth_line),
+            format!("{LEFT}{}", app.auth_line),
             Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
         ))));
         app.sys("Enter: send · Ctrl-C: cancel/quit · Esc: quit · PgUp/PgDn: scroll · Ctrl-T: thinking · Ctrl-R: markdown");
@@ -196,6 +240,31 @@ impl App {
                 self.blocks.push(Block::Thinking(s.buf));
             } else {
                 self.push_assistant(s.agent, s.buf);
+            }
+        }
+    }
+
+    /// Mark the most recent still-running tool as finished (green on success,
+    /// red on failure), stopping its blink.
+    fn finish_last_tool(&mut self, ok: bool) {
+        for b in self.blocks.iter_mut().rev() {
+            if let Block::Tool { status, .. } = b {
+                if *status == ToolStatus::Running {
+                    *status = if ok { ToolStatus::Done } else { ToolStatus::Failed };
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Settle any tools still marked Running (e.g. when a run ends without an
+    /// explicit per-tool result) so nothing is left blinking.
+    pub fn settle_running_tools(&mut self) {
+        for b in self.blocks.iter_mut() {
+            if let Block::Tool { status, .. } = b {
+                if *status == ToolStatus::Running {
+                    *status = ToolStatus::Done;
+                }
             }
         }
     }
@@ -291,6 +360,7 @@ impl App {
             AppEvent::Disconnected(why) => {
                 self.connected = false;
                 self.running = false;
+                self.settle_running_tools();
                 self.status = format!("disconnected — {why}");
             }
             AppEvent::RunStarted => {
@@ -320,6 +390,7 @@ impl App {
             }
             AppEvent::RunFinished(label) => {
                 self.running = false;
+                self.settle_running_tools();
                 self.last_elapsed = self.run_started.take().map(|t| t.elapsed());
                 let took = self.last_elapsed.map(|d| format!(" · {}", fmt_elapsed(d))).unwrap_or_default();
                 self.status = format!("idle ({label}){took}");
@@ -440,23 +511,18 @@ impl App {
                 // same call — collapse them by replacing the previous line.
                 let name = item.tool_name.unwrap_or_default();
                 let detail = item.detail.unwrap_or_default();
-                let mut spans = vec![Span::styled(
-                    format!("⏺ {name}"),
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-                )];
-                if !detail.is_empty() {
-                    spans.push(Span::styled(format!("({detail})"), Style::default().fg(Color::DarkGray)));
-                }
-                let line = Line::from(spans);
                 if self.last_tool.as_deref() == Some(&name) {
-                    if let Some(Block::Plain(l)) = self.blocks.last_mut() {
-                        *l = line; // replace the empty/earlier start for the same call
+                    // Same call: enrich the earlier (often empty) start in place.
+                    if let Some(Block::Tool { detail: d, .. }) = self.blocks.last_mut() {
+                        if !detail.is_empty() {
+                            *d = detail;
+                        }
                     } else {
-                        self.blocks.push(Block::Plain(line));
+                        self.blocks.push(Block::Tool { name: name.clone(), detail, status: ToolStatus::Running });
                     }
                 } else {
                     self.flush_stream();
-                    self.blocks.push(Block::Plain(line));
+                    self.blocks.push(Block::Tool { name: name.clone(), detail, status: ToolStatus::Running });
                     self.last_task = None;
                     self.last_tool = Some(name);
                 }
@@ -468,6 +534,7 @@ impl App {
                 let d = item.detail.unwrap_or_default();
                 let body = if d.is_empty() { "(ok)".to_string() } else { truncate(&d, 220) };
                 self.flush_stream();
+                self.finish_last_tool(true); // dot → green
                 self.blocks.push(Block::Plain(Line::from(Span::styled(
                     format!("  ⎿ {body}{ms}"),
                     Style::default().fg(Color::DarkGray),
@@ -477,6 +544,7 @@ impl App {
             }
             "tool_failed" => {
                 self.flush_stream();
+                self.finish_last_tool(false); // dot → red
                 self.blocks.push(Block::Plain(Line::from(Span::styled(
                     format!("  ⎿ ✗ {}", truncate(&item.detail.unwrap_or_default(), 220)),
                     Style::default().fg(Color::Red),
@@ -555,6 +623,38 @@ impl App {
                 }
                 Block::Thinking(s) => self.render_thinking(s, &mut out),
                 Block::Plain(l) => out.push(l.clone()),
+                Block::Tool { name, detail, status } => {
+                    // Dot: blinks while running, green when done, red on failure.
+                    let dot_style = match status {
+                        ToolStatus::Running => {
+                            // ~3 ticks per state → a calm ≈0.7s blink cycle.
+                            let on = (self.spinner / 3) % 2 == 0;
+                            Style::default()
+                                .fg(if on { Color::Cyan } else { Color::DarkGray })
+                                .add_modifier(Modifier::BOLD)
+                        }
+                        ToolStatus::Done => {
+                            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+                        }
+                        ToolStatus::Failed => {
+                            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+                        }
+                    };
+                    let mut spans = vec![
+                        Span::styled("⏺ ".to_string(), dot_style),
+                        Span::styled(
+                            name.clone(),
+                            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                        ),
+                    ];
+                    if !detail.is_empty() {
+                        spans.push(Span::styled(
+                            format!("({detail})"),
+                            Style::default().fg(Color::DarkGray),
+                        ));
+                    }
+                    out.push(Line::from(spans));
+                }
                 Block::Rule(label) => {
                     cur_agent = None;
                     blank(&mut out);
@@ -617,9 +717,14 @@ impl App {
     // ---- rendering ------------------------------------------------------
 
     pub fn draw(&mut self, f: &mut Frame) {
+        // Input box grows with the wrapped message (borders + content), capped
+        // so the transcript, hint and status rows always remain on screen.
+        let tw = Self::input_text_width(f.area().width);
+        let cap = f.area().height.saturating_sub(3).max(3);
+        let input_h = (self.input_visual_rows(tw) + 2).clamp(3, cap);
         let chunks = Layout::vertical([
             Constraint::Min(1),
-            Constraint::Length(3),
+            Constraint::Length(input_h),
             Constraint::Length(1),
             Constraint::Length(1),
         ])
@@ -646,27 +751,30 @@ impl App {
         };
         if o.detail_open {
             let lines: Vec<Line<'static>> = o
-                .items
-                .get(o.sel)
+                .current()
+                .and_then(|i| o.items.get(i))
                 .map(|it| it.detail.iter().map(|l| Line::from(l.clone())).collect())
                 .unwrap_or_default();
             let block = TuiBlock::default()
                 .borders(Borders::ALL)
                 .title(format!(" {} — detail (Esc back) ", o.title))
-                .border_style(Style::default().fg(Color::Magenta));
+                .border_style(Style::default().fg(Color::Cyan));
             f.render_widget(
                 Paragraph::new(lines).block(block).wrap(Wrap { trim: false }).scroll((o.dscroll, 0)),
                 area,
             );
         } else {
-            let items: Vec<ListItem> = o
-                .items
+            // Only the items matching the type-to-search filter are shown.
+            let visible = o.visible();
+            let items: Vec<ListItem> = visible
                 .iter()
-                .map(|it| ListItem::new(Line::from(it.label.clone())))
+                .map(|&i| ListItem::new(Line::from(o.items[i].label.clone())))
                 .collect();
             let mut state = ListState::default();
-            state.select(Some(o.sel));
-            let count = o.items.len();
+            if !visible.is_empty() {
+                state.select(Some(o.sel.min(visible.len() - 1)));
+            }
+            let count = visible.len();
             // Anchor the picker to the bottom of the area (just above the input),
             // sized to its contents but capped to the available height.
             let needed = (count as u16).saturating_add(2);
@@ -682,26 +790,43 @@ impl App {
                 OverlayKind::Workspaces => "Esc quit",
                 _ => "Esc close",
             };
+            // Show the live search filter (the pickers are type-to-search).
+            let search = if o.filter.is_empty() {
+                if self.overlay_searchable() { " · type to search".to_string() } else { String::new() }
+            } else {
+                format!(" · search: {}", o.filter)
+            };
             let list = List::new(items)
                 .block(
                     TuiBlock::default()
                         .borders(Borders::ALL)
-                        .title(format!(" {} ({count}) — Enter view/select · {esc_hint} · ^C quit ", o.title))
-                        .border_style(Style::default().fg(Color::Magenta)),
+                        .title(format!(" {} ({count}) — Enter select · {esc_hint} · ^C quit{search} ", o.title))
+                        .border_style(Style::default().fg(Color::Cyan)),
                 )
-                .highlight_style(Style::default().fg(Color::Black).bg(Color::Magenta).add_modifier(Modifier::BOLD))
+                .highlight_style(Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD))
                 .highlight_symbol("➤ ");
             // ASCII banner (+ authenticated line) above the bottom-anchored picker.
             let top_h = area.height.saturating_sub(h);
             if top_h >= 3 {
-                let mut banner: Vec<Line<'static>> = BANNER
-                    .lines()
-                    .map(|l| Line::from(Span::styled(l.to_string(), Style::default().fg(Color::Cyan))))
-                    .collect();
+                // Left indent + a blank top line so the art isn't in the corner.
+                const LEFT: &str = "   ";
+                let mut banner: Vec<Line<'static>> = vec![Line::default()];
+                banner.extend(BANNER.lines().map(|l| {
+                    Line::from(Span::styled(format!("{LEFT}{l}"), Style::default().fg(Color::Cyan)))
+                }));
                 if !self.auth_line.is_empty() {
                     banner.push(Line::from(Span::styled(
-                        format!("  {}", self.auth_line),
+                        format!("{LEFT}{}", self.auth_line),
                         Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                    )));
+                }
+                // On the thread picker, show which workspace these threads
+                // belong to, so the user knows where they are.
+                if o.kind == OverlayKind::Threads {
+                    let ws = self.workspace_name.as_deref().unwrap_or("(no workspace — all threads)");
+                    banner.push(Line::from(Span::styled(
+                        format!("{LEFT}⊞ workspace: {ws}"),
+                        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
                     )));
                 }
                 f.render_widget(
@@ -722,7 +847,8 @@ impl App {
                 Some(OverlayKind::Workspaces) => "Esc → quit",
                 _ => "Esc close",
             };
-            format!("  ↑/↓ move · Enter view/select · {back} · ^C quit")
+            let search = if self.overlay_searchable() { "type to search · " } else { "" };
+            format!("  {search}↑/↓ move · Enter select · {back} · ^C quit")
         } else if self.pending.is_some() {
             "  type your answer · Enter submit".to_string()
         } else {
@@ -742,8 +868,10 @@ impl App {
         const PAD_X: u16 = 2;
         const PAD_Y: u16 = 1;
         let lines = self.build_lines();
+        // Only top + bottom bars (no left/right borders) for a cleaner, wider
+        // transcript; horizontal padding keeps text off the edges.
         let mut block = TuiBlock::default()
-            .borders(Borders::ALL)
+            .borders(Borders::TOP | Borders::BOTTOM)
             .title(" transcript ")
             .border_style(Style::default().fg(Color::Cyan))
             .padding(Padding::new(PAD_X, PAD_X, PAD_Y, PAD_Y));
@@ -764,13 +892,17 @@ impl App {
                 .right_aligned(),
             );
         }
-        let inner_w = area.width.saturating_sub(2 + 2 * PAD_X);
+        // No side borders → only the horizontal padding eats into the width.
+        let inner_w = area.width.saturating_sub(2 * PAD_X);
         let inner_h = area.height.saturating_sub(2 + 2 * PAD_Y);
 
         let para = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
         let total = para.line_count(inner_w) as u16;
         self.max_scroll = total.saturating_sub(inner_h);
-        if self.follow {
+        // Auto-scroll to the bottom only when following AND the user hasn't
+        // pinned the view by scrolling up (so streaming output never yanks them
+        // back down mid-read).
+        if self.follow && !self.pinned {
             self.scroll = self.max_scroll;
         } else if self.scroll > self.max_scroll {
             self.scroll = self.max_scroll;
@@ -778,20 +910,192 @@ impl App {
         f.render_widget(para.scroll((self.scroll, 0)), area);
     }
 
+    // ---- multiline input editor ----------------------------------------
+
+    /// Insert a char at the cursor and step past it.
+    pub fn input_insert_char(&mut self, c: char) {
+        self.input.insert(self.input_cursor, c);
+        self.input_cursor += c.len_utf8();
+    }
+
+    /// Insert a newline (Alt/Shift+Enter) for composing a multiline message.
+    pub fn input_newline(&mut self) {
+        self.input.insert(self.input_cursor, '\n');
+        self.input_cursor += 1;
+    }
+
+    /// Delete the char before the cursor.
+    pub fn input_backspace(&mut self) {
+        if self.input_cursor == 0 {
+            return;
+        }
+        let prev = self.input[..self.input_cursor].chars().next_back().unwrap();
+        self.input_cursor -= prev.len_utf8();
+        self.input.remove(self.input_cursor);
+    }
+
+    /// Delete the char at the cursor (Del key).
+    pub fn input_delete(&mut self) {
+        if self.input_cursor < self.input.len() {
+            self.input.remove(self.input_cursor);
+        }
+    }
+
+    pub fn input_left(&mut self) {
+        if self.input_cursor > 0 {
+            let prev = self.input[..self.input_cursor].chars().next_back().unwrap();
+            self.input_cursor -= prev.len_utf8();
+        }
+    }
+
+    pub fn input_right(&mut self) {
+        if self.input_cursor < self.input.len() {
+            let next = self.input[self.input_cursor..].chars().next().unwrap();
+            self.input_cursor += next.len_utf8();
+        }
+    }
+
+    fn line_start(&self, pos: usize) -> usize {
+        self.input[..pos].rfind('\n').map(|i| i + 1).unwrap_or(0)
+    }
+
+    fn line_end(&self, pos: usize) -> usize {
+        self.input[pos..].find('\n').map(|i| pos + i).unwrap_or(self.input.len())
+    }
+
+    pub fn input_home(&mut self) {
+        self.input_cursor = self.line_start(self.input_cursor);
+    }
+
+    pub fn input_end(&mut self) {
+        self.input_cursor = self.line_end(self.input_cursor);
+    }
+
+    /// Byte index `col` chars into the line `[start, end]`, clamped to `end`.
+    fn col_to_byte(&self, start: usize, end: usize, col: usize) -> usize {
+        match self.input[start..end].char_indices().nth(col) {
+            Some((b, _)) => start + b,
+            None => end,
+        }
+    }
+
+    /// Move the cursor up one line (keeping its column). Returns false when
+    /// already on the first line, so the caller can scroll the transcript.
+    pub fn input_up(&mut self) -> bool {
+        let ls = self.line_start(self.input_cursor);
+        if ls == 0 {
+            return false;
+        }
+        let col = self.input[ls..self.input_cursor].chars().count();
+        let prev_start = self.line_start(ls - 1);
+        self.input_cursor = self.col_to_byte(prev_start, ls - 1, col);
+        true
+    }
+
+    /// Move the cursor down one line. Returns false when on the last line.
+    pub fn input_down(&mut self) -> bool {
+        let le = self.line_end(self.input_cursor);
+        if le == self.input.len() {
+            return false;
+        }
+        let ls = self.line_start(self.input_cursor);
+        let col = self.input[ls..self.input_cursor].chars().count();
+        let next_start = le + 1;
+        let next_end = self.line_end(next_start);
+        self.input_cursor = self.col_to_byte(next_start, next_end, col);
+        true
+    }
+
+    /// Clear the input and reset the cursor (used on send and thread switch).
+    pub fn input_clear(&mut self) {
+        self.input.clear();
+        self.input_cursor = 0;
+    }
+
+    /// Text width available per visual row: terminal width minus the input
+    /// box borders (2), horizontal padding (2) and the 2-col prompt gutter.
+    fn input_text_width(area_width: u16) -> usize {
+        (area_width as usize).saturating_sub(6).max(1)
+    }
+
+    /// Hard-wrap the input into visual rows of at most `tw` chars (also breaking
+    /// on '\n'). Returns each row's byte span plus the cursor's (row, col) so
+    /// the box can size itself and place the cursor exactly — long lines wrap
+    /// instead of being clipped.
+    fn input_wrap(&self, tw: usize) -> (Vec<(usize, usize)>, u16, u16) {
+        let tw = tw.max(1);
+        let mut rows: Vec<(usize, usize)> = Vec::new();
+        let mut row_start = 0usize;
+        let mut chars_in_row = 0usize;
+        let mut byte = 0usize;
+        for ch in self.input.chars() {
+            if ch == '\n' {
+                rows.push((row_start, byte));
+                byte += 1;
+                row_start = byte;
+                chars_in_row = 0;
+            } else {
+                if chars_in_row == tw {
+                    rows.push((row_start, byte));
+                    row_start = byte;
+                    chars_in_row = 0;
+                }
+                byte += ch.len_utf8();
+                chars_in_row += 1;
+            }
+        }
+        rows.push((row_start, byte));
+        // Cursor sits on the last row whose start is at or before it (so a
+        // position exactly on a wrap boundary lands at col 0 of the next row).
+        let cur = self.input_cursor.min(self.input.len());
+        let r = rows.iter().rposition(|&(s, _)| s <= cur).unwrap_or(0);
+        let col = self.input[rows[r].0..cur].chars().count() as u16;
+        (rows, r as u16, col)
+    }
+
+    /// Number of visual rows the message occupies at the given text width.
+    fn input_visual_rows(&self, tw: usize) -> u16 {
+        self.input_wrap(tw).0.len() as u16
+    }
+
     fn draw_input(&self, f: &mut Frame, area: Rect) {
         let (title, color) = if let Some(label) = self.pending_label() {
             (format!(" answer: {label} (Enter to submit) "), Color::Cyan)
         } else if self.running {
-            (" message (running — Ctrl-C cancels) ".to_string(), Color::Yellow)
+            (" message (Enter send · ^J newline · ^C cancels) ".to_string(), Color::Yellow)
         } else {
-            (" message ".to_string(), Color::Green)
+            (" message (Enter send · ^J newline) ".to_string(), Color::Green)
         };
         let block = TuiBlock::default()
             .borders(Borders::ALL)
             .title(title)
             .border_style(Style::default().fg(color))
             .padding(Padding::horizontal(1));
-        f.render_widget(Paragraph::new(win_safe(&format!("› {}", self.input)).into_owned()).block(block), area);
+        let inner = block.inner(area);
+
+        // Pre-wrapped visual rows: the first carries the "› " prompt, the rest a
+        // 2-space hang so wrapped/continuation text stays aligned under it.
+        let tw = Self::input_text_width(area.width);
+        let (rows, crow, ccol) = self.input_wrap(tw);
+        let lines: Vec<Line<'static>> = rows
+            .iter()
+            .enumerate()
+            .map(|(i, &(s, e))| {
+                let prefix = if i == 0 { "› " } else { "  " };
+                Line::from(win_safe(&format!("{prefix}{}", &self.input[s..e])).into_owned())
+            })
+            .collect();
+
+        // Scroll so the cursor's row stays visible when the message is taller
+        // than the (capped) box.
+        let vis = inner.height.max(1);
+        let scroll = (crow + 1).saturating_sub(vis);
+        f.render_widget(Paragraph::new(lines).block(block).scroll((scroll, 0)), area);
+
+        // Place the real terminal cursor (prompt/hang prefix is 2 cols wide).
+        let cx = (inner.x + 2 + ccol).min(inner.x + inner.width.saturating_sub(1));
+        let cy = inner.y + crow.saturating_sub(scroll);
+        f.set_cursor_position(ratatui::layout::Position { x: cx, y: cy });
     }
 
     fn draw_status(&self, f: &mut Frame, area: Rect) {
@@ -862,16 +1166,33 @@ impl App {
         self.scroll_lines(up, 1);
     }
 
-    /// Scroll the transcript by `n` lines. Re-enables follow when scrolled to
-    /// the very bottom so new output keeps streaming into view.
+    /// Scroll the transcript by `n` lines. Scrolling up pins the view (no more
+    /// auto-scroll); returning to the very bottom un-pins so new output streams
+    /// into view again.
     pub fn scroll_lines(&mut self, up: bool, n: u16) {
         if up {
             self.follow = false;
+            self.pinned = true;
             self.scroll = self.scroll.saturating_sub(n);
         } else {
             self.scroll = (self.scroll + n).min(self.max_scroll);
-            self.follow = self.scroll >= self.max_scroll;
+            if self.scroll >= self.max_scroll {
+                self.follow = true;
+                self.pinned = false;
+            }
         }
+    }
+
+    /// Whether the user has scrolled up and pinned the transcript.
+    pub fn is_pinned(&self) -> bool {
+        self.pinned
+    }
+
+    /// Jump back to the bottom and resume following live output.
+    pub fn jump_to_bottom(&mut self) {
+        self.pinned = false;
+        self.follow = true;
+        self.scroll = self.max_scroll;
     }
 
     /// Seed the transcript with prior conversation fetched on chat start.
@@ -932,15 +1253,12 @@ impl App {
                     self.push_thinking(pstr("text"));
                 }
                 "tool.start" => {
+                    // Historical calls are already complete → Done (green dot);
+                    // a following tool.failed downgrades it to Failed.
                     let name = pstr("toolName");
                     let args = compact_json(p.get("arguments"), 120);
-                    let mut spans = vec![Span::styled(
-                        format!("⏺ {name}"),
-                        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))];
-                    if !args.is_empty() {
-                        spans.push(Span::styled(format!("({args})"), Style::default().fg(Color::DarkGray)));
-                    }
-                    self.push(Line::from(spans));
+                    self.flush_stream();
+                    self.blocks.push(Block::Tool { name, detail: args, status: ToolStatus::Done });
                 }
                 "tool.output" => {
                     let dur = p.get("durationMs").and_then(|d| d.as_i64())
@@ -951,6 +1269,7 @@ impl App {
                         format!("  ⎿ {body}{dur}"), Style::default().fg(Color::DarkGray))));
                 }
                 "tool.failed" => {
+                    self.finish_last_tool(false);
                     self.push(Line::from(Span::styled(
                         format!("  ⎿ ✗ {}", pstr("error")),
                         Style::default().fg(Color::Red))));
@@ -987,7 +1306,33 @@ impl App {
     // ---- overlays (workspaces / threads / findings / approvals) --------
 
     pub fn open_overlay(&mut self, kind: OverlayKind, title: String, items: Vec<OverlayItem>) {
-        self.overlay = Some(Overlay { kind, title, items, sel: 0, detail_open: false, dscroll: 0 });
+        self.overlay = Some(Overlay {
+            kind, title, items, sel: 0, detail_open: false, dscroll: 0, filter: String::new(),
+        });
+    }
+
+    /// Append a char to the overlay's type-to-search filter (resets cursor).
+    pub fn overlay_filter_push(&mut self, c: char) {
+        if let Some(o) = &mut self.overlay {
+            o.filter.push(c);
+            o.sel = 0;
+        }
+    }
+
+    /// Remove the last char from the overlay's search filter (resets cursor).
+    pub fn overlay_filter_pop(&mut self) {
+        if let Some(o) = &mut self.overlay {
+            o.filter.pop();
+            o.sel = 0;
+        }
+    }
+
+    /// Whether the active overlay supports type-to-search (the pickers do).
+    pub fn overlay_searchable(&self) -> bool {
+        matches!(
+            self.overlay.as_ref().map(|o| o.kind),
+            Some(OverlayKind::Threads) | Some(OverlayKind::Workspaces)
+        )
     }
 
     pub fn overlay_active(&self) -> bool {
@@ -1039,6 +1384,13 @@ impl App {
                         out.push_str(&sp.content);
                     }
                     out.push('\n');
+                }
+                Block::Tool { name, detail, .. } => {
+                    if detail.is_empty() {
+                        out.push_str(&format!("⏺ {name}\n"));
+                    } else {
+                        out.push_str(&format!("⏺ {name}({detail})\n"));
+                    }
                 }
                 Block::Rule(t) => out.push_str(&format!("{t}\n")),
             }
@@ -1098,6 +1450,7 @@ impl App {
         if let Some(&idx) = matches.get(self.slash_sel.min(matches.len().saturating_sub(1))) {
             let name = self.slash_commands[idx].name.clone();
             self.input = format!("/{name} ");
+            self.input_cursor = self.input.len();
             self.slash_sel = 0;
         }
     }
@@ -1147,13 +1500,21 @@ impl App {
         )));
     }
 
+    /// Duration (seconds) the most recently finished run took, if known —
+    /// used to decide whether to fire a "response done" notification.
+    pub fn last_run_secs(&self) -> Option<u64> {
+        self.last_elapsed.map(|d| d.as_secs())
+    }
+
     pub fn overlay_move(&mut self, up: bool) {
         if let Some(o) = &mut self.overlay {
             if o.detail_open {
                 o.dscroll = if up { o.dscroll.saturating_sub(1) } else { o.dscroll.saturating_add(1) };
-            } else if !o.items.is_empty() {
-                let n = o.items.len();
-                o.sel = if up { (o.sel + n - 1) % n } else { (o.sel + 1) % n };
+            } else {
+                let n = o.visible().len();
+                if n > 0 {
+                    o.sel = if up { (o.sel + n - 1) % n } else { (o.sel + 1) % n };
+                }
             }
         }
     }
@@ -1178,7 +1539,8 @@ impl App {
                 None
             }
             OverlayKind::Threads | OverlayKind::Workspaces => {
-                o.items.get(o.sel).and_then(|it| it.action.clone()).map(|a| (o.kind, a))
+                let idx = o.current()?;
+                o.items.get(idx).and_then(|it| it.action.clone()).map(|a| (o.kind, a))
             }
         }
     }
@@ -1206,6 +1568,9 @@ impl App {
         self.last_task = None;
         self.scroll = 0;
         self.follow = true;
+        self.pinned = false;
+        // Start each thread with an empty message box.
+        self.input_clear();
         self.thread_id = thread_id;
         self.title = String::new();
         self.task_label = None;
@@ -1219,7 +1584,9 @@ impl App {
         self.blocks.push(Block::User(text.to_string()));
         self.last_task = None;
         self.last_tool = None;
+        // Sending a message returns the user to the live bottom of the chat.
         self.follow = true;
+        self.pinned = false;
         // Start the turn's elapsed timer at send (covers the wait before the
         // server's run.started arrives).
         self.run_started = Some(std::time::Instant::now());
@@ -1408,5 +1775,144 @@ mod md_tests {
         // Heading after text renders without the literal '##'.
         assert!(joined.contains("Greeting"), "heading missing: {joined:?}");
         assert!(!joined.contains("##"), "heading marker leaked: {joined:?}");
+    }
+}
+
+#[cfg(test)]
+mod input_editor_tests {
+    use super::*;
+
+    fn app() -> App {
+        App::new("t".into(), "http://x".into(), "ten".into(), "org".into())
+    }
+
+    #[test]
+    fn insert_and_horizontal_movement() {
+        let mut a = app();
+        for c in "hello".chars() {
+            a.input_insert_char(c);
+        }
+        assert_eq!(a.input, "hello");
+        assert_eq!(a.input_cursor, 5);
+        a.input_left();
+        a.input_left();
+        assert_eq!(a.input_cursor, 3); // "hel|lo"
+        a.input_insert_char('X');
+        assert_eq!(a.input, "helXlo");
+        assert_eq!(a.input_cursor, 4);
+        a.input_home();
+        assert_eq!(a.input_cursor, 0);
+        a.input_end();
+        assert_eq!(a.input_cursor, a.input.len());
+    }
+
+    #[test]
+    fn backspace_and_delete_at_cursor() {
+        let mut a = app();
+        for c in "abc".chars() {
+            a.input_insert_char(c);
+        }
+        a.input_left(); // "ab|c"
+        a.input_backspace(); // remove 'b' -> "a|c"
+        assert_eq!(a.input, "ac");
+        assert_eq!(a.input_cursor, 1);
+        a.input_delete(); // remove 'c' at cursor -> "a"
+        assert_eq!(a.input, "a");
+    }
+
+    #[test]
+    fn multiline_newline_and_vertical_nav() {
+        let mut a = app();
+        for c in "ab".chars() {
+            a.input_insert_char(c);
+        }
+        a.input_newline();
+        for c in "cde".chars() {
+            a.input_insert_char(c);
+        }
+        assert_eq!(a.input, "ab\ncde");
+        assert_eq!(a.input_cursor, 6);
+        assert!(a.input_up());
+        assert_eq!(a.input_cursor, 2); // column clamped to "ab"
+        assert!(!a.input_up()); // first line → caller scrolls transcript
+        assert_eq!(a.input_cursor, 2);
+        assert!(a.input_down());
+        assert_eq!(a.input_cursor, 5); // "cde" col 2
+        assert!(!a.input_down()); // last line → caller scrolls transcript
+    }
+
+    #[test]
+    fn long_lines_wrap_into_visual_rows() {
+        let mut a = app();
+        for c in "abcdef".chars() {
+            a.input_insert_char(c);
+        }
+        // Width 3 → "abc" / "def"; cursor at end is row 1, col 3.
+        let (rows, crow, ccol) = a.input_wrap(3);
+        assert_eq!(rows.len(), 2);
+        assert_eq!((crow, ccol), (1, 3));
+        assert_eq!(a.input_visual_rows(3), 2);
+        // A newline also forces a fresh visual row.
+        a.input_clear();
+        for c in "a\nb".chars() {
+            a.input_insert_char(c);
+        }
+        assert_eq!(a.input_visual_rows(10), 2);
+    }
+
+    #[test]
+    fn clear_resets_cursor() {
+        let mut a = app();
+        a.input_insert_char('x');
+        a.input_clear();
+        assert_eq!(a.input, "");
+        assert_eq!(a.input_cursor, 0);
+        assert_eq!(a.input_visual_rows(10), 1);
+    }
+
+    #[test]
+    fn utf8_boundaries_are_respected() {
+        let mut a = app();
+        for c in "héllo".chars() {
+            a.input_insert_char(c); // é is 2 bytes
+        }
+        a.input_left(); // before 'o'
+        a.input_backspace(); // remove 'l' -> "hélo"
+        assert_eq!(a.input, "hélo");
+        a.input_home();
+        a.input_right(); // after 'h'
+        a.input_delete(); // remove 'é'
+        assert_eq!(a.input, "hlo");
+    }
+
+    #[test]
+    fn scrolling_up_pins_through_streaming() {
+        let mut a = app();
+        a.max_scroll = 100;
+        a.scroll = 100;
+        a.follow = true;
+
+        // User scrolls up to read history.
+        a.scroll_lines(true, 10);
+        assert!(a.is_pinned());
+        assert!(!a.follow);
+        assert_eq!(a.scroll, 90);
+
+        // Streaming output forces follow=true (as feed()/tool events do) — the
+        // pin must keep the view from being yanked back to the bottom.
+        a.follow = true;
+        assert!(a.is_pinned(), "must stay pinned while reading during a run");
+
+        // Returning to the bottom un-pins and resumes following.
+        a.scroll_lines(false, 50); // clamps to max_scroll (bottom)
+        assert!(!a.is_pinned());
+        assert!(a.follow);
+
+        // Esc/jump also clears the pin.
+        a.scroll_lines(true, 5);
+        assert!(a.is_pinned());
+        a.jump_to_bottom();
+        assert!(!a.is_pinned());
+        assert!(a.follow);
     }
 }
