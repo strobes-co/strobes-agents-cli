@@ -246,6 +246,31 @@ impl ApiClient {
         Ok(serde_json::from_value(v).unwrap_or_default())
     }
 
+    /// Upload one file's bytes to the workspace at `dest_path` (relative).
+    pub async fn upload_workspace_file(
+        &self,
+        workspace_id: &str,
+        dest_path: &str,
+        content: Vec<u8>,
+    ) -> Result<()> {
+        let url = self.url(&self.org_path(&format!("/cli/workspaces/{workspace_id}/upload/")))?;
+        let resp = self
+            .http
+            .post(&url)
+            .query(&[("path", dest_path)])
+            .header("Authorization", format!("token {}", self.profile.master_key))
+            .header("Content-Type", "application/octet-stream")
+            .body(content)
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(anyhow!("upload failed: HTTP {}: {}", status.as_u16(), trunc(&body, 200)));
+        }
+        Ok(())
+    }
+
     /// Download the workspace zip bytes (presigned URL → GET).
     pub async fn download_workspace_bytes(&self, workspace_id: &str) -> Result<Vec<u8>> {
         let url = self.workspace_download_url(workspace_id).await?;

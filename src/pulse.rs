@@ -11,7 +11,11 @@
 use anyhow::Result;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc;
+use tokio::sync::Notify;
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::config::Profile;
@@ -56,12 +60,21 @@ pub enum AppEvent {
     Error(String),
 }
 
-/// Handle used by the UI to send frames to the server.
-#[derive(Clone)]
+/// Handle used by the UI to send frames to the server. Dropping it stops the
+/// connection's reconnect supervisor (so a thread switch / chat exit is clean).
 pub struct PulseHandle {
     out: mpsc::UnboundedSender<String>,
     workspace_id: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     llm_model: Option<i64>,
+    stop: Arc<AtomicBool>,
+    stop_notify: Arc<Notify>,
+}
+
+impl Drop for PulseHandle {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        self.stop_notify.notify_waiters();
+    }
 }
 
 impl PulseHandle {
@@ -134,51 +147,64 @@ pub async fn connect(
     llm_model: Option<i64>,
 ) -> Result<PulseHandle> {
     let url = profile.pulse_ws_url(thread_id)?;
-    let ws_stream = dial_ws(&url, profile).await?;
-    let (mut write, mut read) = ws_stream.split();
+    // The first connection must succeed so the caller gets a live handle.
+    let ws = dial_ws(&url, profile).await?;
 
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
+    let (out_tx, out_rx) = mpsc::unbounded_channel::<String>();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_notify = Arc::new(Notify::new());
 
-    // Writer task: drain frames to the socket.
-    tokio::spawn(async move {
-        while let Some(frame) = out_rx.recv().await {
-            if write.send(Message::Text(frame)).await.is_err() {
-                break;
-            }
-        }
-    });
-
-    // Periodic ping to keep the connection warm.
+    // Supervisor: run the session, and on any drop reconnect with backoff —
+    // forever, until the handle is dropped (stop set). Keeps the same out_tx /
+    // app_tx so the UI and send path survive reconnects transparently.
     {
-        let ping_tx = out_tx.clone();
+        let profile = profile.clone();
+        let app_tx = app_tx.clone();
+        let out_tx = out_tx.clone();
+        let stop = stop.clone();
+        let stop_notify = stop_notify.clone();
         tokio::spawn(async move {
+            let mut out_rx = out_rx;
+            let mut next = Some(ws);
             loop {
-                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-                if ping_tx.send(json!({ "type": "ping" }).to_string()).is_err() {
+                if stop.load(Ordering::Relaxed) {
                     break;
                 }
-            }
-        });
-    }
-
-    // Reader task: parse frames and translate to AppEvents.
-    {
-        let out_tx = out_tx.clone();
-        let app_tx = app_tx.clone();
-        tokio::spawn(async move {
-            let _ = app_tx.send(AppEvent::Connected);
-            while let Some(msg) = read.next().await {
-                match msg {
-                    Ok(Message::Text(txt)) => {
-                        if let Ok(v) = serde_json::from_str::<Value>(&txt) {
-                            handle_frame(v, &app_tx, &out_tx);
+                let sock = match next.take() {
+                    Some(s) => s,
+                    None => break,
+                };
+                run_session(sock, &mut out_rx, &out_tx, &app_tx, &stop, &stop_notify).await;
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                // Reconnect with capped exponential backoff.
+                let mut delay = 1u64;
+                loop {
+                    if stop.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    let _ = app_tx.send(AppEvent::Disconnected(format!("reconnecting in {delay}s…")));
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_secs(delay)) => {}
+                        _ = stop_notify.notified() => return,
+                    }
+                    if stop.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    let _ = app_tx.send(AppEvent::Disconnected("reconnecting…".into()));
+                    match dial_ws(&url, &profile).await {
+                        Ok(s) => {
+                            next = Some(s);
+                            break;
+                        }
+                        Err(e) => {
+                            let _ = app_tx.send(AppEvent::Disconnected(format!("reconnect failed: {e}")));
+                            delay = (delay * 2).min(20);
                         }
                     }
-                    Ok(Message::Close(_)) | Err(_) => break,
-                    _ => {}
                 }
             }
-            let _ = app_tx.send(AppEvent::Disconnected("connection closed".into()));
         });
     }
 
@@ -186,7 +212,57 @@ pub async fn connect(
         out: out_tx,
         workspace_id: std::sync::Arc::new(std::sync::Mutex::new(profile.workspace_id.clone())),
         llm_model,
+        stop,
+        stop_notify,
     })
+}
+
+/// Run one connected WebSocket session: drain outgoing frames, read incoming
+/// frames, ping periodically. Returns when the socket closes/errors or `stop`
+/// is signalled. Leaves `out_rx` intact for the next reconnect.
+async fn run_session(
+    ws: tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    out_rx: &mut mpsc::UnboundedReceiver<String>,
+    out_tx: &mpsc::UnboundedSender<String>,
+    app_tx: &mpsc::UnboundedSender<AppEvent>,
+    stop: &Arc<AtomicBool>,
+    stop_notify: &Arc<Notify>,
+) {
+    let (mut write, mut read) = ws.split();
+    let _ = app_tx.send(AppEvent::Connected);
+    let mut ping = tokio::time::interval(Duration::from_secs(30));
+    ping.tick().await; // consume the immediate first tick
+
+    loop {
+        tokio::select! {
+            _ = stop_notify.notified() => return,
+            frame = out_rx.recv() => match frame {
+                Some(f) => {
+                    if write.send(Message::Text(f)).await.is_err() {
+                        return;
+                    }
+                }
+                None => return,
+            },
+            msg = read.next() => match msg {
+                Some(Ok(Message::Text(txt))) => {
+                    if let Ok(v) = serde_json::from_str::<Value>(&txt) {
+                        handle_frame(v, app_tx, out_tx);
+                    }
+                }
+                Some(Ok(_)) => {}
+                Some(Err(_)) | None => return,
+            },
+            _ = ping.tick() => {
+                if write.send(Message::Text(json!({ "type": "ping" }).to_string())).await.is_err() {
+                    return;
+                }
+            }
+        }
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+    }
 }
 
 /// Structured fields live in `data` (ephemeral) or `payload` (persisted).

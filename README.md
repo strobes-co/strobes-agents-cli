@@ -110,7 +110,14 @@ strobes chat                    # interactive chat (thread picker)
 strobes chat --thread <UUID> --model 4    # resume a thread with a chosen model
 strobes bind --download         # pick + download a workspace locally
 strobes pull --workspace <UUID> # download a workspace's files to a folder
+strobes update                  # self-update to the latest release (no TUI)
+strobes --version               # print the version
 ```
+
+`strobes update` checks GitHub for the latest release, downloads the binary for
+your platform, and replaces the running executable in place (`--force` to
+reinstall the same version). If your install dir needs elevated rights, run
+`sudo strobes update`.
 
 ### In-chat keys (shown in the bottom bar)
 
@@ -123,9 +130,16 @@ strobes pull --workspace <UUID> # download a workspace's files to a folder
 | `^F` / `^A` | findings / approvals for the bound workspace (Enter → detail) |
 | `^L` | list the synced local workspace files (Enter → path/size detail) |
 | `^E` | open the local workspace folder in Finder / Explorer / file manager |
+| `^Y` | copy the whole transcript to the clipboard |
 | `^T` / `^R` | toggle thinking / markdown |
 | `^C` | cancel the running turn (or quit when idle) |
-| `Esc` | quit · mouse-wheel / PgUp/PgDn / ↑↓ scroll |
+| `Esc` | back (chat → threads → workspaces) · PgUp/PgDn / ↑↓ scroll |
+
+The mouse isn't captured, so your terminal's native **click-drag selection +
+copy** works in the transcript; `^Y` copies the entire transcript. A small
+spinner appears in the status bar while a turn is running (incl. tool/HTTP
+waits). The CLI checks for newer releases on chat start and `strobes status`,
+and suggests the update one-liner if one is available.
 
 The transcript renders cleanly: `◆ Agent` headers (only on agent change),
 `⏺ tool(args)` + `⎿ result`, dimmed `✻ thinking`, Markdown (incl. tables), and
