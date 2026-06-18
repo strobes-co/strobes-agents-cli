@@ -132,6 +132,13 @@ that workspace's files into a local sandbox so the agent's `workspace_get_meta` 
 `execute_command` see the real files, and drives a local **Chrome** for the
 `browser_*` tools (`STROBES_AI_BROWSER_HEADLESS=1` for headless).
 
+**Browser setup:** the `browser_*` tools need Google Chrome / Chromium. The CLI
+auto-detects it in the usual places; if it's missing, the tool returns a
+platform-specific install hint. Point at a non-standard install with
+`STROBES_AI_CHROME=/path/to/chrome`, or set `STROBES_AI_BROWSER_AUTOINSTALL=1`
+to have the CLI download a self-contained **Chrome for Testing** build (cached
+under the config dir) on first use.
+
 Model picker ids: `4` Haiku 4.5 · `18` Sonnet 4.6 · `21` Opus 4.7 (Bedrock), or
 your org's BYOM id.
 
