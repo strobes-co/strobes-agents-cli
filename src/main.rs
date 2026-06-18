@@ -851,6 +851,8 @@ enum Defer {
     Threads,
     Findings,
     Approvals,
+    Files,
+    OpenFiles,
     SwitchThread(String),
     BindWorkspace(String),
 }
@@ -1061,6 +1063,8 @@ async fn run_chat(
                                 KeyCode::Char('o') if ctrl => defer = Some(Defer::Threads),
                                 KeyCode::Char('f') if ctrl => defer = Some(Defer::Findings),
                                 KeyCode::Char('a') if ctrl => defer = Some(Defer::Approvals),
+                                KeyCode::Char('l') if ctrl => defer = Some(Defer::Files),
+                                KeyCode::Char('e') if ctrl => defer = Some(Defer::OpenFiles),
                                 KeyCode::Char(c) => app.input.push(c),
                                 KeyCode::Backspace => { app.input.pop(); }
                                 KeyCode::Enter => {
@@ -1145,6 +1149,26 @@ async fn run_chat(
                     Err(e) => app.on_app_event(pulse::AppEvent::Error(e.to_string())),
                 },
             },
+            Some(Defer::Files) => {
+                let dir = local::sandbox_dir();
+                let items = file_items(&dir);
+                if items.is_empty() {
+                    app.notice(&format!(
+                        "no local workspace files yet ({}) — bind a workspace to sync",
+                        dir.display()
+                    ));
+                } else {
+                    let title = format!("Files — {} ({} items)", dir.display(), items.len());
+                    app.open_overlay(app::OverlayKind::Files, title, items);
+                }
+            }
+            Some(Defer::OpenFiles) => {
+                let dir = local::sandbox_dir();
+                match open_in_file_manager(&dir) {
+                    Ok(_) => app.notice(&format!("opened {} in your file manager", dir.display())),
+                    Err(e) => app.on_app_event(pulse::AppEvent::Error(format!("open failed: {e}"))),
+                }
+            }
             Some(Defer::BindWorkspace(sel)) if sel == "__new_ws__" => {
                 // Create a workspace: ask for a name + optional setup prompt,
                 // then jump into its setup chat (sending the prompt).
@@ -1267,6 +1291,87 @@ async fn run_chat(
     };
 
     res
+}
+
+/// Build overlay items for the local workspace files under `dir` (recursive).
+fn file_items(dir: &std::path::Path) -> Vec<app::OverlayItem> {
+    let mut files: Vec<(String, u64)> = Vec::new();
+    walk_files(dir, dir, &mut files);
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    files
+        .into_iter()
+        .map(|(rel, size)| {
+            let label = format!("{rel}  · {}", human_size(size));
+            let detail = vec![
+                rel.clone(),
+                format!("size: {}", human_size(size)),
+                format!("path: {}", dir.join(&rel).display()),
+                String::new(),
+                "^E opens this folder in your file manager.".into(),
+            ];
+            app::OverlayItem { label, detail, action: None }
+        })
+        .collect()
+}
+
+/// Recursively collect (relative path, size) of files under `root` (capped).
+fn walk_files(root: &std::path::Path, dir: &std::path::Path, out: &mut Vec<(String, u64)>) {
+    if out.len() >= 2000 {
+        return;
+    }
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let ft = match entry.file_type() {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+        let path = entry.path();
+        if ft.is_dir() {
+            walk_files(root, &path, out);
+        } else if ft.is_file() {
+            let rel = path.strip_prefix(root).unwrap_or(&path).to_string_lossy().to_string();
+            let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+            out.push((rel, size));
+        }
+        if out.len() >= 2000 {
+            return;
+        }
+    }
+}
+
+fn human_size(n: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    let f = n as f64;
+    if f >= MB {
+        format!("{:.1}M", f / MB)
+    } else if f >= KB {
+        format!("{:.1}K", f / KB)
+    } else {
+        format!("{n}B")
+    }
+}
+
+/// Reveal `dir` in the OS file manager (Finder / Explorer / xdg-open).
+fn open_in_file_manager(dir: &std::path::Path) -> Result<()> {
+    if !dir.exists() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let program = if cfg!(target_os = "macos") {
+        "open"
+    } else if cfg!(target_os = "windows") {
+        "explorer"
+    } else {
+        "xdg-open"
+    };
+    std::process::Command::new(program)
+        .arg(dir)
+        .spawn()
+        .map_err(|e| anyhow!("could not launch {program}: {e}"))?;
+    Ok(())
 }
 
 fn finding_items(fs: Vec<api::Finding>) -> Vec<app::OverlayItem> {

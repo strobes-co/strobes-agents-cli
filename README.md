@@ -121,6 +121,8 @@ strobes pull --workspace <UUID> # download a workspace's files to a folder
 | `^W` | workspaces browser → Enter binds, then pick a new / existing thread |
 | `^O` | threads browser (Enter switches) |
 | `^F` / `^A` | findings / approvals for the bound workspace (Enter → detail) |
+| `^L` | list the synced local workspace files (Enter → path/size detail) |
+| `^E` | open the local workspace folder in Finder / Explorer / file manager |
 | `^T` / `^R` | toggle thinking / markdown |
 | `^C` | cancel the running turn (or quit when idle) |
 | `Esc` | quit · mouse-wheel / PgUp/PgDn / ↑↓ scroll |
