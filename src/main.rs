@@ -25,6 +25,53 @@ use tokio::sync::mpsc;
 use app::App;
 use config::Config;
 
+/// Capture mouse events so trackpad/wheel scroll reaches the transcript.
+/// (Native click-drag selection still works while holding Option/Shift.)
+fn enable_mouse() {
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture);
+}
+
+fn disable_mouse() {
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
+}
+
+/// Alert the user that a response finished, by writing terminal escape codes the
+/// emulator interprets — cross-platform (macOS/Linux/Windows terminals) and no
+/// external processes. Most terminals only surface these when the window is
+/// unfocused. Tunables:
+///   STROBES_AI_NOTIFY=off            disable entirely
+///   STROBES_AI_NOTIFY_MIN_SECS=<n>   only notify for runs ≥ n seconds (default 4)
+fn notify_response_done(secs: u64) {
+    let disabled = std::env::var("STROBES_AI_NOTIFY")
+        .map(|v| v.eq_ignore_ascii_case("off") || v == "0")
+        .unwrap_or(false);
+    let min = std::env::var("STROBES_AI_NOTIFY_MIN_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(4);
+    if let Some(bytes) = notify_done_bytes(secs, disabled, min) {
+        use std::io::Write;
+        let mut out = std::io::stdout();
+        let _ = out.write_all(&bytes);
+        let _ = out.flush();
+    }
+}
+
+/// The escape bytes for a done-notification, or None when suppressed (disabled,
+/// or the run was shorter than `min` seconds). BEL = universal attention;
+/// OSC 9 = desktop notification (iTerm2/WezTerm/Windows Terminal); OSC 777 =
+/// the notify form used by urxvt and others. Terminals ignore what they can't grok.
+fn notify_done_bytes(secs: u64, disabled: bool, min: u64) -> Option<Vec<u8>> {
+    if disabled || secs < min {
+        return None;
+    }
+    let msg = "Strobes Agents — response ready";
+    Some(
+        format!("\x07\x1b]9;{msg}\x07\x1b]777;notify;Strobes Agents;response ready\x07")
+            .into_bytes(),
+    )
+}
+
 #[derive(Parser)]
 #[command(name = "strobes", version, about = "Ratatui client for Strobes Agents AI")]
 struct Cli {
@@ -166,10 +213,17 @@ async fn main() -> Result<()> {
             // (pickers + chat) and restore ONCE, so switching between workspace,
             // thread, and chat never flashes the normal terminal.
             let mut terminal = ratatui::init();
-            // NOTE: we deliberately do NOT capture the mouse — that lets the
-            // terminal's native click-drag selection + copy work (scrolling is
-            // via PgUp/PgDn/↑↓; ^Y copies the whole transcript).
+            // Capture the mouse so trackpad/wheel scroll moves the transcript.
+            // Native text selection/copy still works via Option/Shift-drag, and
+            // ^Y copies the whole transcript.
+            //
+            // NOTE: we deliberately do NOT enable the kitty keyboard protocol
+            // here. On terminals that support it, it changes ESC[-sequence
+            // parsing and collides with SGR mouse reports — leaking raw scroll
+            // sequences (e.g. `[<64;..M`) into the input. Newlines use Ctrl+J.
+            enable_mouse();
             let r = chat_flow(&mut terminal, &mut cfg, &tenant, profile, thread, workspace, new, model).await;
+            disable_mouse();
             ratatui::restore();
             r
         }
@@ -206,9 +260,16 @@ async fn chat_flow(
             let ws_flag = workspace.is_some();
             loop {
                 if !ws_flag {
-                    match resolve_workspace_interactive(terminal, tenant, &profile).await? {
-                        WsChoice::Pick(w) => profile.workspace_id = w,
+                    match resolve_workspace_interactive(terminal, tenant, &profile, cfg).await? {
+                        WsChoice::Pick(w) => {
+                            // Count this open for "recent" ranking next time.
+                            if let Some(id) = &w {
+                                cfg.record_workspace_open(id);
+                            }
+                            profile.workspace_id = w;
+                        }
                         WsChoice::Created { id, setup_thread, prompt } => {
+                            cfg.record_workspace_open(&id);
                             profile.workspace_id = Some(id);
                             if let Some(t) = setup_thread {
                                 // Jump straight into the setup chat with the prompt.
@@ -269,11 +330,19 @@ async fn resolve_workspace_interactive(
     terminal: &mut ratatui::DefaultTerminal,
     tenant: &str,
     profile: &config::Profile,
+    cfg: &Config,
 ) -> Result<WsChoice> {
     require_complete(profile)?;
     let auth = auth_line(profile, tenant);
     let client = api::ApiClient::new(profile.clone())?;
-    let workspaces = client.list_workspaces().await.unwrap_or_default();
+    let mut workspaces = client.list_workspaces().await.unwrap_or_default();
+    // Surface frequently-opened workspaces first (most opens, then most recent).
+    // Stable sort keeps never-opened ones in the server's order below.
+    workspaces.sort_by(|a, b| {
+        cfg.workspace_open_count(&b.id)
+            .cmp(&cfg.workspace_open_count(&a.id))
+            .then(cfg.workspace_last_opened(&b.id).cmp(&cfg.workspace_last_opened(&a.id)))
+    });
     let cur = profile.workspace_id.as_deref();
     // Item 0 = create new, item 1 = no workspace, then existing workspaces.
     let mut labels = vec![
@@ -283,7 +352,9 @@ async fn resolve_workspace_interactive(
     for w in &workspaces {
         let name = if w.name.is_empty() { "(unnamed)" } else { &w.name };
         let mark = if Some(w.id.as_str()) == cur { "  ✓" } else { "" };
-        labels.push(format!("{name}   [{}]{mark}", w.status));
+        let count = cfg.workspace_open_count(&w.id);
+        let recent = if count > 0 { format!("  · ↻ recent ×{count}") } else { String::new() };
+        labels.push(format!("{name}   [{}]{mark}{recent}", w.status));
     }
     loop {
         match picker::select_with(terminal, "Select a workspace", &labels, &auth).await? {
@@ -337,6 +408,27 @@ async fn resolve_thread_interactive(
         .list_threads(profile.workspace_id.as_deref())
         .await
         .unwrap_or_default();
+
+    // Context lines under the ASCII art: which workspace these threads belong
+    // to, plus its headline counts (threads · credits · findings · files).
+    let auth = match profile.workspace_id.as_deref() {
+        Some(id) => {
+            // Resolve the name and the stats counts concurrently.
+            let (workspaces, (credits, findings, files)) =
+                tokio::join!(client.list_workspaces(), fetch_workspace_stats(&client, id));
+            let name = workspaces
+                .ok()
+                .and_then(|ws| ws.into_iter().find(|w| w.id.as_str() == id).map(|w| w.name))
+                .filter(|n| !n.is_empty())
+                .unwrap_or_else(|| format!("{}…", &id[..8.min(id.len())]));
+            let stats = format!(
+                "{} threads  ·  ◈ {credits:.2} credits  ·  ⚠ {findings} findings  ·  {files} files",
+                threads.len()
+            );
+            format!("{auth}\n⊞ workspace: {name}\n{stats}")
+        }
+        None => format!("{auth}\n⊞ workspace: (none — all threads)"),
+    };
 
     let mut labels = vec!["➕  New thread".to_string()];
     for t in &threads {
@@ -593,6 +685,21 @@ fn extract_zip_bytes(bytes: Vec<u8>, target: &std::path::Path) -> Result<usize> 
 /// Point the agent's local sandbox at the workspace folder IMMEDIATELY (so the
 /// next tool call uses it), then download + extract the files in the BACKGROUND
 /// so the UI never freezes. Progress is reported as Notice events on `tx`.
+/// Fetch a workspace's headline counts (credits, findings, files) concurrently.
+/// Returned as `(credits, findings, files)`; failures degrade to 0.
+async fn fetch_workspace_stats(client: &api::ApiClient, ws_id: &str) -> (f64, usize, usize) {
+    let (credits, findings, files) = tokio::join!(
+        client.get_credits(Some(ws_id), None),
+        client.list_workspace_findings(ws_id),
+        client.list_workspace_files(ws_id, true),
+    );
+    (
+        credits.map(|c| c.credits).unwrap_or(0.0),
+        findings.map(|f| f.len()).unwrap_or(0),
+        files.map(|f| f.iter().filter(|x| !x.is_folder).count()).unwrap_or(0),
+    )
+}
+
 fn spawn_workspace_sync(
     profile: config::Profile,
     ws_id: String,
@@ -1217,8 +1324,8 @@ async fn run_chat(
                                         app.overlay_esc();
                                     }
                                 }
-                                KeyCode::Up | KeyCode::Char('k') => app.overlay_move(true),
-                                KeyCode::Down | KeyCode::Char('j') => app.overlay_move(false),
+                                KeyCode::Up => app.overlay_move(true),
+                                KeyCode::Down => app.overlay_move(false),
                                 KeyCode::PageUp => app.overlay_page(true, viewport_h),
                                 KeyCode::PageDown => app.overlay_page(false, viewport_h),
                                 KeyCode::Enter => {
@@ -1231,15 +1338,26 @@ async fn run_chat(
                                 // ^C exits the app from any picker/overlay (cancels
                                 // an in-flight run first if one is active).
                                 KeyCode::Char('c') if ctrl => { if app.running { handle.cancel(); } else { quit = true; } }
+                                // Type-to-search in the workspace/thread pickers.
+                                KeyCode::Backspace if app.overlay_searchable() => app.overlay_filter_pop(),
+                                KeyCode::Char(c) if !ctrl && app.overlay_searchable() => app.overlay_filter_push(c),
+                                // vim-style j/k nav only where there's no search.
+                                KeyCode::Char('k') if !ctrl => app.overlay_move(true),
+                                KeyCode::Char('j') if !ctrl => app.overlay_move(false),
                                 _ => {}
                             }
                         } else if app.awaiting_input() {
                             match k.code {
                                 KeyCode::Esc => quit = true,
-                                KeyCode::Char(c) => app.input.push(c),
-                                KeyCode::Backspace => { app.input.pop(); }
+                                KeyCode::Char(c) if !ctrl => app.input_insert_char(c),
+                                KeyCode::Backspace => app.input_backspace(),
+                                KeyCode::Left => app.input_left(),
+                                KeyCode::Right => app.input_right(),
+                                KeyCode::Home => app.input_home(),
+                                KeyCode::End => app.input_end(),
                                 KeyCode::Enter => {
-                                    let raw = std::mem::take(&mut app.input);
+                                    let raw = app.input.clone();
+                                    app.input_clear();
                                     if let Some((id, data)) = app.submit_interrupt_value(raw.trim()) {
                                         handle.respond_interrupt(&id, data);
                                     }
@@ -1260,9 +1378,16 @@ async fn run_chat(
                         } else {
                             // ----- normal chat -----
                             match k.code {
-                                // Esc steps back into navigation (threads →
-                                // workspaces) instead of quitting; ^C quits.
-                                KeyCode::Esc => defer = Some(Defer::Threads),
+                                // Esc: if scrolled up, snap back to the live
+                                // bottom first; otherwise step back into
+                                // navigation (threads → workspaces). ^C quits.
+                                KeyCode::Esc => {
+                                    if app.is_pinned() {
+                                        app.jump_to_bottom();
+                                    } else {
+                                        defer = Some(Defer::Threads);
+                                    }
+                                }
                                 KeyCode::Char('c') if ctrl => { if app.running { handle.cancel(); } else { quit = true; } }
                                 KeyCode::Char('t') if ctrl => app.show_thinking = !app.show_thinking,
                                 KeyCode::Char('r') if ctrl => app.markdown = !app.markdown,
@@ -1279,8 +1404,13 @@ async fn run_chat(
                                         Err(e) => app.on_app_event(pulse::AppEvent::Error(format!("copy failed: {e}"))),
                                     }
                                 }
-                                KeyCode::Char(c) => app.input.push(c),
-                                KeyCode::Backspace => { app.input.pop(); }
+                                // Newline: Shift/Alt+Enter (needs kitty protocol)
+                                // or Ctrl+J (works on every terminal). Plain
+                                // Enter sends.
+                                KeyCode::Char('j') if ctrl => app.input_newline(),
+                                KeyCode::Enter if k.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::SHIFT) => {
+                                    app.input_newline();
+                                }
                                 KeyCode::Enter => {
                                     let text = app.input.trim().to_string();
                                     if !text.is_empty() {
@@ -1289,22 +1419,32 @@ async fn run_chat(
                                         match parse_dragged_paths(&text) {
                                             Some(paths) if app.has_workspace => {
                                                 defer = Some(Defer::UploadFiles(paths));
-                                                app.input.clear();
+                                                app.input_clear();
                                             }
                                             _ => {
                                                 app.echo_user(&text);
                                                 handle.send_user_message(&text);
-                                                app.input.clear();
+                                                app.input_clear();
                                                 app.running = true;
                                                 app.status = "sending…".into();
                                             }
                                         }
                                     }
                                 }
+                                KeyCode::Backspace => app.input_backspace(),
+                                KeyCode::Delete => app.input_delete(),
+                                KeyCode::Left => app.input_left(),
+                                KeyCode::Right => app.input_right(),
+                                KeyCode::Home => app.input_home(),
+                                KeyCode::End => app.input_end(),
                                 KeyCode::PageUp => app.page(true, viewport_h),
                                 KeyCode::PageDown => app.page(false, viewport_h),
-                                KeyCode::Up => app.scroll_line(true),
-                                KeyCode::Down => app.scroll_line(false),
+                                // Up/Down move the cursor within a multiline
+                                // message; at the top/bottom edge they scroll the
+                                // transcript instead.
+                                KeyCode::Up => { if !app.input_up() { app.scroll_line(true); } }
+                                KeyCode::Down => { if !app.input_down() { app.scroll_line(false); } }
+                                KeyCode::Char(c) if !ctrl => app.input_insert_char(c),
                                 _ => {}
                             }
                         }
@@ -1314,13 +1454,25 @@ async fn run_chat(
                         MouseEventKind::ScrollDown => if app.overlay_active() { app.overlay_move(false) } else { app.scroll_lines(false, 3) },
                         _ => {}
                     },
-                    Some(Err(_)) | None => quit = true,
+                    // A transient parse error (e.g. a stray escape byte) must NOT
+                    // kill the session — just ignore it. Only a closed stream quits.
+                    Some(Err(_)) => {}
+                    None => quit = true,
                     _ => {}
                 }
             }
             maybe_app = rx.recv() => {
                 match maybe_app {
-                    Some(ev) => app.on_app_event(ev),
+                    Some(ev) => {
+                        let finished = matches!(ev, pulse::AppEvent::RunFinished(_));
+                        app.on_app_event(ev);
+                        // Notify the (possibly away) user that the reply is ready.
+                        if finished {
+                            if let Some(secs) = app.last_run_secs() {
+                                notify_response_done(secs);
+                            }
+                        }
+                    }
                     None => quit = true,
                 }
             }
@@ -1460,6 +1612,11 @@ async fn run_chat(
                             handle.set_workspace(Some(new_id.clone()));
                             app.has_workspace = true;
                             app.set_workspace_name(name.clone());
+                            {
+                                let mut c = Config::load();
+                                c.record_workspace_open(&new_id);
+                                let _ = c.save();
+                            }
                             spawn_workspace_sync(profile.clone(), new_id.clone(), app_tx.clone());
                             app.notice(&format!("✔ created workspace {name} — opening setup chat…"));
                             match setup {
@@ -1496,6 +1653,12 @@ async fn run_chat(
                 profile.workspace_id = Some(id.clone());
                 handle.set_workspace(Some(id.clone()));
                 app.has_workspace = true;
+                // Count this open locally for "recent" ranking next time.
+                {
+                    let mut c = Config::load();
+                    c.record_workspace_open(&id);
+                    let _ = c.save();
+                }
                 if let Ok(wss) = client.list_workspaces().await {
                     if let Some(w) = wss.iter().find(|w| w.id == id) {
                         app.set_workspace_name(w.name.clone());
@@ -1886,6 +2049,7 @@ fn workspace_items(
     counts: &[Option<usize>],
     credits: &std::collections::HashMap<String, f64>,
     profile: &config::Profile,
+    cfg: &Config,
 ) -> Vec<app::OverlayItem> {
     let mut items = vec![app::OverlayItem {
         label: "➕  New workspace".to_string(),
@@ -1903,11 +2067,17 @@ fn workspace_items(
             None => "? threads".into(),
         };
         let cr = credits.get(&w.id).copied().unwrap_or(0.0);
-        let label = format!("{name}{bound}  · {} · {tcount} · ◈ {cr:.2} cr", w.status);
-        let detail = vec![name, format!("status: {}", w.status), format!("threads: {tcount}"),
-            format!("credits: {cr:.3}"),
-            format!("id: {}", w.id),
-            String::new(), "Press Enter to bind this workspace (enables ^F / ^A).".into()];
+        let opens = cfg.workspace_open_count(&w.id);
+        let recent = if opens > 0 { format!(" · ↻ recent ×{opens}") } else { String::new() };
+        let label = format!("{name}{bound}  · {} · {tcount} · ◈ {cr:.2} cr{recent}", w.status);
+        let mut detail = vec![name, format!("status: {}", w.status), format!("threads: {tcount}"),
+            format!("credits: {cr:.3}")];
+        if opens > 0 {
+            detail.push(format!("opened {opens}× from this machine"));
+        }
+        detail.push(format!("id: {}", w.id));
+        detail.push(String::new());
+        detail.push("Press Enter to bind this workspace (enables ^F / ^A).".into());
         app::OverlayItem { label, detail, action: Some(w.id) }
     }));
     items
@@ -1928,10 +2098,17 @@ async fn workspace_overlay_items(
     client: &api::ApiClient,
     profile: &config::Profile,
 ) -> Result<Vec<app::OverlayItem>> {
-    let ws = client.list_workspaces().await?;
+    let cfg = Config::load();
+    let mut ws = client.list_workspaces().await?;
+    // Most-opened (then most-recent) first; never-opened keep server order.
+    ws.sort_by(|a, b| {
+        cfg.workspace_open_count(&b.id)
+            .cmp(&cfg.workspace_open_count(&a.id))
+            .then(cfg.workspace_last_opened(&b.id).cmp(&cfg.workspace_last_opened(&a.id)))
+    });
     let (counts, credits) =
         tokio::join!(workspace_thread_counts(client, &ws), workspace_credits_map(client));
-    Ok(workspace_items(ws, &counts, &credits, profile))
+    Ok(workspace_items(ws, &counts, &credits, profile, &cfg))
 }
 
 #[cfg(test)]
@@ -1942,6 +2119,22 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio_tungstenite::accept_async;
     use tokio_tungstenite::tungstenite::Message;
+
+    #[test]
+    fn notify_gating_and_payload() {
+        // Disabled → nothing.
+        assert!(notify_done_bytes(10, true, 4).is_none());
+        // Too short → nothing.
+        assert!(notify_done_bytes(2, false, 4).is_none());
+        // Long enough → BEL + OSC 9 + OSC 777 present.
+        let b = notify_done_bytes(5, false, 4).expect("should notify");
+        assert_eq!(b[0], 0x07, "starts with BEL");
+        let s = String::from_utf8(b).unwrap();
+        assert!(s.contains("\x1b]9;"), "has OSC 9 notification");
+        assert!(s.contains("\x1b]777;notify;"), "has OSC 777 notification");
+        // min=0 notifies even instant replies.
+        assert!(notify_done_bytes(0, false, 0).is_some());
+    }
 
     /// Verifies the full CLI_LOCAL round-trip in Rust against a mock pulse
     /// server: server sends a `tool.local_execute`, the client runs it on the
