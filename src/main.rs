@@ -13,6 +13,10 @@ mod local;
 mod markdown;
 mod picker;
 mod pulse;
+mod workflow;
+mod workflow_runner;
+mod workflow_state;
+mod workflow_tui;
 
 use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
@@ -27,11 +31,11 @@ use config::Config;
 
 /// Capture mouse events so trackpad/wheel scroll reaches the transcript.
 /// (Native click-drag selection still works while holding Option/Shift.)
-fn enable_mouse() {
+pub fn enable_mouse() {
     let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture);
 }
 
-fn disable_mouse() {
+pub fn disable_mouse() {
     let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
 }
 
@@ -183,6 +187,44 @@ enum Cmd {
         #[arg(long, short)]
         model: Option<i64>,
     },
+    /// Run YAML-based offline workflows (sequence, parallel, DAG).
+    Workflow {
+        #[command(subcommand)]
+        sub: WorkflowCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum WorkflowCmd {
+    /// Run a YAML workflow file.
+    Run {
+        /// Path to the workflow YAML file.
+        file: String,
+        /// Override a workflow variable (KEY=VALUE). Repeatable.
+        #[arg(long, short = 'v', value_name = "KEY=VALUE")]
+        var: Vec<String>,
+        /// Print events to stdout instead of opening the TUI.
+        #[arg(long)]
+        no_tui: bool,
+    },
+    /// List workflow YAML files (.yaml/.yml with phases:) in the current directory.
+    List,
+    /// Write a starter workflow template (defaults to stdout).
+    Init {
+        /// Write to this file instead of stdout.
+        #[arg(long, short)]
+        output: Option<String>,
+    },
+    /// Show history of locally recorded workflow runs.
+    History,
+    /// Resume a previously interrupted workflow run.
+    Resume {
+        /// Run ID shown by `strobes workflow history`.
+        id: String,
+        /// Print events to stdout instead of opening the TUI.
+        #[arg(long)]
+        no_tui: bool,
+    },
 }
 
 #[tokio::main]
@@ -228,6 +270,7 @@ async fn main() -> Result<()> {
             r
         }
         Cmd::Probe { thread, send, secs, model } => cmd_probe(&profile, &thread, send, secs, model).await,
+        Cmd::Workflow { sub } => cmd_workflow(profile, sub, &tenant).await,
     }
 }
 
@@ -1091,6 +1134,7 @@ enum Defer {
     UploadFiles(Vec<std::path::PathBuf>),
     SwitchThread(String),
     BindWorkspace(String),
+    Models,
 }
 
 /// If the input is one or more existing local file paths (e.g. a file dragged
@@ -1191,7 +1235,7 @@ async fn load_thread_data(
     }
 }
 
-async fn run_chat(
+pub async fn run_chat(
     terminal: &mut ratatui::DefaultTerminal,
     tenant: &str,
     profile: config::Profile,
@@ -1205,6 +1249,9 @@ async fn run_chat(
     let client = api::ApiClient::new(profile.clone())?;
     let mut app = App::new(thread_id.clone(), profile.base_url.clone(), tenant.to_string(), profile.org_id.clone());
     app.has_workspace = profile.workspace_id.is_some();
+    if let Some(m) = model {
+        app.set_model(Some(m));
+    }
 
     // Fire the independent startup round-trips (history, title, slash-commands,
     // active-run, and the WebSocket connect) concurrently so the UI appears in
@@ -1332,13 +1379,32 @@ async fn run_chat(
                                     match app.overlay_enter() {
                                         Some((app::OverlayKind::Workspaces, id)) => defer = Some(Defer::BindWorkspace(id)),
                                         Some((app::OverlayKind::Threads, id)) => defer = Some(Defer::SwitchThread(id)),
+                                        Some((app::OverlayKind::Models, id)) => {
+                                            let model_id = match id.parse::<i64>().ok() {
+                                                Some(0) => None,
+                                                n => n,
+                                            };
+                                            handle.set_model(model_id);
+                                            app.set_model(model_id);
+                                            let name = api::model_name(model_id);
+                                            app.notice(&format!("⚙ model → {name}"));
+                                            app.close_overlay();
+                                        }
                                         _ => {}
                                     }
                                 }
                                 // ^C exits the app from any picker/overlay (cancels
                                 // an in-flight run first if one is active).
                                 KeyCode::Char('c') if ctrl => { if app.running { handle.cancel(); } else { quit = true; } }
-                                // Type-to-search in the workspace/thread pickers.
+                                // ^P toggles the model picker even while another overlay is shown.
+                                KeyCode::Char('p') if ctrl => {
+                                    if app.overlay_kind() == Some(app::OverlayKind::Models) {
+                                        app.close_overlay();
+                                    } else {
+                                        defer = Some(Defer::Models);
+                                    }
+                                }
+                                // Type-to-search in the workspace/thread/model pickers.
                                 KeyCode::Backspace if app.overlay_searchable() => app.overlay_filter_pop(),
                                 KeyCode::Char(c) if !ctrl && app.overlay_searchable() => app.overlay_filter_push(c),
                                 // vim-style j/k nav only where there's no search.
@@ -1391,8 +1457,13 @@ async fn run_chat(
                                 KeyCode::Char('c') if ctrl => { if app.running { handle.cancel(); } else { quit = true; } }
                                 KeyCode::Char('t') if ctrl => app.show_thinking = !app.show_thinking,
                                 KeyCode::Char('r') if ctrl => app.markdown = !app.markdown,
+                                KeyCode::Char('s') if ctrl => {
+                                    app.select_mode = !app.select_mode;
+                                    if app.select_mode { disable_mouse(); } else { enable_mouse(); }
+                                }
                                 KeyCode::Char('w') if ctrl => defer = Some(Defer::Workspaces),
                                 KeyCode::Char('o') if ctrl => defer = Some(Defer::Threads),
+                                KeyCode::Char('p') if ctrl => defer = Some(Defer::Models),
                                 KeyCode::Char('f') if ctrl => defer = Some(Defer::Findings),
                                 KeyCode::Char('a') if ctrl => defer = Some(Defer::Approvals),
                                 KeyCode::Char('l') if ctrl => defer = Some(Defer::Files),
@@ -1544,6 +1615,33 @@ async fn run_chat(
                     let title = format!("Files — {} ({} items)", dir.display(), items.len());
                     app.open_overlay(app::OverlayKind::Files, title, items);
                 }
+            }
+            Some(Defer::Models) => {
+                let models: Vec<(i64, String)> = api::BUILTIN_MODELS
+                    .iter()
+                    .map(|&(id, name)| (id, name.to_string()))
+                    .collect();
+                let current = app.current_model();
+                let items: Vec<app::OverlayItem> = models
+                    .into_iter()
+                    .map(|(id, name)| {
+                        let mark = if Some(id) == current || (current.is_none() && id == 0) {
+                            " ●"
+                        } else {
+                            ""
+                        };
+                        let label = format!("{name}{mark}");
+                        let detail = vec![
+                            name.clone(),
+                            format!("model id: {id}"),
+                            String::new(),
+                            "Press Enter to use this model for the current chat.".into(),
+                            "Takes effect on the next message you send.".into(),
+                        ];
+                        app::OverlayItem { label, detail, action: Some(id.to_string()) }
+                    })
+                    .collect();
+                app.open_overlay(app::OverlayKind::Models, "Select AI model  (^P toggle)".into(), items);
             }
             Some(Defer::OpenFiles) => {
                 let dir = local::sandbox_dir();
@@ -2109,6 +2207,317 @@ async fn workspace_overlay_items(
     let (counts, credits) =
         tokio::join!(workspace_thread_counts(client, &ws), workspace_credits_map(client));
     Ok(workspace_items(ws, &counts, &credits, profile, &cfg))
+}
+
+async fn cmd_workflow(profile: config::Profile, sub: WorkflowCmd, tenant: &str) -> Result<()> {
+    match sub {
+        WorkflowCmd::Run { file, var, no_tui } => {
+            require_complete(&profile)?;
+            let def = workflow::load(&file)?;
+            let abs_file = std::path::Path::new(&file)
+                .canonicalize()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|_| file.clone());
+
+            // Vars explicitly set via -v flags take priority.
+            let cli_vars: std::collections::HashMap<String, String> = var
+                .iter()
+                .filter_map(|kv| {
+                    let mut it = kv.splitn(2, '=');
+                    Some((it.next()?.to_string(), it.next()?.to_string()))
+                })
+                .collect();
+
+            // ── Interactive variable prompting ───────────────────────────────
+            // Print a brief workflow summary, then prompt for every variable
+            // that wasn't already supplied via -v, showing its YAML default.
+            let total_tasks: usize = def.phases.iter().map(|p| p.tasks.len()).sum();
+            println!(
+                "\n  Workflow : {}\n  Phases   : {}  |  Tasks: {}",
+                def.name,
+                def.phases.len(),
+                total_tasks,
+            );
+            if !def.description.is_empty() {
+                println!("  {}", def.description);
+            }
+
+            let mut extra_vars = cli_vars;
+            if !def.variables.is_empty() {
+                let mut keys: Vec<&String> = def.variables.keys().collect();
+                keys.sort();
+                let all_provided = keys.iter().all(|k| extra_vars.contains_key(*k));
+                if !all_provided {
+                    println!("\n  Variables (Enter to keep default):");
+                }
+                for k in keys {
+                    if extra_vars.contains_key(k) {
+                        // Already set via -v; echo so the user sees the final value.
+                        println!("  {k} = {}", extra_vars[k]);
+                        continue;
+                    }
+                    let default = &def.variables[k];
+                    let secret = ["key", "secret", "token", "password", "pass", "credential"]
+                        .iter()
+                        .any(|s| k.to_lowercase().contains(s));
+                    let val = prompt_line(&format!("  {k}"), default, secret)?;
+                    extra_vars.insert(k.clone(), val);
+                }
+            }
+            println!();
+
+            let (ev_tx, ev_rx) =
+                mpsc::unbounded_channel::<workflow_runner::WfEvent>();
+
+            if no_tui {
+                // Headless: print events to stdout.
+                let ev_tx2 = ev_tx.clone();
+                let def2 = def.clone();
+                let profile2 = profile.clone();
+                let extra2 = extra_vars.clone();
+                let abs_file2 = abs_file.clone();
+                let runner = tokio::spawn(async move {
+                    if let Err(e) =
+                        workflow_runner::run(def2, profile2, ev_tx2.clone(), extra2, None, abs_file2).await
+                    {
+                        let _ = ev_tx2.send(workflow_runner::WfEvent::WorkflowFailed {
+                            reason: e.to_string(),
+                        });
+                    }
+                });
+                let mut rx = ev_rx;
+                let mut failed = false;
+                while let Some(ev) = rx.recv().await {
+                    use workflow_runner::WfEvent::*;
+                    match &ev {
+                        Log(m) => println!("{m}"),
+                        WorkspaceReady { id, name } => println!("workspace: {name} [{id}]"),
+                        SetupStarted { thread_id } => {
+                            println!("▶ workspace-setup ({}…)", &thread_id[..8.min(thread_id.len())])
+                        }
+                        PhaseStarted { phase } => println!("▶ phase: {phase}"),
+                        TaskStarted { task, thread_id, .. } => {
+                            println!(
+                                "▶ {task} ({}…)",
+                                &thread_id[..8.min(thread_id.len())]
+                            )
+                        }
+                        TaskOutput { task, text } => println!("[{task}] {text}"),
+                        TaskDone { task } => println!("✔ {task}"),
+                        TaskFailed { task, reason } => println!("✗ {task}: {reason}"),
+                        TaskSkipped { task } => println!("↷ {task} (skipped)"),
+                        WorkflowDone => println!("✔ workflow complete"),
+                        WorkflowFailed { reason } => {
+                            println!("✗ workflow failed: {reason}");
+                            failed = true;
+                        }
+                    }
+                }
+                let _ = runner.await;
+                if failed {
+                    return Err(anyhow!("workflow failed"));
+                }
+            } else {
+                // TUI mode — one terminal instance shared with any drill-down chat views.
+                let ev_tx2 = ev_tx.clone();
+                let def2 = def.clone();
+                let profile2 = profile.clone();
+                let extra2 = extra_vars.clone();
+                let abs_file3 = abs_file.clone();
+                tokio::spawn(async move {
+                    if let Err(e) =
+                        workflow_runner::run(def2, profile2, ev_tx2.clone(), extra2, None, abs_file3).await
+                    {
+                        let _ = ev_tx2.send(workflow_runner::WfEvent::WorkflowFailed {
+                            reason: e.to_string(),
+                        });
+                    }
+                });
+                let mut terminal = ratatui::init();
+                enable_mouse();
+                let r = workflow_tui::run_tui(
+                    &mut terminal,
+                    def,
+                    ev_rx,
+                    profile.clone(),
+                    tenant.to_string(),
+                )
+                .await;
+                disable_mouse();
+                ratatui::restore();
+                r?;
+            }
+            Ok(())
+        }
+        WorkflowCmd::List => {
+            let files = workflow::list_workflows(".");
+            if files.is_empty() {
+                println!(
+                    "no workflow files (.yaml/.yml with 'phases:') found in current directory"
+                );
+            } else {
+                for f in &files {
+                    println!("{f}");
+                }
+                println!("\n{} file(s) found", files.len());
+            }
+            Ok(())
+        }
+        WorkflowCmd::Init { output } => {
+            let tpl = workflow::starter_template();
+            match output {
+                Some(path) => {
+                    std::fs::write(&path, tpl)?;
+                    println!("✔ wrote {path}");
+                    println!("edit the file, then run: strobes workflow run {path}");
+                }
+                None => print!("{tpl}"),
+            }
+            Ok(())
+        }
+
+        WorkflowCmd::History => {
+            let runs = workflow_state::list_runs();
+            if runs.is_empty() {
+                println!("No workflow runs recorded yet.");
+                println!("Runs are saved in: {}", workflow_state::runs_dir().display());
+                return Ok(());
+            }
+            println!(
+                "\n{:<38}  {:<26}  {:<10}  {:<6}  {}",
+                "RUN ID", "WORKFLOW", "STATUS", "DONE", "STARTED"
+            );
+            println!("{}", "─".repeat(96));
+            for r in &runs {
+                let done = format!("{}/{}", r.done_count(), r.total_tasks());
+                let name_trunc = if r.workflow_name.len() > 26 {
+                    format!("{}…", &r.workflow_name[..25])
+                } else {
+                    r.workflow_name.clone()
+                };
+                let started = r
+                    .started_at
+                    .trim_end_matches('Z')
+                    .replacen('T', " ", 1);
+                let started = &started[..started.len().min(19)];
+                println!(
+                    "{:<38}  {:<26}  {:<10}  {:<6}  {}",
+                    r.id, name_trunc, r.status.label(), done, started
+                );
+            }
+            println!();
+            Ok(())
+        }
+
+        WorkflowCmd::Resume { id, no_tui } => {
+            require_complete(&profile)?;
+            let resume_record = workflow_state::load(&id)?;
+
+            // Validate we can still load the workflow file.
+            let def = workflow::load(&resume_record.workflow_file).map_err(|e| {
+                anyhow!(
+                    "cannot reload workflow file '{}': {e}\n\
+                     (if the file moved, update 'workflow_file' in {})",
+                    resume_record.workflow_file,
+                    workflow_state::runs_dir().join(format!("{id}.json")).display()
+                )
+            })?;
+
+            let vars = resume_record.vars.clone();
+
+            println!("\n  Resuming : {}", resume_record.workflow_name);
+            println!("  Run ID   : {id}");
+            println!(
+                "  Progress : {}/{} tasks done",
+                resume_record.done_count(),
+                resume_record.total_tasks()
+            );
+            println!();
+
+            let (ev_tx, ev_rx) = mpsc::unbounded_channel::<workflow_runner::WfEvent>();
+
+            if no_tui {
+                let ev_tx2 = ev_tx.clone();
+                let def2 = def.clone();
+                let profile2 = profile.clone();
+                let resume2 = Some(resume_record);
+                let wf_file = String::new(); // unused — taken from resume record
+                let runner = tokio::spawn(async move {
+                    if let Err(e) = workflow_runner::run(
+                        def2, profile2, ev_tx2.clone(), vars, resume2, wf_file,
+                    )
+                    .await
+                    {
+                        let _ = ev_tx2.send(workflow_runner::WfEvent::WorkflowFailed {
+                            reason: e.to_string(),
+                        });
+                    }
+                });
+                let mut rx = ev_rx;
+                let mut failed = false;
+                while let Some(ev) = rx.recv().await {
+                    use workflow_runner::WfEvent::*;
+                    match &ev {
+                        Log(m) => println!("{m}"),
+                        WorkspaceReady { id, name } => println!("workspace: {name} [{id}]"),
+                        SetupStarted { thread_id } => println!(
+                            "▶ workspace-setup ({}…)",
+                            &thread_id[..8.min(thread_id.len())]
+                        ),
+                        PhaseStarted { phase } => println!("▶ phase: {phase}"),
+                        TaskStarted { task, thread_id, .. } => println!(
+                            "▶ {task} ({}…)",
+                            &thread_id[..8.min(thread_id.len())]
+                        ),
+                        TaskOutput { task, text } => println!("[{task}] {text}"),
+                        TaskDone { task } => println!("✔ {task}"),
+                        TaskFailed { task, reason } => println!("✗ {task}: {reason}"),
+                        TaskSkipped { task } => println!("↷ {task} (skipped)"),
+                        WorkflowDone => println!("✔ workflow complete"),
+                        WorkflowFailed { reason } => {
+                            println!("✗ workflow failed: {reason}");
+                            failed = true;
+                        }
+                    }
+                }
+                let _ = runner.await;
+                if failed {
+                    return Err(anyhow!("workflow failed"));
+                }
+            } else {
+                let ev_tx2 = ev_tx.clone();
+                let def2 = def.clone();
+                let profile2 = profile.clone();
+                let resume2 = Some(resume_record);
+                let wf_file = String::new(); // unused — taken from resume record
+                tokio::spawn(async move {
+                    if let Err(e) = workflow_runner::run(
+                        def2, profile2, ev_tx2.clone(), vars, resume2, wf_file,
+                    )
+                    .await
+                    {
+                        let _ = ev_tx2.send(workflow_runner::WfEvent::WorkflowFailed {
+                            reason: e.to_string(),
+                        });
+                    }
+                });
+                let mut terminal = ratatui::init();
+                enable_mouse();
+                let r = workflow_tui::run_tui(
+                    &mut terminal,
+                    def,
+                    ev_rx,
+                    profile.clone(),
+                    tenant.to_string(),
+                )
+                .await;
+                disable_mouse();
+                ratatui::restore();
+                r?;
+            }
+            Ok(())
+        }
+    }
 }
 
 #[cfg(test)]

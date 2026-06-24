@@ -14,6 +14,7 @@ pub struct LocalResult {
     pub output: String,
     pub exit_code: Option<i32>,
     pub error: Option<String>,
+    pub captured_network: Vec<serde_json::Value>,
 }
 
 pub fn sandbox_dir() -> PathBuf {
@@ -49,15 +50,27 @@ pub async fn run_tool(tool_name: &str, input: &serde_json::Value) -> LocalResult
             output: meta_json(),
             exit_code: Some(0),
             error: None,
+            captured_network: vec![],
         },
         b if b.starts_with("browser_") => match crate::browser::handle(b, input).await {
-            Ok(output) => LocalResult { output, exit_code: Some(0), error: None },
-            Err(e) => LocalResult { output: String::new(), exit_code: None, error: Some(e) },
+            Ok((output, captured_network)) => LocalResult {
+                output,
+                exit_code: Some(0),
+                error: None,
+                captured_network,
+            },
+            Err(e) => LocalResult {
+                output: String::new(),
+                exit_code: None,
+                error: Some(e),
+                captured_network: vec![],
+            },
         },
         other => LocalResult {
             output: String::new(),
             exit_code: None,
             error: Some(format!("unsupported local tool in TUI build: {other}")),
+            captured_network: vec![],
         },
     }
 }
@@ -96,6 +109,7 @@ async fn run_code(code: &str, lang: &str) -> LocalResult {
                 output: String::new(),
                 exit_code: Some(127),
                 error: Some(format!("unsupported language: {lang}")),
+                captured_network: vec![],
             }
         }
     };
@@ -106,6 +120,7 @@ async fn run_code(code: &str, lang: &str) -> LocalResult {
             output: String::new(),
             exit_code: Some(1),
             error: Some(format!("write temp failed: {e}")),
+            captured_network: vec![],
         };
     }
     let out = Command::new(program)
@@ -136,12 +151,14 @@ fn finish(out: std::io::Result<std::process::Output>) -> LocalResult {
                 output: text.trim_end().to_string(),
                 exit_code: o.status.code(),
                 error: None,
+                captured_network: vec![],
             }
         }
         Err(e) => LocalResult {
             output: String::new(),
             exit_code: Some(127),
             error: Some(e.to_string()),
+            captured_network: vec![],
         },
     }
 }

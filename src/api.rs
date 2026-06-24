@@ -141,6 +141,43 @@ pub struct SlashCmd {
     pub argument_hint: String,
 }
 
+/// Built-in model IDs from the backend's `llm_model_choices` constant.
+/// ID `0` is the sentinel that means "use the org's configured default"
+/// (no `llm_model` key is sent in the context).
+pub const BUILTIN_MODELS: &[(i64, &str)] = &[
+    (0,  "Default (org setting)"),
+    (4,  "Claude Haiku 4.5"),
+    (10, "Claude Sonnet 4.5"),
+    (18, "Claude Sonnet 4.6"),
+    (11, "Claude Opus 4.5"),
+    (14, "Claude Opus 4.6"),
+    (21, "Claude Opus 4.7"),
+    (24, "Claude Opus 4.8"),
+    (12, "Nova 2 Lite"),
+    (15, "DeepSeek-R1"),
+    (16, "MiniMax M2"),
+    (19, "MiniMax M2.5"),
+    (17, "Kimi K2 Thinking"),
+    (22, "Kimi K2.5"),
+    (20, "GLM 5"),
+    (25, "GPT-5.4"),
+    (26, "GPT-5.5"),
+    (27, "Gemma 4 31B"),
+    (28, "Gemma 4 26B-A4B"),
+];
+
+/// Display name for a model id, or "Default" when None/0.
+pub fn model_name(id: Option<i64>) -> String {
+    match id {
+        None | Some(0) => "Default".to_string(),
+        Some(id) => BUILTIN_MODELS
+            .iter()
+            .find(|(mid, _)| *mid == id)
+            .map(|(_, name)| name.to_string())
+            .unwrap_or_else(|| format!("model:{id}")),
+    }
+}
+
 pub struct ApiClient {
     profile: Profile,
     http: reqwest::Client,
@@ -353,6 +390,7 @@ impl ApiClient {
         let arr = v.get("commands").cloned().unwrap_or(serde_json::Value::Null);
         Ok(serde_json::from_value(arr).unwrap_or_default())
     }
+
 
     /// Cheap auth/connectivity check.
     pub async fn ping(&self) -> Result<()> {
