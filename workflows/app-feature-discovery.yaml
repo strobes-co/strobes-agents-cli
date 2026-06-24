@@ -1,0 +1,789 @@
+name: "app-feature-discovery"
+description: "Deep crawl and feature inventory of a web application. First attempts to auto-signup or login with provided credentials to establish an authenticated session, then systematically crawls every page, submits forms with sample data, and documents every feature end-to-end — inputs, outputs, workflows, and business logic."
+
+workspace:
+  name: "Feature Discovery — ${TARGET_DOMAIN}"
+
+variables:
+  TARGET_URL: "https://app.example.com"    # full URL of the target (required)
+  TARGET_DOMAIN: "app.example.com"         # domain only
+  CREDENTIALS: ""                          # optional: "username:password" or "email:password"
+  SECOND_CREDS: ""                         # optional: second account for multi-user flows
+  SIGNUP_EMAIL: "featdisc-{{timestamp}}@mailinator.com"   # auto-generated signup email
+  SIGNUP_PASSWORD: "FeatDisc2024!"         # password to use for auto-signup
+  CRAWL_DEPTH: "5"
+  OUTPUT_DIR: "./feature-discovery-output"
+
+phases:
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # PHASE 1 — AUTHENTICATION SETUP (runs first, gates all downstream phases)
+  # ══════════════════════════════════════════════════════════════════════════
+  - name: "auth-setup"
+    tasks:
+
+      - name: "quick-profile"
+        prompt: |
+          Target: ${TARGET_URL}
+
+          Quick profile to understand the auth surface. Visit ${TARGET_URL} and document:
+          1. Page title, meta description, main navigation links.
+          2. Locate the login URL and the signup/register URL.
+          3. Check robots.txt and sitemap.xml for any auth-related paths.
+          4. Check for OAuth/SSO providers on the login page (Google, GitHub, Microsoft, LinkedIn, Apple).
+          5. Determine: is this an SPA or MPA? (check for meta tags vs JS-heavy rendering).
+
+          Output: login_url, signup_url, oauth_providers, app_type.
+
+      - name: "auto-signup"
+        depends_on: ["quick-profile"]
+        prompt: |
+          Target: ${TARGET_URL}  |  Signup email: ${SIGNUP_EMAIL}  |  Password: ${SIGNUP_PASSWORD}
+
+          Attempt to automatically register a new account:
+
+          1. Navigate to the signup/register page.
+          2. Document the registration form:
+             - All input fields (name, type, required/optional, validation patterns)
+             - Hidden fields (CSRF token, redirect params)
+             - CAPTCHA or bot protection present?
+             - Terms/conditions checkbox?
+             - Submit endpoint and method
+
+          3. Attempt to submit the registration with:
+             - Email: ${SIGNUP_EMAIL}
+             - Password: ${SIGNUP_PASSWORD}
+             - Name/username: "FeatureDiscoveryTest"
+             - Fill all required fields with sample data
+
+          4. Document the result:
+             - SUCCESS: account created, redirected to dashboard or verification page
+             - EMAIL_VERIFICATION_REQUIRED: account created but email verification needed
+             - CAPTCHA_BLOCKED: registration blocked by CAPTCHA
+             - VALIDATION_ERROR: specific field validation failed (document which)
+             - DUPLICATE: email already registered
+             - RATE_LIMITED: too many attempts
+
+          5. If registration succeeded:
+             - Capture the session token / cookies set
+             - Note any verification requirements
+             - Set status: SIGNED_UP
+
+          6. If registration failed but CAPTCHA is the only blocker:
+             - Note that manual intervention is needed for CAPTCHA
+             - Set status: NEEDS_CAPTCHA_SIGNUP
+
+          Output: signup_result, session_tokens (if obtained), account_created (true/false), verification_required (true/false).
+
+      - name: "login"
+        depends_on: ["quick-profile", "auto-signup"]
+        prompt: |
+          Target: ${TARGET_URL}
+          Provided credentials: ${CREDENTIALS}
+          Auto-created account: ${SIGNUP_EMAIL} / ${SIGNUP_PASSWORD}
+
+          Attempt to log in using available credentials. Priority order:
+          1. If ${CREDENTIALS} is provided, use them first.
+          2. If auto-signup succeeded, use the auto-created account.
+          3. If neither, report that no session is available.
+
+          Login attempt:
+          1. Navigate to the login page.
+          2. Submit credentials.
+          3. Document:
+             - Login endpoint URL and method
+             - Request payload format
+             - Response: status code, redirect, cookies set, tokens returned
+             - Any error messages received
+
+          4. If login succeeded:
+             - Verify session is active by visiting the post-login landing page
+             - Capture all session tokens:
+               - Cookie values (name, value, domain, HttpOnly, Secure, SameSite)
+               - If JWT: decode header + payload, note alg, exp, sub, role claims
+               - If Bearer token: note the token format and where it's sent
+               - If CSRF token: note where it's found (meta tag, cookie, header)
+             - Capture the post-login navigation structure (all menu items)
+             - Set status: LOGGED_IN
+
+          5. If login failed:
+             - Note the error reason
+             - Set status: LOGIN_FAILED
+
+          Output: login_status, session_context (tokens, cookies, headers), post_login_nav, is_authenticated (true/false).
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # PHASE 2 — APPLICATION PROFILING
+  # ══════════════════════════════════════════════════════════════════════════
+  - name: "profiling"
+    tasks:
+
+      - name: "tech-fingerprint"
+        depends_on: ["quick-profile"]
+        prompt: |
+          Target: ${TARGET_URL}
+
+          Identify the full technology stack:
+
+          1. **Web Server & Hosting:**
+             - Server header, X-Powered-By
+             - CDN detection (Cloudflare, Akamai, Fastly, CloudFront)
+             - IP address and hosting provider
+
+          2. **Frontend Framework:**
+             - Check HTML for: data-react-* (React), ng-* (Angular), v-* (Vue), data-svelte-* (Svelte)
+             - Check for: __NEXT_DATA__ (Next.js), __NUXT__ (Nuxt), __VUE_SSR__
+             - Check window.__INITIAL_STATE__ or similar global objects in page source
+             - Identify JS bundler: webpack, vite, parcel (look for source maps, bundle signatures)
+
+          3. **Backend Framework:**
+             - Cookies: PHPSESSID (PHP), JSESSIONID (Java/JSP), ASP.NET_SessionId (.NET), connect.sid (Express), session (Rails)
+             - Headers: X-AspNet-Version, X-Runtime (Rails), X-Powered-By: Express
+             - URL patterns: .php, .asp/.aspx, .jsp, .do (Struts), .action
+
+          4. **Third-party Integrations:**
+             - Analytics: Google Analytics, Hotjar, Mixpanel, Amplitude, Heap
+             - Auth: Auth0, Okta, Firebase Auth, AWS Cognito, Clerk, NextAuth
+             - Payments: Stripe.js, PayPal, Braintree, Square
+             - Chat/Support: Intercom, Zendesk, Drift, Crisp, LiveChat
+             - Monitoring: Sentry, Datadog RUM, New Relic, LogRocket
+             - Marketing: HubSpot, Marketo, Mailchimp
+             - Media: Cloudinary, Imgix, mux
+
+          5. **Client-side JS Libraries:**
+             - jQuery, Bootstrap, Tailwind, Material UI, Chakra UI, Ant Design
+             - Axios, fetch, Apollo Client, Relay
+             - Moment.js, date-fns, lodash, underscore
+
+          Output: technology stack inventory with version hints.
+
+      - name: "public-surface-mapping"
+        depends_on: ["quick-profile"]
+        prompt: |
+          Target: ${TARGET_URL}
+
+          Map the public-facing application surface:
+
+          1. Visit the homepage and document all navigation links (top nav, sidebar, footer, mobile menu).
+          2. Visit any public pages found (about, contact, pricing, blog, docs, FAQ, features).
+          3. For each public page:
+             - URL, page title, content purpose
+             - Forms present (search, newsletter, contact, signup)
+             - Links to other pages
+          4. Check .well-known endpoints:
+             - /.well-known/security.txt, /.well-known/openid-configuration
+             - /.well-known/change-password, /.well-known/assetlinks.json
+
+          Output: public page inventory with navigation structure.
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # PHASE 3 — DEEP CRAWL & FEATURE DISCOVERY (authenticated if session available)
+  # ══════════════════════════════════════════════════════════════════════════
+  - name: "crawl-and-features"
+    tasks:
+
+      - name: "full-page-crawl"
+        depends_on: ["login", "public-surface-mapping"]
+        prompt: |
+          Target: ${TARGET_URL}  |  Depth: ${CRAWL_DEPTH}
+          Authenticated: ${is_authenticated}  |  Session tokens available: ${session_context}
+
+          Crawl the application comprehensively:
+
+          1. If authenticated (${is_authenticated} == true):
+             - Start crawl from the post-login dashboard
+             - Follow all navigation links from the authenticated menu
+             - Follow all links, buttons, tabs, and paginated results
+             - Click through all sidebar items, user dropdown, settings menus
+
+          2. If not authenticated:
+             - Start crawl from the homepage
+             - Follow all public navigation links
+             - Do NOT follow login/logout/auth-only paths
+
+          3. Crawling rules:
+             - Follow links up to depth ${CRAWL_DEPTH}
+             - Stay on ${TARGET_DOMAIN} (do not follow external links)
+             - Follow pagination (page=2, ?offset=, ?cursor= patterns)
+             - Follow redirects (301, 302, 307)
+             - Do not follow: logout, delete-account, unsubscribe
+
+          4. For each page visited, document:
+             - URL
+             - Page title
+             - HTTP method and response code
+             - Content type
+             - Page purpose / feature description (1-2 sentences)
+             - All links on the page (internal only)
+             - All forms (method, action, input fields with types and names)
+             - All interactive elements (buttons, dropdowns, toggles, tabs, modals)
+             - API calls/XHR requests triggered on page load
+             - Whether the page is [public] or [auth-required]
+
+          5. Categorise each page by feature type:
+             - **Dashboard**: overview, analytics, summary
+             - **List/Index**: displays a collection of items
+             - **Detail/View**: single item details
+             - **Create/Add**: form to create a new resource
+             - **Edit/Update**: form to modify a resource
+             - **Delete/Confirm**: deletion confirmation
+             - **Settings**: preferences, configuration
+             - **Profile**: user account, personal info
+             - **Admin**: administration/management
+             - **Report/Export**: data export, reporting
+             - **Utility**: search, notifications, help
+
+          Output: complete page inventory with categorisation and metadata.
+
+      - name: "auth-flow-documentation"
+        depends_on: ["login"]
+        prompt: |
+          Target: ${TARGET_URL}
+          Login status: ${login_status}
+
+          Document the complete authentication experience:
+
+          1. **Login Flow:**
+             - Login page URL and structure
+             - Input fields and validation rules
+             - Error messages (login failed, user not found, wrong password, account locked, MFA required)
+             - Success behaviour (redirect URL, token response, welcome message)
+             - MFA/2FA flow (if prompted): method (TOTP, SMS, email), backup codes
+             - Session persistence (remember me functionality, session duration)
+
+          2. **Registration Flow (if available):**
+             - Signup page URL and structure
+             - Required vs optional fields
+             - Email verification flow (link sent, OTP, click to verify)
+             - Post-registration onboarding (wizard, tutorial, first-time setup)
+             - Any restrictions (domain whitelist, invite-only, approval required)
+
+          3. **Password Reset Flow:**
+             - Request reset page URL
+             - Email sent confirmation (does it reveal if account exists?)
+             - Reset link/token format
+             - Reset password form fields
+             - Post-reset behaviour (auto-login, redirect to login)
+
+          4. **OAuth / SSO Providers (if available):**
+             - List of providers (Google, GitHub, Microsoft, LinkedIn, Apple, etc.)
+             - OAuth flow (redirect, consent screen, callback)
+             - Scope/permissions requested
+             - Account linking behaviour (new user = auto-create, or link to existing?)
+
+          5. **Session Management:**
+             - Session token format (JWT, opaque cookie, bearer token)
+             - Token location (cookie with HttpOnly? localStorage? header?)
+             - Token expiry/refresh mechanism
+             - Logout behaviour (clear cookie, invalidate token, redirect)
+             - Concurrent session handling (multiple devices allowed? session list visible?)
+
+          Output: complete authentication flow documentation.
+
+      - name: "form-interaction-testing"
+        depends_on: ["full-page-crawl"]
+        prompt: |
+          Target: ${TARGET_URL}
+
+          Interact with every discovered form by submitting sample data:
+
+          **For each form on every page:**
+
+          1. Record the form structure:
+             - Form action URL and method
+             - All input fields (name, type, placeholder, required, min/max length, pattern)
+             - Select/option fields (list all options)
+             - Checkbox/radio groups
+             - Hidden fields and their values
+
+          2. Submit sample data:
+             - Fill all required fields with realistic sample data
+             - Use unique, identifiable values (e.g., "TEST-FD-{timestamp}")
+             - Submit the form
+
+          3. Document the result:
+             - Success: confirmation message, redirect URL, created resource URL
+             - Validation error: which field failed, what error message
+             - Server error: status code, error page content
+             - No visible change: check for API calls in the background
+
+          4. **Edge case submissions:**
+             - Submit with empty required fields → validation messages
+             - Submit with boundary values (min length, max length)
+             - Submit with special characters
+             - Submit duplicate data (same form twice) → duplicate detection?
+
+          **Specific form types to handle:**
+
+          5. **Search forms:**
+             - Submit empty query, short query (1 char), long query (500+ chars)
+             - Submit special characters: `' OR 1=1--`, `<script>alert(1)</script>`
+             - Document: results page, URL parameters, pagination, filters
+
+          6. **Settings/configuration forms:**
+             - Change each setting one at a time
+             - Document: save behaviour (auto-save vs button), confirmation, persistence
+
+          7. **Multi-step forms:**
+             - Complete each step sequentially
+             - At each step, document: what fields appear, validation, what happens on "next"
+             - Test: can you skip steps by navigating directly to the step URL?
+             - Test: can you go back and change earlier steps?
+
+          Output: comprehensive form behaviour documentation with sample submissions.
+
+      - name: "crud-operation-mapping"
+        depends_on: ["full-page-crawl"]
+        prompt: |
+          Target: ${TARGET_URL}
+
+          Document every CRUD feature by creating, reading, updating, and deleting sample data:
+
+          For each feature category found (users, posts, orders, projects, tickets, products, etc.):
+
+          1. **CREATE:**
+             - Navigate to the creation page
+             - List all fields (required, optional, defaults)
+             - Fill with sample data (use "TEST-FD-{feature}-{timestamp}" for traceability)
+             - Submit and capture: request payload, response, confirmation message, redirect URL
+             - Verify the item appears in the list/index page
+             - Note any validation errors encountered
+
+          2. **READ:**
+             - Navigate to the new item's detail/view page
+             - Document all displayed fields and their values
+             - Note related items, tabs, sections within the detail view
+             - Check for: comments, attachments, activity log, version history
+             - Check for: share/export/print actions
+
+          3. **UPDATE:**
+             - Navigate to the edit page
+             - Which fields are editable vs read-only?
+             - Modify some fields with updated sample data
+             - Submit and capture the changes
+             - Verify changes reflect on the detail page
+
+          4. **DELETE:**
+             - Locate the delete action (button, link, dropdown)
+             - Document: confirmation dialog text, "reason for deletion" field
+             - Confirm deletion
+             - Verify the item is removed from the list page
+             - Check: is it soft-deleted (appears in trash/recycle bin)?
+             - Check: admin restore capability?
+
+          5. **BULK operations:**
+             - Check for: multi-select, bulk delete, bulk edit, bulk export/import
+             - Document the bulk action workflow and restrictions
+
+          Output: full CRUD documentation for every feature.
+
+      - name: "api-discovery"
+        depends_on: ["full-page-crawl"]
+        prompt: |
+          Target: ${TARGET_URL}
+
+          Discover and document all API endpoints used by the application:
+
+          1. **OpenAPI / Swagger Discovery:**
+             Check: /swagger.json, /swagger-ui.html, /openapi.json, /api-docs, /api/v1/docs, /redoc, /.well-known/openapi, /docs, /documentation
+             If found: parse the spec, document all endpoints, methods, params, auth requirements.
+
+          2. **GraphQL Discovery:**
+             Check: /graphql, /api/graphql, /gql, /graphiql, /query, /playground
+             If found, attempt introspection:
+             `{"query":"{ __schema { queryType { name } types { name kind fields { name type { name kind } } } } }"}`
+             Document: queries, mutations, subscriptions, auth requirements.
+
+          3. **API Endpoint Extraction from Page Source:**
+             - Search HTML for: /api/, /rest/, /v1/, /v2/, /graphql
+             - Check window.__INITIAL_STATE__, __NEXT_DATA__, __NUXT__ for API route references
+             - Check script tags for `fetch(`, `axios.`, `api.`, `$.ajax`
+
+          4. **API Call Logging:**
+             - Monitor network requests during crawl
+             - For each XHR/fetch call, capture: method, URL, request headers, response status, response body structure (first 200 chars)
+             - Categorise: authenticated vs public endpoints
+
+          5. **WebSocket Discovery:**
+             - Check for WebSocket connections (wss://) in page source
+             - Check for Socket.io, Pusher, Ably, Firebase Realtime references
+             - If found, document event names and data payloads
+
+          Output: complete API inventory with endpoint details and auth requirements.
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # PHASE 4 — WORKFLOW & BUSINESS LOGIC DOCUMENTATION
+  # ══════════════════════════════════════════════════════════════════════════
+  - name: "workflows"
+    tasks:
+
+      - name: "multi-step-workflow-mapping"
+        depends_on: ["crud-operation-mapping", "form-interaction-testing"]
+        prompt: |
+          Target: ${TARGET_URL}
+
+          Map all multi-step workflows and stateful business processes:
+
+          1. **Identify multi-step processes:**
+             - User onboarding / registration wizard
+             - Checkout / purchase / subscription flow
+             - KYC / identity / document verification
+             - Ticket / support request lifecycle
+             - Order / project / task lifecycle
+             - Approval workflows (submit → review → approve/reject)
+             - Invitation flows (invite → accept → onboard)
+             - File upload with review process
+             - Account upgrade / downgrade
+
+          2. **For each workflow, document:**
+             - **Step 1:** URL, what data is collected, what action is performed
+             - **Step 2:** URL, what new fields appear, validation rules
+             - **Step N:** continue until completion
+             - What triggers progression to the next step? (button click, API response, redirect)
+             - Can steps be skipped or reordered? (test by directly navigating to step URLs)
+             - What is the final state after completion?
+             - Can the workflow be cancelled mid-way? What happens to partial data?
+
+          3. **State transitions:**
+             - For each stateful entity, list all possible states
+             - How does a ticket go from "open" → "in progress" → "resolved" → "closed"?
+             - Who can perform each transition? (creator, assignee, admin, system)
+             - Are there time-based transitions? (auto-close after 7 days, expiry)
+
+          4. **Business rules observed:**
+             - Required fields and validation rules (min/max length, format, uniqueness)
+             - Permission/role requirements per step
+             - Quotas and limits (max items, file size limits, rate limits, storage limits)
+             - Time-based rules (expiry, scheduling, deadlines, cooldown periods)
+             - Conditional logic (field A visible only if field B has value X)
+             - Calculation rules (pricing, discounts, tax, shipping)
+
+          5. **Notification triggers:**
+             - What actions trigger email notifications? (welcome email, password reset, order confirmation, status change)
+             - What actions trigger in-app notifications? (bell icon, toast, badge)
+             - What actions trigger webhook calls? (if configurable)
+             - Can users configure which notifications they receive?
+
+          Output: complete workflow documentation with state machines, business rules, and notification map.
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # PHASE 5 — CLIENT-SIDE & HIDDEN FEATURE DISCOVERY
+  # ══════════════════════════════════════════════════════════════════════════
+  - name: "client-side"
+    tasks:
+
+      - name: "js-analysis"
+        depends_on: ["full-page-crawl"]
+        prompt: |
+          Target: ${TARGET_URL}
+
+          Analyse JavaScript to uncover hidden features, routes, and configuration:
+
+          1. **Collect all JS sources:**
+             - All <script src="..."> URLs from every crawled page
+             - Inline scripts (full contents between <script></script> tags)
+             - Dynamic/lazy-loaded chunk URLs
+             - Source maps (append .map to JS URLs and attempt download)
+
+          2. **Extract feature routes and pages:**
+             Search JS for route/pattern definitions:
+             - React: `<Route path="...">`, `{path: '...'}`, `routes = [`
+             - Vue: `path: '...'`, `router.addRoute`, `routes: [`
+             - Angular: `path: '...'`, `loadChildren:`, `canActivate:`
+             - Generic: `"/dashboard"`, `"/settings"`, `"/admin"`, `"/billing"`
+             - Lazy-loaded routes: `import('./pages/...')`, `() => import('...')`
+
+          3. **Extract API endpoint references:**
+             - `fetch('/api/...')`, `axios.get('/api/...')`, `axios.post('/api/...')`
+             - `api.get(...)`, `api.post(...)`, `api.put(...)`, `api.delete(...)`
+             - `${API_BASE}/...`, `process.env.API_URL`, `import.meta.env.VITE_API_URL`
+             - GraphQL operation strings: `gql`...`, `useQuery(`, `useMutation(`
+             - WebSocket/Socket.io event names
+
+          4. **Extract feature flags:**
+             - Search for: `featureFlag`, `featureToggle`, `isEnabled`, `isFeatureEnabled`
+             - `experiment`, `ABTest`, `canary`, `rollout`, `showNewUI`
+             - `process.env.FEATURE_*`, `window.__FEATURES__`, `localStorage.getItem('feature_')`
+
+          5. **Extract hardcoded configuration:**
+             - API base URLs per environment: `"development"`, `"staging"`, `"production"`
+             - Third-party API keys and client IDs (Stripe, Sentry, Firebase, Auth0, Google Maps)
+             - Environment variables and defaults
+             - Error message strings (reveal internal component/state names)
+
+          6. **Discover hidden UI:**
+             - Commented-out HTML/JSX that reveals planned features
+             - Debug panels, admin consoles referenced in code
+             - Feature-gated components not visible in the UI
+
+          Output: routes map, API endpoints, feature flags, hidden features, hardcoded configuration.
+
+      - name: "hidden-feature-testing"
+        depends_on: ["js-analysis"]
+        prompt: |
+          Target: ${TARGET_URL}
+
+          Test for hidden / feature-flagged functionality discovered in JS:
+
+          1. **Hidden Route Access:**
+             For each route discovered in JS but not visible in the UI:
+             - Navigate directly to the URL
+             - Document: accessible? requires auth? returns 200/403/404?
+             - If accessible, document the feature/page content
+
+          2. **Feature Flag Manipulation:**
+             - If feature flags found in JS, try enabling them:
+               - URL parameters: `?feature_xyz=true`
+               - localStorage: `localStorage.setItem('feature_xyz', 'true')` then reload
+               - Cookies: set `feature_xyz=true`
+               - Window variables: check if exposed on window object
+             - Reload the page and observe new UI elements
+
+          3. **Debug Mode Testing:**
+             - Try: `?debug=true`, `?dev=true`, `?env=development`, `?env=staging`
+             - Try: `X-Debug-Mode: true` header
+             - Try: `?__debug=true`, `?__devtools=true`
+             - Check browser console for debug output, warnings, errors
+
+          4. **Disabled UI Elements:**
+             - Find greyed-out, disabled buttons, tabs, or menu items in the UI
+             - Remove the "disabled" attribute via browser console and try clicking
+             - Trigger the associated API call directly (from JS analysis)
+             - Document: does the feature work despite being visually disabled?
+
+          5. **localStorage & sessionStorage:**
+             - List all stored keys and values (redact sensitive data after first 4 chars)
+             - Look for: draft content, user preferences, cached API responses, feature toggles
+             - Any JWT tokens or API keys stored in localStorage? (security issue)
+
+          6. **Rollout / A/B Testing:**
+             - Check for A/B test parameters in URLs or cookies
+             - Try different values to see alternate UI versions
+             - Document: different layouts, features, or content for different test groups
+
+          Output: discovered hidden features, accessible routes, debug panels, and alternate UI variants.
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # PHASE 6 — PERMISSION & ROLE MAPPING (requires SECOND_CREDS)
+  # ══════════════════════════════════════════════════════════════════════════
+  - name: "role-mapping"
+    condition: "${SECOND_CREDS} != ''"
+    tasks:
+
+      - name: "rbac-comparison"
+        depends_on: ["full-page-crawl"]
+        prompt: |
+          Target: ${TARGET_URL}
+          Account 1: ${CREDENTIALS}  |  Account 2: ${SECOND_CREDS}
+
+          Map role-based access control across the two accounts:
+
+          1. Log in with Account 1 (${CREDENTIALS}) and document:
+             - All visible navigation items
+             - All accessible pages (visit each and note status)
+             - Actions available (create, edit, delete, approve, export)
+
+          2. Log in with Account 2 (${SECOND_CREDS}) and document:
+             - All visible navigation items
+             - All accessible pages
+             - Actions available
+
+          3. Compare the two:
+             - Which features are shared between both accounts?
+             - Which features are exclusive to Account 2?
+             - Which menu items, tabs, buttons differ?
+             - Which API endpoints differ in response?
+
+          4. Permission boundary testing:
+             - For features exclusive to Account 2, try accessing them directly with Account 1's session (URL navigation)
+             - For API endpoints only Account 2 can use, replay the request with Account 1's session token
+             - Document: server-side enforced (proper) vs client-side only (vulnerable)
+
+          5. Identify role model from the application:
+             - Search for role indicators: admin, user, moderator, editor, viewer, member, owner, superadmin
+             - Check URL patterns: /admin/, /moderator/
+             - Check HTML/JS: `role:`, `isAdmin`, `isModerator`, `permissions:`
+             - Check API responses: roles array, permission claims in JWT payload
+
+          Output: RBAC matrix with server-side enforcement analysis and role labels.
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # PHASE 7 — CONSOLIDATED FEATURE DOCUMENTATION
+  # ══════════════════════════════════════════════════════════════════════════
+  - name: "documentation"
+    tasks:
+
+      - name: "generate-feature-report"
+        depends_on:
+          - "full-page-crawl"
+          - "tech-fingerprint"
+          - "auth-flow-documentation"
+          - "form-interaction-testing"
+          - "crud-operation-mapping"
+          - "api-discovery"
+          - "multi-step-workflow-mapping"
+          - "js-analysis"
+          - "hidden-feature-testing"
+          - "rbac-comparison"
+        prompt: |
+          Target: ${TARGET_URL}
+          Authenticated: ${is_authenticated}
+          Account created: ${account_created}  |  Login status: ${login_status}
+
+          Compile a comprehensive end-to-end feature documentation for the application.
+
+          ## Feature Inventory Report
+
+          ### 1. Application Overview
+          - Application name and purpose
+          - Target URL
+          - Technology stack (server, frontend, backend, CDN, third-party integrations)
+          - Total pages discovered (public + authenticated)
+          - Total distinct features identified
+          - Authentication status (authenticated crawl: yes/no)
+
+          ### 2. Authentication & Session Management
+          - **Login flow:** URL, input fields, validation, success/failure behaviour, MFA
+          - **Registration flow:** URL, required fields, verification, post-signup onboarding
+          - **Password reset:** URL, token format, email verification, expiry
+          - **OAuth/SSO providers:** which providers, flow description, scopes requested
+          - **Session token:** format (JWT/cookie), security flags (HttpOnly, Secure, SameSite), expiry, refresh mechanism
+          - **Logout:** behaviour, token invalidation, redirect
+
+          ### 3. Navigation & Sitemap
+          ```
+          ASCII sitemap showing:
+          ├── Public pages
+          │   ├── / (Homepage)
+          │   ├── /about
+          │   └── ...
+          └── Authenticated pages
+              ├── /dashboard
+              │   ├── /dashboard/overview
+              │   └── /dashboard/analytics
+              ├── /profile
+              └── ...
+          ```
+
+          ### 4. Feature Inventory (by category)
+          For each feature, document:
+
+          **Feature Name:**
+          - URL(s): [list of URLs associated]
+          - Purpose: [what this feature does for the user]
+          - Access: [public | auth-required | admin-only]
+          - CRUD capabilities: [create | read | update | delete | bulk]
+          - Inputs: [fields, types, validation rules]
+          - Outputs: [response data, confirmation messages]
+          - Workflow: [if multi-step, describe the flow]
+          - API endpoints consumed: [method, path, auth]
+          - Dependencies: [prerequisites, related features]
+
+          ### 5. Forms & Inputs Reference
+          Table: Page URL | Form action | Method | Field names (with types) | Validation | Success behaviour
+
+          ### 6. API Surface
+          - **REST endpoints:** method | path | auth required | parameters | response structure summary
+          - **GraphQL:** operations (queries/mutations/subscriptions), introspection status
+          - **WebSocket:** event names, payload structure
+          - **Public vs authenticated API breakdown**
+
+          ### 7. Workflow Documentation
+          For each multi-step workflow:
+          - Workflow name
+          - Step-by-step (URL + action at each step)
+          - State machine (states and transitions in ASCII)
+          - Business rules (validation, limits, calculations, time-based rules)
+          - Notification triggers (email, in-app, webhook)
+
+          ### 8. Business Rules Summary
+          - Validation rules per field/feature
+          - Quotas and limits (max items, file sizes, rate limits, storage)
+          - Permission requirements per action
+          - Calculated fields / pricing rules
+          - Conditional logic observed
+
+          ### 9. Hidden / Discovered Features
+          - Routes found in JS but not in visible UI
+          - Feature flags discovered and their effects
+          - Debug/developer tools accessible
+          - A/B test variants found
+          - Disabled UI elements that have working backend APIs
+
+          ### 10. Data Model (inferred)
+          - Entity types (User, Product, Order, Ticket, etc.)
+          - Entity fields (from CRUD operations)
+          - Entity relationships (from navigation and detail pages)
+          - Data types and formats observed
+
+          ### 11. Role Model (if multiple accounts tested)
+          - Roles identified
+          - Feature access by role (matrix table)
+          - Server-side vs client-side enforcement analysis
+
+          ### 12. Edge Cases & Observations
+          - Validation gaps or inconsistencies
+          - Error message information leakage
+          - Features in development/beta
+          - Unexpected behaviours or bugs observed
+          - Security-relevant observations (exposed keys, missing auth, information disclosure)
+
+          Write in Markdown with tables, ASCII diagrams, and structured lists. This report should serve as complete application documentation suitable for developers, QA, and security testers.
+
+      - name: "visual-sitemap"
+        depends_on:
+          - "full-page-crawl"
+          - "hidden-feature-testing"
+        prompt: |
+          Target: ${TARGET_URL}
+
+          Generate a visual ASCII sitemap of the complete application:
+
+          ```
+          https://${TARGET_DOMAIN}/
+          ├── [PUBLIC]
+          │   ├── / (Homepage)
+          │   ├── /about
+          │   ├── /contact
+          │   ├── /pricing
+          │   ├── /blog
+          │   │   ├── /blog/{slug}  (article detail)
+          │   │   └── /blog?page=N   (pagination)
+          │   ├── /docs
+          │   ├── /login
+          │   ├── /register
+          │   └── /password-reset
+          ├── [AUTH]
+          │   ├── /dashboard
+          │   │   ├── /dashboard/overview
+          │   │   └── /dashboard/analytics
+          │   ├── /profile
+          │   │   ├── /profile/edit
+          │   │   ├── /profile/security
+          │   │   └── /profile/notifications
+          │   ├── /{feature}
+          │   │   ├── /{feature} (list)
+          │   │   ├── /{feature}/new (create)
+          │   │   ├── /{feature}/{id} (detail)
+          │   │   └── /{feature}/{id}/edit (update)
+          │   └── /settings
+          │       ├── /settings/general
+          │       ├── /settings/team
+          │       ├── /settings/billing
+          │       └── /settings/integrations
+          ├── [ADMIN] (if applicable)
+          │   ├── /admin/users
+          │   ├── /admin/settings
+          │   └── /admin/logs
+          └── [HIDDEN] (discovered in JS but not in UI)
+              ├── /beta/{feature}
+              └── /debug
+          ```
+
+          For each node include:
+          - Access level: [PUBLIC] [AUTH] [ADMIN] [HIDDEN]
+          - HTTP method and typical response code (GET 200, POST 201, etc.)
+          - Page title
+          - Feature category (Dashboard, List, Detail, Create, Edit, Settings, etc.)
+
+          Output: complete visual sitemap.

@@ -192,6 +192,24 @@ enum Cmd {
         #[command(subcommand)]
         sub: WorkflowCmd,
     },
+    /// Create a thread, send one message, stream the response to stdout, then exit.
+    /// Useful for scripting and for launching orchestrator prompts that spawn sub-agents.
+    Send {
+        /// Message to send (the full prompt text).
+        message: String,
+        /// Attach the thread to this existing workspace ID.
+        #[arg(long, short)]
+        workspace: Option<String>,
+        /// Create a new workspace with this name and attach the thread to it.
+        #[arg(long)]
+        new_workspace: Option<String>,
+        /// Thread title (defaults to first 60 chars of the message).
+        #[arg(long, short)]
+        title: Option<String>,
+        /// LLM model picker id.
+        #[arg(long, short)]
+        model: Option<i64>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -271,6 +289,9 @@ async fn main() -> Result<()> {
         }
         Cmd::Probe { thread, send, secs, model } => cmd_probe(&profile, &thread, send, secs, model).await,
         Cmd::Workflow { sub } => cmd_workflow(profile, sub, &tenant).await,
+        Cmd::Send { message, workspace, new_workspace, title, model } => {
+            cmd_send(&profile, message, workspace, new_workspace, title, model).await
+        }
     }
 }
 
@@ -830,6 +851,171 @@ async fn cmd_probe(p: &config::Profile, thread_id: &str, send: Option<String>, s
                     }
                 }
             }
+        }
+    }
+    Ok(())
+}
+
+/// Create a new thread, send one message, stream the response to stdout.
+///
+/// Tokens are printed inline (no trailing newline until a natural one arrives),
+/// tool events are prefixed with ▶ / ◀ / ✗, and the process exits cleanly on
+/// `RunFinished`. `Interrupt` events prompt the user interactively.
+async fn cmd_send(
+    p: &config::Profile,
+    message: String,
+    workspace: Option<String>,
+    new_workspace: Option<String>,
+    title: Option<String>,
+    model: Option<i64>,
+) -> Result<()> {
+    require_complete(p)?;
+    let client = api::ApiClient::new(p.clone())?;
+
+    // Resolve workspace: prefer explicit --workspace, then create one if --new-workspace given.
+    let workspace_id: Option<String> = match (workspace, new_workspace) {
+        (Some(ws), _) => Some(ws),
+        (None, Some(name)) => {
+            let (id, _) = client.create_workspace(&name).await?;
+            eprintln!("workspace: {id}");
+            Some(id)
+        }
+        (None, None) => None,
+    };
+
+    let thread_title = title.unwrap_or_else(|| {
+        let truncated: String = message.chars().take(60).collect();
+        if message.chars().count() > 60 {
+            format!("{truncated}…")
+        } else {
+            truncated
+        }
+    });
+
+    let thread_id = client
+        .create_thread(&thread_title, workspace_id.as_deref())
+        .await?;
+    eprintln!("thread: {thread_id}");
+
+    let (tx, mut rx) = mpsc::unbounded_channel::<pulse::AppEvent>();
+    let handle = pulse::connect(p, &thread_id, tx, model).await?;
+    handle.send_user_message(&message);
+
+    let mut needs_newline = false;
+    loop {
+        match rx.recv().await {
+            None => {
+                if needs_newline {
+                    println!();
+                }
+                break;
+            }
+            Some(ev) => match ev {
+                pulse::AppEvent::RunFinished(_) => {
+                    if needs_newline {
+                        println!();
+                    }
+                    break;
+                }
+                pulse::AppEvent::Stream(item) => match item.kind.as_str() {
+                    "token" => {
+                        if let Some(text) = &item.text {
+                            print!("{text}");
+                            let _ = std::io::Write::flush(&mut std::io::stdout());
+                            needs_newline = !text.ends_with('\n');
+                        }
+                    }
+                    "thinking" => {
+                        if let Some(text) = &item.text {
+                            if needs_newline {
+                                println!();
+                                needs_newline = false;
+                            }
+                            println!("💭 {text}");
+                        }
+                    }
+                    "tool_start" => {
+                        if needs_newline {
+                            println!();
+                            needs_newline = false;
+                        }
+                        let name = item.tool_name.as_deref().unwrap_or("?");
+                        let detail = item.detail.as_deref().unwrap_or("");
+                        if detail.is_empty() {
+                            println!("▶ {name}");
+                        } else {
+                            println!("▶ {name}({detail})");
+                        }
+                    }
+                    "tool_output" => {
+                        if needs_newline {
+                            println!();
+                            needs_newline = false;
+                        }
+                        let name = item.tool_name.as_deref().unwrap_or("?");
+                        let detail = item.detail.as_deref().unwrap_or("");
+                        if !detail.is_empty() {
+                            println!("◀ {name}: {detail}");
+                        }
+                    }
+                    "tool_failed" => {
+                        if needs_newline {
+                            println!();
+                            needs_newline = false;
+                        }
+                        let name = item.tool_name.as_deref().unwrap_or("?");
+                        let err = item.detail.as_deref().unwrap_or("error");
+                        println!("✗ {name}: {err}");
+                    }
+                    "note" | "system" => {
+                        if needs_newline {
+                            println!();
+                            needs_newline = false;
+                        }
+                        if let Some(text) = &item.text {
+                            println!("ℹ {text}");
+                        }
+                    }
+                    _ => {
+                        if let Some(text) = &item.text {
+                            print!("{text}");
+                            let _ = std::io::Write::flush(&mut std::io::stdout());
+                            needs_newline = !text.ends_with('\n');
+                        }
+                    }
+                },
+                pulse::AppEvent::Error(e) => {
+                    if needs_newline {
+                        println!();
+                        needs_newline = false;
+                    }
+                    eprintln!("error: {e}");
+                    break;
+                }
+                pulse::AppEvent::Interrupt {
+                    id,
+                    title,
+                    message: msg,
+                    fields,
+                } => {
+                    if needs_newline {
+                        println!();
+                        needs_newline = false;
+                    }
+                    println!("\n[interrupt] {title}");
+                    if !msg.is_empty() {
+                        println!("{msg}");
+                    }
+                    let mut resp = serde_json::Map::new();
+                    for f in &fields {
+                        let secret = f.ftype == "password";
+                        let val = prompt_line(&f.label, "", secret)?;
+                        resp.insert(f.key.clone(), serde_json::Value::from(val));
+                    }
+                    handle.respond_interrupt(&id, serde_json::Value::Object(resp));
+                }
+                _ => {}
+            },
         }
     }
     Ok(())

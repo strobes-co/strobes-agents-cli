@@ -17,26 +17,46 @@ pub struct LocalResult {
     pub captured_network: Vec<serde_json::Value>,
 }
 
-pub fn sandbox_dir() -> PathBuf {
+/// Return the sandbox directory for a given thread.
+///
+/// When a `thread_id` is present (injected by pulse.rs) each thread gets its
+/// own isolated working directory under `~/.strobes-ai/sandboxes/<thread_id>/`.
+/// This ensures workflow tasks can't clobber each other's files.
+/// Falls back to the global `STROBES_AI_SANDBOX` env override or the legacy
+/// single `~/.strobes-ai/sandbox/` path when no thread_id is available.
+pub fn sandbox_dir_for(thread_id: Option<&str>) -> PathBuf {
     if let Ok(d) = std::env::var("STROBES_AI_SANDBOX") {
         return PathBuf::from(d);
     }
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-    home.join(".strobes-ai").join("sandbox")
+    if let Some(tid) = thread_id {
+        let safe: String = tid
+            .chars()
+            .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+            .collect();
+        home.join(".strobes-ai").join("sandboxes").join(safe)
+    } else {
+        home.join(".strobes-ai").join("sandbox")
+    }
 }
 
-fn ensure_sandbox() -> PathBuf {
-    let dir = sandbox_dir();
-    let _ = std::fs::create_dir_all(&dir);
-    dir
+/// Convenience wrapper — used by callers that don't have a thread_id.
+pub fn sandbox_dir() -> PathBuf {
+    sandbox_dir_for(None)
 }
+
 
 /// Route a proxied tool call to the right local executor.
 pub async fn run_tool(tool_name: &str, input: &serde_json::Value) -> LocalResult {
+    // Each task runs in its own thread; the thread_id is injected by pulse.rs.
+    // We use it to key an isolated sandbox directory per task.
+    let thread_id = input.get("_thread_id").and_then(|v| v.as_str());
+    let sandbox = sandbox_dir_for(thread_id);
+
     match tool_name {
         "execute_command" => {
             let cmd = input.get("command").and_then(|v| v.as_str()).unwrap_or("");
-            run_shell(cmd).await
+            run_shell(cmd, &sandbox).await
         }
         "execute_code" => {
             let code = input.get("code").and_then(|v| v.as_str()).unwrap_or("");
@@ -44,14 +64,16 @@ pub async fn run_tool(tool_name: &str, input: &serde_json::Value) -> LocalResult
                 .get("language")
                 .and_then(|v| v.as_str())
                 .unwrap_or("python");
-            run_code(code, lang).await
+            run_code(code, lang, &sandbox).await
         }
         "workspace_get_meta" => LocalResult {
-            output: meta_json(),
+            output: meta_json(&sandbox),
             exit_code: Some(0),
             error: None,
             captured_network: vec![],
         },
+        "todo_write" => todo_write(input, &sandbox),
+        "todo_read" => todo_read(&sandbox),
         b if b.starts_with("browser_") => match crate::browser::handle(b, input).await {
             Ok((output, captured_network)) => LocalResult {
                 output,
@@ -75,8 +97,8 @@ pub async fn run_tool(tool_name: &str, input: &serde_json::Value) -> LocalResult
     }
 }
 
-async fn run_shell(command: &str) -> LocalResult {
-    let dir = ensure_sandbox();
+async fn run_shell(command: &str, sandbox: &std::path::Path) -> LocalResult {
+    let _ = std::fs::create_dir_all(sandbox);
     // Use the native shell: cmd.exe on Windows, login bash elsewhere.
     let mut cmd = if cfg!(windows) {
         let mut c = Command::new("cmd");
@@ -88,7 +110,7 @@ async fn run_shell(command: &str) -> LocalResult {
         c
     };
     let out = cmd
-        .current_dir(&dir)
+        .current_dir(sandbox)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
@@ -96,7 +118,7 @@ async fn run_shell(command: &str) -> LocalResult {
     finish(out)
 }
 
-async fn run_code(code: &str, lang: &str) -> LocalResult {
+async fn run_code(code: &str, lang: &str, sandbox: &std::path::Path) -> LocalResult {
     // The Python launcher is `python` on Windows, `python3` elsewhere.
     let python = if cfg!(windows) { "python" } else { "python3" };
     let (program, args, suffix): (&str, Vec<&str>, &str) = match lang.to_lowercase().as_str() {
@@ -113,8 +135,8 @@ async fn run_code(code: &str, lang: &str) -> LocalResult {
             }
         }
     };
-    let dir = ensure_sandbox();
-    let file = dir.join(format!("snippet-{}{}", uuid::Uuid::new_v4().simple(), suffix));
+    let _ = std::fs::create_dir_all(sandbox);
+    let file = sandbox.join(format!("snippet-{}{}", uuid::Uuid::new_v4().simple(), suffix));
     if let Err(e) = tokio::fs::write(&file, code).await {
         return LocalResult {
             output: String::new(),
@@ -126,7 +148,7 @@ async fn run_code(code: &str, lang: &str) -> LocalResult {
     let out = Command::new(program)
         .args(&args)
         .arg(&file)
-        .current_dir(&dir)
+        .current_dir(sandbox)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
@@ -163,9 +185,50 @@ fn finish(out: std::io::Result<std::process::Output>) -> LocalResult {
     }
 }
 
-fn meta_json() -> String {
-    let dir = sandbox_dir();
-    let file_count = std::fs::read_dir(&dir).map(|d| d.count()).unwrap_or(0);
+/// Persist the agent's todo list to `<sandbox>/todos.json`.
+/// Input: `{ "todos": [{ "id", "content", "status", "priority" }] }`
+fn todo_write(input: &serde_json::Value, sandbox: &std::path::Path) -> LocalResult {
+    let todos = input.get("todos").cloned().unwrap_or(serde_json::json!([]));
+    let _ = std::fs::create_dir_all(sandbox);
+    let path = sandbox.join("todos.json");
+    match serde_json::to_string_pretty(&todos) {
+        Ok(json) => match std::fs::write(&path, &json) {
+            Ok(_) => LocalResult {
+                output: json,
+                exit_code: Some(0),
+                error: None,
+                captured_network: vec![],
+            },
+            Err(e) => LocalResult {
+                output: String::new(),
+                exit_code: Some(1),
+                error: Some(format!("todo_write: {e}")),
+                captured_network: vec![],
+            },
+        },
+        Err(e) => LocalResult {
+            output: String::new(),
+            exit_code: Some(1),
+            error: Some(format!("todo_write serialize: {e}")),
+            captured_network: vec![],
+        },
+    }
+}
+
+/// Read the agent's persisted todo list from `<sandbox>/todos.json`.
+fn todo_read(sandbox: &std::path::Path) -> LocalResult {
+    let path = sandbox.join("todos.json");
+    let content = std::fs::read_to_string(&path).unwrap_or_else(|_| "[]".to_string());
+    LocalResult {
+        output: content,
+        exit_code: Some(0),
+        error: None,
+        captured_network: vec![],
+    }
+}
+
+fn meta_json(sandbox: &std::path::Path) -> String {
+    let file_count = std::fs::read_dir(sandbox).map(|d| d.count()).unwrap_or(0);
     // Shell + user vary by platform (Windows has no SHELL/USER).
     let (shell, user) = if cfg!(windows) {
         (
@@ -179,12 +242,12 @@ fn meta_json() -> String {
         )
     };
     let mut meta = serde_json::json!({
-        "working_directory": dir.to_string_lossy(),
+        "working_directory": sandbox.to_string_lossy(),
         "platform": std::env::consts::OS,
         "shell": shell,
         "user": user,
         "entry_count": file_count,
-        "note": "Files synced locally from the remote workspace. Use shell (ls/find/cat) to inspect.",
+        "note": "Isolated sandbox for this task. Files here are private to this thread.",
     });
     if let Ok(ws) = std::env::var("STROBES_AI_WORKSPACE_ID") {
         meta["workspace_id"] = serde_json::Value::from(ws);
