@@ -1,6 +1,6 @@
 [package]
 name = "strobes-agents-cli"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 description = "Strobes Agents AI — a Ratatui terminal client for remote Strobes workspaces"
 license = "Proprietary"
@@ -27,6 +27,7 @@ pulldown-cmark = { version = "0.12", default-features = false }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 chromiumoxide = { version = "0.7", default-features = false, features = ["tokio-runtime"] }
 base64 = "0.22"
+serde_yaml = "0.9"
 
 [profile.release]
 opt-level = 2

@@ -1,0 +1,265 @@
+name: "full-bugbounty-hunt"
+description: "End-to-end bug bounty engagement — scoping, recon, exploitation, PoC crafting, and submission-ready report. Designed to maximise P1/P2 yield on a single target domain."
+
+workspace:
+  name: "Bug Bounty — ${PROGRAM} (${TARGET})"
+
+variables:
+  TARGET: "example.com"
+  PROGRAM: "Example Bug Bounty"
+  PLATFORM: "HackerOne"              # HackerOne | Bugcrowd | Intigriti | private
+  SCOPE: "*.example.com, api.example.com"
+  OUT_OF_SCOPE: "blog.example.com"
+  TEST_ACCOUNT: "bbtest@mailinator.com:Password123!"
+  SECOND_ACCOUNT: "bbtest2@mailinator.com:Password123!"  # for IDOR / priv-esc tests
+  MAX_PAYOUT: "10000"                # max bounty in USD (for prioritisation)
+  REPORT_FORMAT: "HackerOne"         # HackerOne | Bugcrowd | markdown
+
+phases:
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # PHASE 1 — PROGRAMME RESEARCH
+  # ══════════════════════════════════════════════════════════════════════════
+  - name: "programme-research"
+    tasks:
+
+      - name: "read-policy"
+        prompt: |
+          Programme: ${PROGRAM}  |  Platform: ${PLATFORM}
+
+          Research the bug bounty programme policy for "${PROGRAM}" on ${PLATFORM}:
+          1. Find and read the programme's policy page. Extract: scope (in/out), reward table, disclosure timeline, banned techniques (e.g. automated scanning, social engineering, DoS), and any special submission rules.
+          2. Identify the highest-paying vulnerability categories for this programme.
+          3. List any previously disclosed reports (if public) to avoid duplicates and understand the attack surface already explored.
+          4. Identify the most valuable assets (admin portals, payment flows, user data APIs) based on scope + reward table.
+          5. Output: a structured briefing for a pentester — what to hunt for, what to avoid, and where the money is.
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # PHASE 2 — RECON (parallel)
+  # ══════════════════════════════════════════════════════════════════════════
+  - name: "recon"
+    tasks:
+
+      - name: "passive-recon"
+        depends_on: ["read-policy"]
+        prompt: |
+          Target: ${TARGET}  |  Scope: ${SCOPE}  |  Out-of-scope: ${OUT_OF_SCOPE}
+
+          Passive reconnaissance — no direct target interaction:
+          1. **Certificate Transparency** — query crt.sh for ${TARGET}. List all SANs and wildcard certs. Flag anything unexpected (internal hostnames, staging environments, partner domains).
+          2. **Web Archive** — search Wayback Machine for archived URLs of ${TARGET}. Extract endpoints, parameters, and old API paths that may still be live.
+          3. **GitHub/GitLab OSINT** — search for "${TARGET}", "${TARGET} api_key", "${TARGET} password", "${TARGET} secret" on GitHub. Note any leaked credentials, internal URLs, or config files.
+          4. **Shodan/Censys** — look up ${TARGET} IP ranges. List non-standard open ports and exposed services.
+          5. **LinkedIn/Job postings** — identify the tech stack from job descriptions ("We use Django, PostgreSQL, Redis, AWS…").
+          6. **DNS enumeration** — gather MX, TXT (SPF/DKIM/DMARC), NS, and CNAME records. SPF misconfigs can enable email spoofing.
+          7. Produce a structured passive recon summary.
+
+      - name: "subdomain-takeover-check"
+        depends_on: ["read-policy"]
+        prompt: |
+          Target: ${TARGET}  |  Scope: ${SCOPE}
+
+          Hunt for subdomain takeover vulnerabilities:
+          1. Enumerate subdomains via CT logs (crt.sh), DNS brute-force, and web archive data for ${TARGET}.
+          2. For each subdomain, resolve its DNS. Pay special attention to CNAMEs.
+          3. Check each CNAME target against known takeover-vulnerable services:
+             - GitHub Pages (*.github.io)
+             - AWS S3 (*.s3.amazonaws.com, *.s3-website-*.amazonaws.com)
+             - Azure (*.azurewebsites.net, *.cloudapp.azure.com)
+             - Heroku (*.herokuapp.com)
+             - Fastly, Pantheon, Shopify, Tumblr, Ghost, Wordpress.com
+          4. For any dangling CNAME, attempt to claim the service (note: claim but do NOT serve malicious content — document and report immediately).
+          5. Also check for NS delegation to non-existent nameservers (full subdomain takeover via NS).
+          6. Output: list of takeover candidates with service, CNAME value, and confidence level.
+
+      - name: "js-analysis"
+        depends_on: ["read-policy"]
+        prompt: |
+          Target: ${TARGET}
+
+          Analyse JavaScript files served by ${TARGET} for secrets and hidden endpoints:
+          1. Navigate to ${TARGET}, collect all loaded JS file URLs (from Network tab / source).
+          2. Download and search each JS file for:
+             - API keys, tokens, secrets (patterns: `apiKey`, `api_key`, `token`, `secret`, `password`, `AWS_`, `AKIA`, `Bearer `)
+             - Internal API endpoints not visible in the UI (`/api/internal/`, `/admin/`, `/_/`)
+             - Feature-flagged routes that may be accessible
+             - Hardcoded credentials, staging URLs, internal hostnames
+          3. Check for source maps (`.map` files) — if present, download and analyse the original source.
+          4. Look for `fetch()`, `axios.get/post`, `XMLHttpRequest` calls to understand all API communication.
+          5. Report: secrets found (redacted after first 4 chars), hidden endpoints, interesting function names.
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # PHASE 3 — VULNERABILITY HUNTING (parallel, high-value targets)
+  # ══════════════════════════════════════════════════════════════════════════
+  - name: "vuln-hunt"
+    tasks:
+
+      - name: "auth-and-session-bugs"
+        depends_on: ["passive-recon", "js-analysis"]
+        prompt: |
+          Target: ${TARGET}
+          Account 1: ${TEST_ACCOUNT}
+          Account 2: ${SECOND_ACCOUNT}
+
+          Hunt for authentication and session vulnerabilities (high payout category):
+          1. **Account takeover via password reset** — test the forgot-password flow:
+             - Predictable reset tokens (sequential, timestamp-based, MD5 of email)
+             - Host header injection in reset emails (change Host: to attacker.com)
+             - Reset token not expiring after use or after 24h
+             - Username enumeration in the reset flow
+          2. **OAuth account takeover** — if OAuth login exists:
+             - Test missing `state` parameter (CSRF)
+             - Test `redirect_uri` bypass (`?redirect_uri=https://evil.com`, `@evil.com`, extra slashes)
+             - Test implicit flow token leakage via Referer header
+             - Pre-account-takeover: register with victim email before victim verifies OAuth
+          3. **JWT attacks** — if JWTs are used:
+             - `alg: none` bypass
+             - Algorithm confusion (RS256 → HS256 with public key as secret)
+             - Weak secret brute-force (try: secret, password, 12345, domain name)
+             - `kid` parameter injection (SQL, path traversal)
+          4. **2FA/MFA bypass** — if MFA enabled:
+             - Response manipulation (change `"success":false` to `true`)
+             - Code reuse (try an already-used code)
+             - Rate limiting on OTP (try 000000–999999 without lockout)
+          Provide PoC curl commands for each confirmed finding.
+
+      - name: "idor-and-access-control"
+        depends_on: ["passive-recon", "js-analysis"]
+        prompt: |
+          Target: ${TARGET}
+          Account 1: ${TEST_ACCOUNT}
+          Account 2: ${SECOND_ACCOUNT}
+
+          Hunt for IDOR and broken access control (consistently high-payout):
+          1. Log in as Account 1. Capture all API calls containing resource IDs (numeric or UUID).
+          2. Log in as Account 2. Attempt to access Account 1's resources using Account 2's session token.
+          3. Test every object type: user profiles, documents, messages, orders, invoices, settings, API keys.
+          4. **Mass assignment** — send extra fields in PATCH/PUT requests: `"role":"admin"`, `"is_verified":true`, `"subscription":"enterprise"`, `"balance":99999`.
+          5. **Privilege escalation** — while authenticated as a regular user, probe admin-only API endpoints discovered in JS analysis.
+          6. **Unauthenticated API access** — remove the Authorization header from authenticated API calls; does the server still return data?
+          7. **HTTP method override** — try `X-HTTP-Method-Override: DELETE` on GET requests to privileged endpoints.
+          For each IDOR: provide request with victim ID, response showing victim data, and impact statement.
+
+      - name: "injection-and-ssti"
+        depends_on: ["passive-recon", "js-analysis"]
+        prompt: |
+          Target: ${TARGET}  |  Credentials: ${TEST_ACCOUNT}
+
+          Hunt for injection vulnerabilities that lead to RCE or data exfiltration:
+
+          **SSTI (highest priority — direct RCE path)**
+          1. Find all fields that reflect input back: search, greetings, custom messages, email templates, PDF generators.
+          2. Test: `{{7*7}}` (Jinja2/Twig), `${7*7}` (Freemarker), `#{ 7*7 }` (Spring), `<%= 7*7 %>` (ERB).
+          3. If confirmed SSTI: attempt RCE via `{{ ''.__class__.__mro__[1].__subclasses__() }}` (Python) or equivalent. Use id/whoami as PoC — do not exfiltrate real data.
+
+          **SQL Injection**
+          4. Focus on search fields, filter parameters, and API endpoints with ID parameters.
+          5. Test for time-based blind SQLi (SLEEP 5 seconds) — cleaner PoC, less impact.
+          6. If error-based: extract DB name and version only.
+
+          **GraphQL injection**
+          7. If GraphQL endpoint found: run introspection, look for mutations without auth, test batching attacks (DoS), check for field-level authorization bypass.
+
+          **SSRF via webhooks/integrations**
+          8. Find webhook, URL import, or external integration features.
+          9. Test with http://169.254.169.254/latest/meta-data/ and http://127.0.0.1:6379 (Redis RESP probe).
+
+      - name: "business-logic-and-race-conditions"
+        depends_on: ["passive-recon"]
+        prompt: |
+          Target: ${TARGET}  |  Credentials: ${TEST_ACCOUNT}  |  Max payout hint: $${MAX_PAYOUT}
+
+          Hunt for business logic flaws and race conditions (often underreported, good payouts):
+
+          **Race Conditions**
+          1. Identify single-use or limited resources: discount codes, referral bonuses, gift cards, rate-limited API calls, invite links.
+          2. Send 10–50 identical requests simultaneously (use parallel HTTP requests). Does the server process all of them, granting the resource multiple times?
+          3. Test checkout flow: can you check out with a negative quantity to get store credit?
+
+          **Price Manipulation**
+          4. Intercept checkout/order API calls. Modify: `unit_price`, `total`, `discount`, `quantity` (try 0, -1, 0.001).
+          5. Try currency manipulation: if price is $10.00, send `10.00` in a weaker currency.
+
+          **Workflow Bypass**
+          6. In multi-step flows (onboarding, KYC verification, subscription upgrade), attempt to jump to the final step by directly calling the step-completion API.
+
+          **Coupon/Discount Abuse**
+          7. Test coupon stacking (apply same coupon twice), negative discount codes, expired code reuse.
+
+          **Account Limits**
+          8. Test limits: max file storage, max team members, max API calls — are limits enforced server-side?
+
+          Document: flow tested, manipulation applied, result, business impact, and estimated financial impact.
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # PHASE 4 — PoC AND IMPACT ASSESSMENT
+  # ══════════════════════════════════════════════════════════════════════════
+  - name: "poc-crafting"
+    tasks:
+
+      - name: "craft-pocs"
+        depends_on:
+          - "auth-and-session-bugs"
+          - "idor-and-access-control"
+          - "injection-and-ssti"
+          - "business-logic-and-race-conditions"
+          - "subdomain-takeover-check"
+        prompt: |
+          Target: ${TARGET}  |  Platform: ${PLATFORM}
+
+          For every confirmed vulnerability from the hunt phases, produce a submission-ready PoC:
+
+          **For each finding:**
+          1. **Minimal reproducible PoC** — the fewest steps needed to confirm the bug. No unnecessary data exfiltration. Use non-destructive actions (read-only where possible).
+          2. **curl command or HTTP request** (raw headers + body) that reproduces the issue.
+          3. **Expected vs actual response** — screenshot description or response snippet.
+          4. **Impact chain** — what can an attacker do with this, step by step, in the worst case.
+          5. **CVSS v3.1 score** — calculate with vector string (e.g. CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:N).
+          6. **Estimated bounty range** based on the programme's reward table.
+
+          Prioritise findings by CVSS score descending. Group duplicates. Flag any finding that needs to be reported immediately (active exploitation risk).
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # PHASE 5 — SUBMISSION REPORT
+  # ══════════════════════════════════════════════════════════════════════════
+  - name: "submission"
+    tasks:
+
+      - name: "write-reports"
+        depends_on: ["craft-pocs"]
+        prompt: |
+          Programme: ${PROGRAM}  |  Platform: ${PLATFORM}  |  Format: ${REPORT_FORMAT}
+
+          Write individual bug bounty submission reports for all confirmed, exploitable findings.
+
+          **Report format (${REPORT_FORMAT} style):**
+
+          Each report must include:
+          1. **Title** — clear, precise. Format: "[Component] Vulnerability Type leads to Impact" (e.g. "Password reset token not invalidated after use leads to account takeover")
+          2. **Severity** — Critical / High / Medium / Low with CVSS score
+          3. **Summary** (2–3 sentences) — what the bug is, where it is, what it allows
+          4. **Steps to Reproduce** — numbered, exact steps a triage engineer can follow on a fresh browser with no prior knowledge. Include: URL, method, headers, request body, expected result, actual result.
+          5. **Impact** — what a real attacker achieves. Be specific: "an attacker can take over any account without user interaction" not "this could be dangerous".
+          6. **Supporting Material** — curl command, raw HTTP request, and response snippet.
+          7. **Recommended Fix** — 1–3 sentences, actionable.
+          8. **References** — CWE, OWASP, prior disclosed reports if relevant.
+
+          For P1 (Critical) findings: include an escalation note and suggest immediate disclosure.
+
+          Output each report as a separate Markdown section. Sort by severity.
+
+      - name: "executive-summary"
+        depends_on: ["craft-pocs"]
+        prompt: |
+          Programme: ${PROGRAM}  |  Target: ${TARGET}
+
+          Write an executive summary of the entire bug bounty engagement:
+          1. **Engagement overview** — target, scope, duration, methodology used.
+          2. **Finding count by severity** — table: Severity | Count | Estimated Total Payout.
+          3. **Top 3 findings** — plain English description (suitable for a programme manager or CISO).
+          4. **Attack narrative** — describe how the most critical findings could chain together into a realistic attack scenario (e.g. "An unauthenticated attacker could exploit the subdomain takeover on cdn.example.com to serve a malicious script that steals session cookies from authenticated users, enabling account takeover at scale").
+          5. **Positive security observations** — what the programme has done well.
+          6. **Recommended immediate actions** — ordered by urgency.
+          7. **Estimated total bounty value** — based on programme reward table × confirmed findings.
+
+          Write in clear, professional English. Max 2 pages. This will be the cover page of the submission package.

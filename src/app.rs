@@ -18,6 +18,43 @@ use serde_json::{Map, Value};
 
 use crate::pulse::{AppEvent, Field, StreamItem};
 
+/// Status of a tracked agent task.
+#[derive(Clone, Copy, PartialEq)]
+pub enum TaskStatus {
+    Created,
+    Running,
+    Completed,
+    Failed,
+}
+
+impl TaskStatus {
+    fn icon(self) -> &'static str {
+        match self {
+            TaskStatus::Created   => "○",
+            TaskStatus::Running   => "⟳",
+            TaskStatus::Completed => "✓",
+            TaskStatus::Failed    => "✗",
+        }
+    }
+    fn color(self) -> Color {
+        match self {
+            TaskStatus::Created   => Color::DarkGray,
+            TaskStatus::Running   => Color::Cyan,
+            TaskStatus::Completed => Color::Green,
+            TaskStatus::Failed    => Color::Red,
+        }
+    }
+}
+
+/// A single agent task tracked in the tasks panel.
+#[derive(Clone)]
+pub struct Task {
+    pub id: String,
+    pub title: String,
+    pub status: TaskStatus,
+    pub agent: Option<String>,
+}
+
 /// Execution state of a tool call, driving its dot colour/animation.
 #[derive(Clone, Copy, PartialEq)]
 enum ToolStatus {
@@ -59,6 +96,7 @@ pub enum OverlayKind {
     Threads,
     Workspaces,
     Files,
+    Models,
 }
 
 /// One row in an overlay browser. `detail` lines are shown when the row is
@@ -149,6 +187,12 @@ pub struct App {
     // each run completes).
     thread_credits: f64,
     thread_tokens: i64,
+    /// The AI model currently selected for this chat session (None = org default).
+    current_model: Option<i64>,
+    /// Live task list populated by "task" stream events; keyed insertion-order.
+    tasks: Vec<Task>,
+    /// When true, mouse capture is off so the terminal can do native text selection.
+    pub select_mode: bool,
 }
 
 /// ASCII banner shown at the top of a fresh chat transcript and the pickers.
@@ -203,6 +247,9 @@ impl App {
             session_tokens: 0,
             thread_credits: 0.0,
             thread_tokens: 0,
+            current_model: None,
+            tasks: Vec::new(),
+            select_mode: false,
         };
         // Banner (cyan) + the authenticated tenant on top, indented to match
         // the picker pages.
@@ -368,6 +415,7 @@ impl App {
                 self.status = "running…".into();
                 self.run_credits = 0.0;
                 self.run_tokens = 0;
+                self.tasks.clear();
                 if self.run_started.is_none() {
                     self.run_started = Some(std::time::Instant::now());
                 }
@@ -553,20 +601,44 @@ impl App {
                 self.follow = true;
             }
             "task" => {
-                // Subtle, deduped by title (ignore started/completed churn).
                 let title = item.text.unwrap_or_default();
-                if title.trim().is_empty() || self.last_task.as_deref() == Some(&title) {
-                    return;
+                let task_status = match item.status.as_deref() {
+                    Some("started")   => TaskStatus::Running,
+                    Some("completed") => TaskStatus::Completed,
+                    Some("failed")    => TaskStatus::Failed,
+                    _                 => TaskStatus::Created,
+                };
+                if let Some(id) = &item.task_id {
+                    if let Some(existing) = self.tasks.iter_mut().find(|t| &t.id == id) {
+                        existing.status = task_status;
+                        if !title.trim().is_empty() {
+                            existing.title = title.clone();
+                        }
+                    } else if !title.trim().is_empty() {
+                        self.tasks.push(Task {
+                            id: id.clone(),
+                            title: title.clone(),
+                            status: task_status,
+                            agent: item.agent.clone(),
+                        });
+                    }
                 }
-                self.flush_stream();
-                self.blocks.push(Block::Plain(Line::from(Span::styled(
-                    format!("◇ {title}"),
-                    Style::default().fg(Color::Yellow).add_modifier(Modifier::DIM),
-                ))));
-                self.task_label = Some(title.clone());
-                self.last_task = Some(title);
-                self.last_tool = None;
-                self.follow = true;
+                // Keep a subtle inline marker for task.created events only.
+                // Skip for plan.updated batch tasks (status="pending") — those only go to the panel.
+                if !matches!(item.status.as_deref(), Some("pending"))
+                    && task_status == TaskStatus::Created && !title.trim().is_empty()
+                    && self.last_task.as_deref() != Some(&title)
+                {
+                    self.flush_stream();
+                    self.blocks.push(Block::Plain(Line::from(Span::styled(
+                        format!("◇ {title}"),
+                        Style::default().fg(Color::Yellow).add_modifier(Modifier::DIM),
+                    ))));
+                    self.task_label = Some(title.clone());
+                    self.last_task = Some(title);
+                    self.last_tool = None;
+                    self.follow = true;
+                }
             }
             "approval" => self.push(Line::from(Span::styled(
                 format!("  ⚠ approval ({}) {} — auto-approved",
@@ -667,15 +739,27 @@ impl App {
                 if self.show_thinking {
                     self.render_thinking(&s.buf, &mut out);
                 } else {
-                    // Collapsed: a live "thinking…" indicator with elapsed time.
+                    // Collapsed: animated dot + elapsed time + live token count.
+                    let on = (self.spinner / 3) % 2 == 0;
+                    let dot_style = Style::default()
+                        .fg(if on { Color::Magenta } else { Color::DarkGray })
+                        .add_modifier(Modifier::BOLD);
+                    let text_style = Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::ITALIC);
                     let el = self
                         .run_started
                         .map(|t| format!("  {}", fmt_elapsed(t.elapsed())))
                         .unwrap_or_default();
-                    out.push(Line::from(Span::styled(
-                        format!("✻ thinking…{el}"),
-                        Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
-                    )));
+                    let tok = if self.run_tokens > 0 {
+                        format!("  {}", fmt_tokens(self.run_tokens))
+                    } else {
+                        String::new()
+                    };
+                    out.push(Line::from(vec![
+                        Span::styled("✻ ", dot_style),
+                        Span::styled(format!("thinking…{el}{tok}"), text_style),
+                    ]));
                 }
             } else {
                 if cur_agent.as_deref() != Some(s.agent.as_str()) {
@@ -707,10 +791,13 @@ impl App {
         if !self.show_thinking {
             return;
         }
-        let dim = Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC);
-        out.push(Line::from(Span::styled("✻ thinking".to_string(), dim)));
+        let header = Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD);
+        let body = Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD | Modifier::ITALIC);
+        out.push(Line::from(Span::styled("✻ thinking", header)));
         for l in s.split('\n') {
-            out.push(Line::from(Span::styled(format!("  {l}"), dim)));
+            out.push(Line::from(Span::styled(format!("  {l}"), body)));
         }
     }
 
@@ -734,7 +821,19 @@ impl App {
             // of the screen (just above the input bar).
             self.draw_overlay(f, chunks[0]);
         } else {
-            self.draw_transcript(f, chunks[0]);
+            // Show tasks side panel when there are tasks and the screen is wide enough.
+            let body_area = chunks[0];
+            if !self.tasks.is_empty() && body_area.width > 60 {
+                let panel_w = (body_area.width / 4).clamp(22, 36);
+                let hchunks = Layout::horizontal([
+                    Constraint::Min(1),
+                    Constraint::Length(panel_w),
+                ]).split(body_area);
+                self.draw_transcript(f, hchunks[0]);
+                self.draw_tasks_panel(f, hchunks[1]);
+            } else {
+                self.draw_transcript(f, body_area);
+            }
             if self.slash_open() {
                 self.draw_slash_popup(f, chunks[0]);
             }
@@ -788,6 +887,7 @@ impl App {
             let esc_hint = match o.kind {
                 OverlayKind::Threads => "Esc → workspaces",
                 OverlayKind::Workspaces => "Esc quit",
+                OverlayKind::Models => "Esc close · ^P toggle",
                 _ => "Esc close",
             };
             // Show the live search filter (the pickers are type-to-search).
@@ -829,6 +929,14 @@ impl App {
                         Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
                     )));
                 }
+                // On the model picker, show the currently active model.
+                if o.kind == OverlayKind::Models {
+                    let name = crate::api::model_name(self.current_model);
+                    banner.push(Line::from(Span::styled(
+                        format!("{LEFT}⚙ current model: {name}"),
+                        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    )));
+                }
                 f.render_widget(
                     Paragraph::new(banner),
                     Rect { x: area.x, y: area.y, width: area.width, height: top_h },
@@ -838,6 +946,26 @@ impl App {
             f.render_widget(Clear, oarea);
             f.render_stateful_widget(list, oarea, &mut s);
         }
+    }
+
+    fn draw_tasks_panel(&self, f: &mut Frame, area: Rect) {
+        let inner_w = area.width.saturating_sub(2) as usize;
+        let items: Vec<ListItem> = self.tasks.iter().map(|task| {
+            let icon = task.status.icon();
+            let col  = task.status.color();
+            let title = truncate(&task.title, inner_w.saturating_sub(3));
+            ListItem::new(Line::from(vec![
+                Span::styled(format!("{icon} "), Style::default().fg(col).add_modifier(Modifier::BOLD)),
+                Span::styled(title.to_string(), Style::default().fg(col)),
+            ]))
+        }).collect();
+
+        let panel = List::new(items)
+            .block(TuiBlock::default()
+                .title(Span::styled(" Tasks ", Style::default().fg(Color::DarkGray)))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::DarkGray)));
+        f.render_widget(panel, area);
     }
 
     fn draw_hint(&self, f: &mut Frame, area: Rect) {
@@ -855,7 +983,11 @@ impl App {
             let star = if self.has_workspace { "" } else { "*" };
             // ^F/^A are always offered; without a bound workspace they open the
             // workspace picker first (marked with *).
-            format!("  ^W workspaces · ^O threads · ^F findings{star} · ^A approvals{star} · ^L files · ^E open · ^Y copy · ^T thinking · ^R md · Esc back · ^C quit")
+            if self.select_mode {
+                "  SELECT MODE — drag to select text, Cmd-C to copy · ^S exit select mode".to_string()
+            } else {
+                format!("  ^W workspaces · ^O threads · ^P model · ^F findings{star} · ^A approvals{star} · ^L files · ^E open · ^Y copy · ^T thinking · ^R md · ^S select · Esc back · ^C quit")
+            }
         };
         f.render_widget(
             Paragraph::new(win_safe(&text).into_owned()).style(Style::default().fg(Color::DarkGray)),
@@ -864,8 +996,8 @@ impl App {
     }
 
     fn draw_transcript(&mut self, f: &mut Frame, area: Rect) {
-        // Inner padding so messages don't touch the borders.
-        const PAD_X: u16 = 2;
+        // 1-char left/right indent so messages don't run to the terminal edge.
+        const PAD_X: u16 = 1;
         const PAD_Y: u16 = 1;
         let lines = self.build_lines();
         // Only top + bottom bars (no left/right borders) for a cleaner, wider
@@ -1129,10 +1261,14 @@ impl App {
         } else {
             self.status.clone()
         };
+        let model_label = crate::api::model_name(self.current_model);
+        let select_indicator = if self.select_mode { "  ⊙ SELECT" } else { "" };
         let left = format!(
-            " {dot} {chat}  ·  {status}  ·  md:{}  think:{}",
+            " {dot} {chat}  ·  {status}  ·  md:{}  think:{}  ⚙ {}{}",
             if self.markdown { "on" } else { "off" },
             if self.show_thinking { "on" } else { "off" },
+            model_label,
+            select_indicator,
         );
         let style = Style::default().fg(Color::Black).bg(Color::Cyan);
 
@@ -1276,7 +1412,33 @@ impl App {
                 }
                 t if t.starts_with("task.") => {
                     let title = pstr("title");
-                    if !title.trim().is_empty() && self.last_task.as_deref() != Some(title.as_str()) {
+                    let task_id = e.get("taskId").and_then(|v| v.as_str()).map(|s| s.to_string());
+                    let hist_status = match t {
+                        "task.started"   => TaskStatus::Running,
+                        "task.completed" => TaskStatus::Completed,
+                        "task.failed"    => TaskStatus::Failed,
+                        _                => TaskStatus::Created,
+                    };
+                    // Upsert into the tasks panel.
+                    if let Some(ref id) = task_id {
+                        if let Some(existing) = self.tasks.iter_mut().find(|t| &t.id == id) {
+                            existing.status = hist_status;
+                            if !title.trim().is_empty() {
+                                existing.title = title.clone();
+                            }
+                        } else if !title.trim().is_empty() {
+                            self.tasks.push(Task {
+                                id: id.clone(),
+                                title: title.clone(),
+                                status: hist_status,
+                                agent: e.get("agentName").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                            });
+                        }
+                    }
+                    // Inline marker only for task.created events.
+                    if t == "task.created" && !title.trim().is_empty()
+                        && self.last_task.as_deref() != Some(title.as_str())
+                    {
                         self.flush_stream();
                         self.blocks.push(Block::Plain(Line::from(Span::styled(
                             format!("◇ {title}"),
@@ -1284,6 +1446,36 @@ impl App {
                         ))));
                         self.last_task = Some(title);
                         self.last_tool = None;
+                    }
+                }
+                "plan.updated" => {
+                    // Batch task upserts from workspace_add_tasks — panel only, no inline markers.
+                    if let Some(tasks) = p.get("tasks").and_then(|t| t.as_array()) {
+                        for task in tasks {
+                            let tid = task.get("id").and_then(|v| v.as_str()).map(|s| s.to_string());
+                            let title = task.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                            if title.is_empty() { continue; }
+                            let status_str = task.get("status").and_then(|v| v.as_str()).unwrap_or("pending");
+                            let hist_status = match status_str {
+                                "running"   => TaskStatus::Running,
+                                "completed" => TaskStatus::Completed,
+                                "failed"    => TaskStatus::Failed,
+                                _           => TaskStatus::Created,
+                            };
+                            if let Some(ref id) = tid {
+                                if let Some(existing) = self.tasks.iter_mut().find(|t| &t.id == id) {
+                                    existing.status = hist_status;
+                                    if !title.is_empty() { existing.title = title.clone(); }
+                                } else {
+                                    self.tasks.push(Task {
+                                        id: id.clone(),
+                                        title,
+                                        status: hist_status,
+                                        agent: task.get("agentName").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                                    });
+                                }
+                            }
+                        }
                     }
                 }
                 _ => {}
@@ -1295,12 +1487,18 @@ impl App {
 
     /// Show that a run was already in progress when the session opened.
     pub fn note_active_run(&mut self, status: &str) {
-        self.running = true;
-        self.status = format!("run {status} (in progress)");
-        self.push(Line::from(Span::styled(
-            format!("▶ a run is already {status} — streaming live updates…"),
-            Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD),
-        )));
+        // Only set running=true for statuses that mean the run is genuinely still executing.
+        // "completed" / "failed" runs are returned by the history endpoint as the most recent
+        // run — treating them as active causes the TUI to be permanently stuck in "running".
+        let in_progress = matches!(status, "running" | "pending" | "queued" | "in_progress");
+        if in_progress {
+            self.running = true;
+            self.status = format!("run {status} (in progress)");
+            self.push(Line::from(Span::styled(
+                format!("▶ a run is already {status} — streaming live updates…"),
+                Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD),
+            )));
+        }
     }
 
     // ---- overlays (workspaces / threads / findings / approvals) --------
@@ -1331,7 +1529,7 @@ impl App {
     pub fn overlay_searchable(&self) -> bool {
         matches!(
             self.overlay.as_ref().map(|o| o.kind),
-            Some(OverlayKind::Threads) | Some(OverlayKind::Workspaces)
+            Some(OverlayKind::Threads) | Some(OverlayKind::Workspaces) | Some(OverlayKind::Models)
         )
     }
 
@@ -1364,6 +1562,16 @@ impl App {
     pub fn set_thread_credits(&mut self, credits: f64, tokens: i64) {
         self.thread_credits = credits;
         self.thread_tokens = tokens;
+    }
+
+    /// Set the AI model for this session (None = org default).
+    pub fn set_model(&mut self, model: Option<i64>) {
+        self.current_model = model;
+    }
+
+    /// The currently selected model id (None means org default).
+    pub fn current_model(&self) -> Option<i64> {
+        self.current_model
     }
 
     /// Advance the working-spinner animation (called on a timer while running).
@@ -1538,7 +1746,7 @@ impl App {
                 o.dscroll = 0;
                 None
             }
-            OverlayKind::Threads | OverlayKind::Workspaces => {
+            OverlayKind::Threads | OverlayKind::Workspaces | OverlayKind::Models => {
                 let idx = o.current()?;
                 o.items.get(idx).and_then(|it| it.action.clone()).map(|a| (o.kind, a))
             }
@@ -1566,7 +1774,7 @@ impl App {
         self.pending = None;
         self.overlay = None;
         self.last_task = None;
-        self.scroll = 0;
+        self.scroll = u16::MAX; // clamped to max_scroll on first draw
         self.follow = true;
         self.pinned = false;
         // Start each thread with an empty message box.
@@ -1576,6 +1784,7 @@ impl App {
         self.task_label = None;
         self.thread_credits = 0.0;
         self.thread_tokens = 0;
+        self.tasks.clear();
         self.sys("Strobes Agents AI — Ratatui client");
     }
 
