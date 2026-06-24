@@ -12,7 +12,6 @@ use chromiumoxide::browser::Browser;
 use chromiumoxide::page::Page;
 use futures_util::StreamExt;
 use serde_json::Value;
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use tokio::sync::Mutex;
@@ -144,31 +143,71 @@ async fn start_capture(page: &Page) -> Option<CaptureGuard> {
     Some(CaptureGuard { stop_tx, result_rx })
 }
 
-// --- Session ---
+// --- Pool-based session management ---
+//
+// Each concurrent browser operation is assigned its own slot — a Chrome process
+// with a dedicated user-data-dir. Slots are managed entirely by the CLI:
+//
+//   • When a browser tool call arrives, `acquire_slot()` finds the first idle
+//     slot or creates a brand-new one (new Chrome process + profile).
+//   • The slot is marked busy for the duration of the call.
+//   • `release_slot()` marks it idle again.
+//
+// This guarantees that N concurrent sub-agents (spawned via spawn_subagent)
+// automatically get N isolated Chrome processes — no server-side agent ID
+// required. Sequential calls within the same quiet period reuse an idle slot,
+// preserving browsing state (cookies, session) across steps.
 
-// One Chrome process per workspace.  All agents that belong to the same
-// workspace share this process (and therefore share cookies, localStorage, and
-// any auth state they establish).  Each agent gets its own Page (tab) so their
-// navigations don't interfere.  The outer SESSIONS map is keyed on workspace_id
-// and the per-workspace Arc<Mutex> is held only during the brief ensure +
-// page-clone window, then released so concurrent agents proceed in parallel.
-struct WorkspaceSession {
+struct AgentSession {
     _browser: Browser,
     _child: std::process::Child,
-    pages: HashMap<String, Page>,   // agent_name → Page (tab)
+    page: Page,
 }
 
-impl Drop for WorkspaceSession {
+impl Drop for AgentSession {
     fn drop(&mut self) {
         let _ = self._child.kill();
     }
 }
 
-type WsCell = Arc<Mutex<Option<WorkspaceSession>>>;
-static SESSIONS: OnceLock<Mutex<HashMap<String, WsCell>>> = OnceLock::new();
+struct PoolState {
+    sessions: Vec<Arc<Mutex<Option<AgentSession>>>>,
+    busy: Vec<bool>,
+}
 
-fn sessions() -> &'static Mutex<HashMap<String, WsCell>> {
-    SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
+static POOL: OnceLock<Mutex<PoolState>> = OnceLock::new();
+
+fn pool() -> &'static Mutex<PoolState> {
+    POOL.get_or_init(|| {
+        Mutex::new(PoolState {
+            sessions: Vec::new(),
+            busy: Vec::new(),
+        })
+    })
+}
+
+/// Acquire an idle slot, or create a new one if all are busy.
+async fn acquire_slot() -> (usize, Arc<Mutex<Option<AgentSession>>>) {
+    let mut state = pool().lock().await;
+    for i in 0..state.busy.len() {
+        if !state.busy[i] {
+            state.busy[i] = true;
+            return (i, state.sessions[i].clone());
+        }
+    }
+    // All slots busy — spin up a new Chrome process for this concurrent call.
+    let cell = Arc::new(Mutex::new(None::<AgentSession>));
+    state.sessions.push(cell.clone());
+    state.busy.push(true);
+    (state.sessions.len() - 1, cell)
+}
+
+/// Return a slot to the idle pool.
+async fn release_slot(index: usize) {
+    let mut state = pool().lock().await;
+    if let Some(b) = state.busy.get_mut(index) {
+        *b = false;
+    }
 }
 
 /// Grab a free TCP port by briefly binding to 0 then releasing it.
@@ -177,19 +216,19 @@ fn free_port() -> Result<u16> {
     Ok(l.local_addr()?.port())
 }
 
-/// Profile dir for a workspace — one subdirectory per workspace_id so all
-/// agents in the same workspace share the same Chrome profile (cookies, auth).
-fn browser_profile_dir(workspace_id: &str) -> PathBuf {
-    let safe: String = workspace_id.chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
-        .collect();
+/// Profile dir for a pool slot — each slot index gets its own subdirectory so
+/// cookies, localStorage, and auth state are fully isolated between concurrent
+/// browser sessions.
+fn slot_profile_dir(slot_index: usize) -> PathBuf {
     if let Ok(base) = std::env::var("STROBES_AI_BROWSER_PROFILE") {
-        return PathBuf::from(base).join(&safe);
+        return PathBuf::from(base).join(format!("slot-{slot_index}"));
     }
-    crate::config::config_dir().join("browser-profile").join(safe)
+    crate::config::config_dir()
+        .join("browser-profile")
+        .join(format!("slot-{slot_index}"))
 }
 
-async fn ensure<'a>(guard: &'a mut Option<WorkspaceSession>, workspace_id: &str) -> Result<&'a mut WorkspaceSession> {
+async fn ensure<'a>(guard: &'a mut Option<AgentSession>, slot_index: usize) -> Result<&'a mut AgentSession> {
     if guard.is_none() {
         let chrome = match find_chrome() {
             Some(p) => p,
@@ -205,7 +244,7 @@ async fn ensure<'a>(guard: &'a mut Option<WorkspaceSession>, workspace_id: &str)
         };
 
         let headless = std::env::var("STROBES_AI_BROWSER_HEADLESS").as_deref() == Ok("1");
-        let profile = browser_profile_dir(workspace_id);
+        let profile = slot_profile_dir(slot_index);
         let _ = std::fs::create_dir_all(&profile);
 
         // Kill any existing Chrome using this profile — on macOS a stale or
@@ -262,19 +301,12 @@ async fn ensure<'a>(guard: &'a mut Option<WorkspaceSession>, workspace_id: &str)
         tokio::spawn(async move {
             while let Some(_event) = handler.next().await {}
         });
-        *guard = Some(WorkspaceSession { _browser: browser, _child: child, pages: HashMap::new() });
+        // Open the agent's single tab immediately so it's ready on first use.
+        let page = browser.new_page("about:blank").await
+            .map_err(|e| anyhow!("could not open initial tab: {e}"))?;
+        *guard = Some(AgentSession { _browser: browser, _child: child, page });
     }
     Ok(guard.as_mut().unwrap())
-}
-
-/// Return the existing tab for `agent_name`, or open a new one in the shared
-/// browser.  Called while the workspace cell lock is held.
-async fn get_or_create_page(sess: &mut WorkspaceSession, agent_name: &str) -> Result<Page> {
-    if !sess.pages.contains_key(agent_name) {
-        let page = sess._browser.new_page("about:blank").await?;
-        sess.pages.insert(agent_name.to_string(), page);
-    }
-    Ok(sess.pages[agent_name].clone())
 }
 
 /// Where auto-installed Chrome for Testing lives.
@@ -423,34 +455,22 @@ fn s<'a>(input: &'a Value, key: &str) -> &'a str {
 /// Dispatch a `browser_*` command. Returns `(output, captured_network)` on success
 /// or an error string on failure (incl. "Chrome not found").
 ///
-/// `input` must contain `_workspace_id` and `_agent_name` injected by pulse.rs
-/// from the WebSocket event so the correct Chrome process and tab are selected.
+/// Session slots are managed entirely by the local pool — no server-side agent
+/// identifier is needed. Concurrent calls get separate Chrome processes; idle
+/// slots are reused by sequential calls to preserve browsing state.
 pub async fn handle(cmd: &str, input: &Value) -> std::result::Result<(String, Vec<Value>), String> {
-    // pulse.rs injects these from the WebSocket event metadata.
-    let workspace_id = input.get("_workspace_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("default")
-        .to_string();
-    let agent_name = input.get("_agent_name")
-        .and_then(|v| v.as_str())
-        .unwrap_or("default")
-        .to_string();
+    let (slot_index, cell) = acquire_slot().await;
 
-    // Grab (or create) the workspace-level Chrome cell.  Map lock held briefly.
-    let cell: WsCell = {
-        let mut map = sessions().lock().await;
-        map.entry(workspace_id.clone())
-            .or_insert_with(|| Arc::new(Mutex::new(None)))
-            .clone()
-    };
-
-    // Lock the workspace cell only long enough to ensure the browser is up and
-    // clone the agent's tab handle (Page::clone is cheap — Arc inside).
+    // Ensure Chrome is up for this slot, clone the page handle (cheap Arc).
     let page = {
         let mut guard = cell.lock().await;
-        let sess = ensure(&mut guard, &workspace_id).await.map_err(|e| e.to_string())?;
-        get_or_create_page(sess, &agent_name).await.map_err(|e| e.to_string())?
-        // guard drops here — other agents can proceed concurrently
+        match ensure(&mut guard, slot_index).await {
+            Ok(sess) => sess.page.clone(),
+            Err(e) => {
+                release_slot(slot_index).await;
+                return Err(e.to_string());
+            }
+        }
     };
 
     let capture = start_capture(&page).await;
@@ -459,6 +479,7 @@ pub async fn handle(cmd: &str, input: &Value) -> std::result::Result<(String, Ve
         Some(g) => g.finish().await,
         None => vec![],
     };
+    release_slot(slot_index).await;
     result.map(|output| (output, captured))
 }
 

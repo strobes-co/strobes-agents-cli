@@ -1,0 +1,574 @@
+name: "feature-crawl"
+description: >
+  Two-stage feature discovery workflow.  Phase 1 runs a fast preliminary
+  examination — homepage, navigation, tech stack, auth surface, robots/sitemap,
+  and quick JS scan — then establishes an authenticated session.  Phase 2 reads
+  those findings and an orchestrator spawns one dedicated sub-agent per
+  discovered feature area (dashboard, settings, admin panel, API, etc.) so every
+  section is crawled in depth in parallel.  Phase 3 consolidates the sub-agent
+  reports into a comprehensive feature map, data-model inference, and visual
+  sitemap.
+
+workspace:
+  name: "Feature Crawl — ${TARGET_DOMAIN}"
+
+variables:
+  TARGET_URL: ""                        # full URL, e.g. https://app.example.com  (required)
+  TARGET_DOMAIN: ""                     # domain only, e.g. app.example.com        (required)
+  CREDENTIALS: ""                       # optional: "email:password" for login
+  SIGNUP_EMAIL: ""                      # optional: auto-register with this email
+  SIGNUP_PASSWORD: "CrawlTest2024!"     # password for auto-registration
+  MAX_AGENTS: "8"                       # max parallel sub-agents for deep crawl
+
+
+phases:
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # PHASE 1 — PRELIMINARY EXAMINATION
+  # Fast, parallel, read-only sweep to map the outer shell of the application.
+  # All four tasks run concurrently; their findings feed the orchestrator.
+  # ════════════════════════════════════════════════════════════════════════════
+  - name: "preliminary"
+    tasks:
+
+      - name: "prelim-homepage"
+        prompt: |
+          Target: ${TARGET_URL}
+
+          Quick homepage and navigation survey — complete in under 3 minutes.
+
+          1. Visit ${TARGET_URL} and record:
+             - Page title, meta description, language.
+             - Primary navigation: all top-nav, sidebar, footer links (text + href).
+             - User-facing section names (the main feature areas of the product).
+             - Social proof / feature list on the homepage (reveals what the app does).
+
+          2. Identify the application type:
+             - SPA (JavaScript-rendered, <div id="root"> or #app, no full-page reloads)?
+             - MPA (traditional server-rendered HTML with page reloads)?
+             - Hybrid (Next.js, Nuxt, SvelteKit)?
+
+          3. Identify the product domain:
+             - What does this application do in one sentence?
+             - Who are the primary users (end users, admin, B2B customers)?
+             - What are the 5–8 core feature areas visible from the homepage?
+
+          4. List all links from the homepage that look like authenticated sections
+             (/dashboard, /workspace, /account, /billing, /settings, /admin, /app/…).
+
+          Output JSON:
+          {
+            "app_type": "SPA|MPA|Hybrid",
+            "product_summary": "...",
+            "primary_nav": [{"text": "...", "href": "..."}],
+            "auth_section_links": ["..."],
+            "feature_areas_from_nav": ["dashboard", "projects", "billing", ...]
+          }
+
+      - name: "prelim-auth-surface"
+        prompt: |
+          Target: ${TARGET_URL}
+
+          Map the authentication surface — complete in under 3 minutes.
+
+          1. Find auth URLs:
+             - Login page: look for /login, /signin, /auth, /sign-in in nav or <a> tags.
+             - Signup/register: /signup, /register, /sign-up, /create-account.
+             - Password reset: /forgot-password, /reset-password, /forgot.
+             - OAuth: look for buttons "Sign in with Google / GitHub / Microsoft / LinkedIn / Apple".
+             - SSO: check for /saml, /oauth, /oidc, /sso.
+
+          2. Visit the login page:
+             - All input fields (names, types, placeholder).
+             - CAPTCHA or bot protection visible?
+             - "Remember me" checkbox?
+             - Error messages when you submit empty fields?
+
+          3. Visit the signup/register page (if exists):
+             - Required vs optional fields.
+             - Email verification mentioned?
+             - CAPTCHA present?
+             - Invite-only or open registration?
+
+          4. Check robots.txt at ${TARGET_URL}/robots.txt and sitemap.xml at ${TARGET_URL}/sitemap.xml:
+             - Disallowed paths that reveal hidden sections.
+             - Sitemapped pages beyond the homepage.
+
+          5. Check /.well-known endpoints:
+             - /.well-known/security.txt (security contact).
+             - /.well-known/openid-configuration (OIDC provider details).
+             - /.well-known/change-password.
+
+          Output JSON:
+          {
+            "login_url": "...",
+            "signup_url": "...",
+            "password_reset_url": "...",
+            "oauth_providers": ["Google", "GitHub"],
+            "login_fields": [{"name": "...", "type": "..."}],
+            "signup_open": true,
+            "email_verification_required": true,
+            "captcha_on_login": false,
+            "captcha_on_signup": false,
+            "robots_disallowed": ["/admin", "/internal"],
+            "sitemap_urls": ["...", "..."]
+          }
+
+      - name: "prelim-tech-stack"
+        prompt: |
+          Target: ${TARGET_URL}
+
+          Fast technology fingerprint — complete in under 3 minutes.
+
+          Visit ${TARGET_URL} and inspect the response headers, HTML source, and loaded
+          resources to identify:
+
+          1. **Web server / CDN:**
+             - Server, X-Powered-By, Via, X-Cache, CF-Ray, X-Amz-Cf-Id headers.
+             - Cloudflare, AWS CloudFront, Fastly, Akamai, Nginx, Apache, IIS.
+
+          2. **Frontend framework:**
+             - React: __reactFiber, data-reactroot, ReactDOM.
+             - Vue: __vue__, v-if, v-bind, v-model.
+             - Angular: ng-version, ng-app, _ng.
+             - Next.js: __NEXT_DATA__ in page source.
+             - Nuxt: __NUXT__ in page source.
+
+          3. **Backend hints from cookies and headers:**
+             - PHPSESSID → PHP; JSESSIONID → Java; .ASPXAUTH or ASP.NET_SessionId → .NET;
+               connect.sid → Node Express; _session → Rails; X-Runtime: Ruby.
+             - URL extensions: .php, .asp, .aspx, .jsp, .do.
+
+          4. **Third-party integrations visible in HTML/JS:**
+             - Analytics: gtag.js, hotjar, mixpanel, amplitude, heap.
+             - Auth services: auth0, okta, firebase, cognito, clerk.
+             - Payments: stripe.js, paypal, braintree.
+             - Support: intercom, zendesk, drift, crisp, freshchat.
+             - CMS/blog: contentful, sanity, prismic.
+             - Monitoring: sentry, datadog, newrelic.
+
+          5. **API base URL hints:**
+             - Look in HTML/JS for: `api.${TARGET_DOMAIN}`, `${TARGET_URL}/api`, `${TARGET_URL}/v1`,
+               `process.env.API_URL`, `window.__API_BASE__`, fetch/axios base URL configurations.
+
+          Output JSON:
+          {
+            "web_server": "Nginx 1.x / Cloudflare",
+            "frontend_framework": "React + Next.js",
+            "backend_hints": ["Node.js Express (connect.sid cookie)"],
+            "third_party": ["Stripe", "Intercom", "Sentry"],
+            "api_base_url_hints": ["https://api.example.com", "/api/v1"]
+          }
+
+      - name: "prelim-js-routes"
+        prompt: |
+          Target: ${TARGET_URL}
+
+          Quick JS route extraction — complete in under 4 minutes.
+
+          1. Load ${TARGET_URL} and collect all <script src="..."> URLs.
+          2. Fetch the top 3 largest JS bundles (usually main.*.js, app.*.js, index.*.js).
+          3. Search the JS source for route definitions:
+             - React Router: `path="..."`, `path: '...'`, `<Route path`, `routes = [`.
+             - Vue Router: `path: '...'`, `routes: [`, `router.addRoute`.
+             - Angular: `path: '...'`, `loadChildren:`.
+             - Generic patterns: `/dashboard`, `/settings`, `/admin`, `/account`, `/billing`,
+               `/profile`, `/workspace`, `/project`, `/team`, `/api`.
+             - Lazy-loaded: `import('./pages/...)`, `() => import`.
+
+          4. Deduplicate and list all discovered routes grouped by feature area:
+             - Auth: /login, /signup, /forgot-password, /verify-email, /oauth/*
+             - Core feature routes: /dashboard, /projects/*, /tasks/*, etc.
+             - Settings: /settings/*, /account/*, /profile/*
+             - Admin: /admin/*, /manage/*
+             - API routes referenced in JS: /api/v1/*, /graphql
+
+          5. Check for:
+             - Feature-flagged routes (only accessible with a flag enabled).
+             - Admin-only routes not visible in the nav.
+             - Debug/developer routes: /debug, /dev, /__admin.
+
+          Output JSON:
+          {
+            "js_routes": [
+              {"path": "/dashboard", "area": "core", "auth_required": true},
+              {"path": "/settings/billing", "area": "settings", "auth_required": true},
+              {"path": "/admin/users", "area": "admin", "auth_required": true, "admin_only": true}
+            ],
+            "api_references": ["/api/v1/users", "/api/v1/projects"],
+            "feature_flagged_routes": [],
+            "debug_routes": []
+          }
+
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # PHASE 2 — SESSION ESTABLISHMENT
+  # Tries to create a session (login or auto-register) so the deep crawl
+  # agents can access authenticated sections.
+  # ════════════════════════════════════════════════════════════════════════════
+  - name: "auth-setup"
+    tasks:
+
+      - name: "establish-session"
+        depends_on:
+          - "prelim-homepage"
+          - "prelim-auth-surface"
+        prompt: |
+          Target: ${TARGET_URL}
+          Login URL from prelim: ${login_url}
+          Signup URL from prelim: ${signup_url}
+          Provided credentials: ${CREDENTIALS}
+          Auto-register email: ${SIGNUP_EMAIL}   (empty = skip auto-register)
+          Auto-register password: ${SIGNUP_PASSWORD}
+          Email verification required: ${email_verification_required}
+          Captcha on login: ${captcha_on_login}
+          Captcha on signup: ${captcha_on_signup}
+
+          Attempt to establish an authenticated session. Priority order:
+
+          **Option A — Use provided credentials (if ${CREDENTIALS} is not empty):**
+          1. Navigate to ${login_url}.
+          2. Fill in the credentials from ${CREDENTIALS} (split on first ":").
+          3. Submit the login form.
+          4. Verify login: check for dashboard redirect, session cookie, or user-specific content.
+
+          **Option B — Auto-register (if ${CREDENTIALS} is empty and ${SIGNUP_EMAIL} is not empty):**
+          1. Navigate to ${signup_url}.
+          2. Fill all required fields:
+             - Email: ${SIGNUP_EMAIL}
+             - Password: ${SIGNUP_PASSWORD}
+             - Name/username: "FeatureCrawler"
+             - Any other required fields with plausible sample data.
+          3. Submit the form.
+          4. If email verification is required, note it but continue — capture any session that
+             was set before verification.
+
+          **Option C — Proceed unauthenticated (if all above fail or are skipped):**
+          - Note that the deep crawl will be limited to public sections only.
+
+          After whichever option succeeded (or all failed), output:
+          {
+            "auth_status": "LOGGED_IN | REGISTERED_NO_VERIFY | REGISTERED_PENDING_VERIFY | NO_SESSION",
+            "auth_method": "credentials | auto_register | none",
+            "post_login_url": "https://app.example.com/dashboard",
+            "session_cookies": [{"name": "...", "value": "...", "httpOnly": true, "secure": true}],
+            "auth_headers": {},
+            "session_note": "...any relevant notes..."
+          }
+
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # PHASE 3 — ORCHESTRATED DEEP CRAWL
+  # Single orchestrator task reads all prelim findings, decides which feature
+  # areas warrant their own sub-agent, then spawns one sub-agent per area using
+  # spawn_subagent.  All sub-agents run in parallel, each with browser isolation.
+  # ════════════════════════════════════════════════════════════════════════════
+  - name: "deep-crawl"
+    tasks:
+
+      - name: "orchestrate-feature-agents"
+        depends_on:
+          - "prelim-homepage"
+          - "prelim-auth-surface"
+          - "prelim-tech-stack"
+          - "prelim-js-routes"
+          - "establish-session"
+        prompt: |
+          Target: ${TARGET_URL}  |  Domain: ${TARGET_DOMAIN}
+          Prelim feature areas: ${feature_areas_from_nav}
+          JS routes discovered: ${js_routes}
+          Auth status: ${auth_status}  |  Post-login URL: ${post_login_url}
+          Session cookies: ${session_cookies}
+          Max parallel agents: ${MAX_AGENTS}
+
+          You are the orchestrator for a deep feature crawl.  Your job is:
+          1. Analyse ALL preliminary findings (homepage nav, JS routes, sitemap, robots.txt
+             disallowed paths, prelim-auth-surface output).
+          2. Produce a list of feature areas to crawl deeply — one agent per area.
+          3. Spawn one sub-agent per area using spawn_subagent (up to ${MAX_AGENTS} in parallel).
+          4. Wait for all sub-agents to complete and collect their reports.
+          5. Output a combined structured summary.
+
+          ─────────────────────────────────────────────────────────────────────
+          STEP 1 — Decide which feature areas to crawl
+          ─────────────────────────────────────────────────────────────────────
+          From the prelim data, identify distinct feature areas.  Typical examples:
+          - "dashboard"          → /dashboard, /overview, /home (post-login landing)
+          - "user-profile"       → /profile, /account, /me
+          - "settings"           → /settings/*, /preferences/*, /configuration/*
+          - "billing"            → /billing/*, /subscription/*, /payments/*
+          - "admin-panel"        → /admin/*, /manage/*, /superadmin/*
+          - "team-management"    → /team/*, /members/*, /invites/*
+          - "core-feature-1"     → the main value-add feature of the app (e.g. /projects/*)
+          - "core-feature-2"     → second main feature (e.g. /tasks/*)
+          - "api-explorer"       → /api-docs, /swagger, /graphiql, /redoc
+          - "public-pages"       → /, /about, /pricing, /docs, /blog (unauthenticated)
+
+          Deduplicate, merge small areas, and cap at ${MAX_AGENTS} agents.
+          Prioritise: core product features first, then settings/billing, then admin, then public.
+
+          ─────────────────────────────────────────────────────────────────────
+          STEP 2 — Spawn sub-agents
+          ─────────────────────────────────────────────────────────────────────
+          For each feature area, spawn a sub-agent with the following prompt template:
+
+          > You are a feature crawler assigned to the "${AREA_NAME}" section of ${TARGET_URL}.
+          > Auth status: ${auth_status}.  Session cookies (restore after navigate if needed): ${session_cookies}.
+          >
+          > SEED URLS for this area: ${SEED_URLS}  (comma-separated starting points)
+          >
+          > YOUR MISSION — crawl every page in this section and produce a structured report:
+          >
+          > 1. Visit each seed URL in turn.  For each page:
+          >    a. Record: URL, page title, HTTP status, page purpose (1 sentence).
+          >    b. List ALL navigation links within this section (internal only).
+          >    c. List ALL forms: action URL, method, input field names + types.
+          >    d. List ALL interactive elements: buttons, dropdowns, tabs, modals (with their labels).
+          >    e. List API/XHR calls triggered on page load (method, URL, status).
+          >    f. Categorise: Dashboard | List | Detail | Create | Edit | Delete | Settings | Utility
+          >
+          > 2. Follow internal links within THIS section up to depth 4.
+          >    Do NOT follow: logout, delete-account, links going outside ${TARGET_DOMAIN}.
+          >
+          > 3. For every form found:
+          >    - Submit with sample data (use "CRAWL-TEST-{field}" as value).
+          >    - Record: success URL/message, validation errors, redirect destination.
+          >
+          > 4. For list/index pages:
+          >    - Click into one item's detail page and record the detail view structure.
+          >    - Check for create/add button → visit the create form.
+          >    - Check for edit/delete actions on items.
+          >
+          > 5. Document business rules observed:
+          >    - Required fields and validation messages.
+          >    - Permission errors encountered (403, "you don't have access to…").
+          >    - Quota/limit messages.
+          >    - Any feature-gated UI (greyed-out, upgrade prompts, plan restrictions).
+          >
+          > 6. Extract API endpoints used by this section:
+          >    - Method, path, request payload shape, response structure (first 200 chars).
+          >    - Whether auth header / cookie is required.
+          >
+          > OUTPUT (JSON):
+          > {
+          >   "area": "${AREA_NAME}",
+          >   "pages": [
+          >     {
+          >       "url": "...",
+          >       "title": "...",
+          >       "status": 200,
+          >       "purpose": "...",
+          >       "category": "List|Detail|Create|Edit|Settings|Dashboard|Utility",
+          >       "forms": [{"action": "...", "method": "POST", "fields": [{"name": "...", "type": "..."}]}],
+          >       "interactive_elements": [{"type": "button", "label": "...", "action": "..."}],
+          >       "api_calls": [{"method": "GET", "url": "...", "status": 200}]
+          >     }
+          >   ],
+          >   "api_endpoints": [{"method": "...", "path": "...", "auth_required": true, "payload_shape": "..."}],
+          >   "business_rules": ["..."],
+          >   "feature_flags_found": ["..."],
+          >   "errors_encountered": ["..."]
+          > }
+
+          Batch all agents together in a single spawn_subagent call for maximum parallelism.
+          Use agent_id: "planning_explore_agent" for all sub-agents.
+          Set appropriate seed URLs for each area based on prelim findings.
+
+          ─────────────────────────────────────────────────────────────────────
+          STEP 3 — Collect and return results
+          ─────────────────────────────────────────────────────────────────────
+          After all sub-agents complete, collect their JSON reports and return:
+          {
+            "areas_crawled": ["dashboard", "settings", "billing", ...],
+            "total_pages": 42,
+            "total_forms": 18,
+            "total_api_endpoints": 31,
+            "area_reports": [
+              { ...sub-agent JSON for area 1... },
+              { ...sub-agent JSON for area 2... },
+              ...
+            ],
+            "orchestrator_notes": "Any observations about areas not covered, errors, skipped agents..."
+          }
+
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # PHASE 4 — SYNTHESIS & DOCUMENTATION
+  # Three parallel synthesis tasks consume the sub-agent reports and produce
+  # the final deliverables.
+  # ════════════════════════════════════════════════════════════════════════════
+  - name: "synthesis"
+    tasks:
+
+      - name: "feature-map-report"
+        depends_on:
+          - "orchestrate-feature-agents"
+          - "prelim-tech-stack"
+          - "establish-session"
+        prompt: |
+          Target: ${TARGET_URL}  |  Domain: ${TARGET_DOMAIN}
+          Tech stack: ${tech_stack}
+          Auth status: ${auth_status}
+          Area reports: ${area_reports}
+          Total pages: ${total_pages}  |  Total API endpoints: ${total_api_endpoints}
+
+          Compile a complete application feature map from all sub-agent crawl reports.
+
+          ## Feature Map Report — ${TARGET_DOMAIN}
+
+          ### 1. Application Overview
+          - **Product:** what the application does (from prelim homepage analysis).
+          - **Technology stack:** web server, frontend framework, backend hints, third-party services.
+          - **Authentication:** method, session mechanism, providers, verification flow.
+          - **Crawl coverage:** N areas crawled, N pages visited, N forms submitted, N API endpoints.
+
+          ### 2. Feature Inventory
+
+          For every area in ${area_reports}, produce a section:
+
+          #### [Area Name] — e.g. Dashboard
+          - **Entry URL(s):** list
+          - **Purpose:** what this section does
+          - **Pages found:**
+            | URL | Title | Category | Status |
+            |-----|-------|----------|--------|
+            | ... | ...   | List     | 200    |
+          - **Key actions available:**
+            - [CRUD matrix] Create ✓ / Read ✓ / Update ✓ / Delete ✗ / Bulk ✗
+          - **Forms:**
+            | Form URL | Method | Fields | Submit result |
+            |----------|--------|--------|---------------|
+          - **API endpoints consumed:**
+            | Method | Path | Auth | Notes |
+            |--------|------|------|-------|
+          - **Business rules observed:**
+            - Validation rules, quotas, permissions, feature flags, plan restrictions.
+          - **Errors / gaps encountered:**
+            - 403 pages, inaccessible features, failed form submissions.
+
+          ### 3. Complete API Surface
+          Deduplicated table of every API endpoint found across all areas:
+          | Method | Path | Auth Required | Area | Request Shape | Response Shape |
+          |--------|------|---------------|------|---------------|----------------|
+
+          ### 4. Data Model (Inferred)
+          For each entity type seen in URLs, forms, and API responses
+          (e.g. User, Project, Task, Payment, Team, Comment):
+          - **Entity name** — fields inferred from forms and API payloads.
+          - **Relationships** — inferred from navigation (project has many tasks, etc.).
+          - **States** — inferred from status fields, filters, or workflow steps.
+
+          ### 5. User Flows & Workflows
+          For each multi-step process discovered (onboarding wizard, checkout, invite flow, etc.):
+          - Flow name
+          - Steps with URLs and key actions
+          - Entry and exit points
+          - Who can trigger it (all users / admin / owner)
+
+          ### 6. Permission & Access Summary
+          - Features accessible without login.
+          - Features requiring login.
+          - Features requiring elevated role (admin, owner, billing-admin).
+          - Feature-gated content (plan upgrade required).
+
+          ### 7. Observations & Gaps
+          - Areas that could not be crawled (no credentials, email verification, invite-only).
+          - Routes found in JS but not reached during crawl.
+          - Disabled/greyed-out features found.
+          - Unusual error messages that reveal internal state.
+
+          Write in Markdown with tables and structured lists.
+
+      - name: "api-catalogue"
+        depends_on:
+          - "orchestrate-feature-agents"
+          - "prelim-js-routes"
+        prompt: |
+          Target: ${TARGET_URL}
+          API references from JS: ${api_references}
+          Area reports: ${area_reports}
+
+          Build a deduplicated, annotated API catalogue from all sub-agent crawl data.
+
+          1. Merge all api_endpoints arrays from every area report.
+          2. Deduplicate by (method, path) normalised (replace /123 → /{id}, /abc-xyz → /{slug}).
+          3. For each endpoint, produce:
+             - Method + path
+             - Which feature area uses it
+             - Auth required (yes/no/conditional)
+             - Request payload shape (field names + types inferred from forms and observed calls)
+             - Response shape summary (top-level keys from observed responses)
+             - Notes (pagination, batch ops, file upload, webhook trigger, etc.)
+
+          4. Check for:
+             - OpenAPI/Swagger spec: probe ${TARGET_URL}/swagger.json, /openapi.json, /api-docs, /api/v1/docs.
+             - GraphQL endpoint: probe ${TARGET_URL}/graphql, /api/graphql.
+             - If found, note the spec URL and summarise its contents.
+
+          5. Group the final catalogue by:
+             - Authentication endpoints
+             - User/profile endpoints
+             - Core resource endpoints (per entity type)
+             - Settings/configuration endpoints
+             - Admin endpoints
+             - Webhooks/events endpoints
+
+          Output Markdown table with a short narrative summary at the top.
+
+      - name: "visual-sitemap"
+        depends_on:
+          - "orchestrate-feature-agents"
+          - "prelim-js-routes"
+          - "prelim-auth-surface"
+        prompt: |
+          Target: ${TARGET_URL}  |  Domain: ${TARGET_DOMAIN}
+          Area reports: ${area_reports}
+          JS routes: ${js_routes}
+          Auth-only section links: ${auth_section_links}
+          Robots disallowed: ${robots_disallowed}
+
+          Generate a complete visual ASCII sitemap of the application.
+
+          Rules:
+          - Every page found in any area_report goes in the sitemap.
+          - Every route in ${js_routes} goes in the sitemap (mark with [JS] if not crawled).
+          - Robots disallowed paths go in [HIDDEN] section.
+          - Group by access level: [PUBLIC], [AUTH], [ADMIN], [HIDDEN].
+          - Use ├── for non-last children and └── for last child.
+          - Append per-node metadata in line: (Title — Category — HTTP status or [JS])
+
+          Example structure:
+          ```
+          https://${TARGET_DOMAIN}/
+          ├── [PUBLIC]
+          │   ├── /  (Homepage — Landing — 200)
+          │   ├── /about  (About — Info — 200)
+          │   ├── /pricing  (Pricing — Info — 200)
+          │   ├── /login  (Sign In — Auth — 200)
+          │   └── /register  (Create Account — Auth — 200)
+          ├── [AUTH]
+          │   ├── /dashboard  (Dashboard — Dashboard — 200)
+          │   ├── /projects  (Projects — List — 200)
+          │   │   ├── /projects/new  (New Project — Create — 200)
+          │   │   └── /projects/:id  (Project Detail — Detail — 200)
+          │   │       ├── /projects/:id/tasks  (Tasks — List — 200)
+          │   │       └── /projects/:id/settings  (Project Settings — Settings — 200)
+          │   ├── /settings  (Settings — Settings — 200)
+          │   │   ├── /settings/profile  (Profile Settings — Settings — 200)
+          │   │   ├── /settings/billing  (Billing — Settings — 200)
+          │   │   └── /settings/team  (Team — Settings — 200)
+          │   └── /profile  (User Profile — Profile — 200)
+          ├── [ADMIN]
+          │   └── /admin  (Admin Panel — Admin — 403 [requires admin role])
+          └── [HIDDEN]  (found in JS / robots.txt but not crawled)
+              ├── /debug  [JS — feature flagged]
+              └── /internal  [robots.txt disallowed]
+          ```
+
+          After the sitemap, append a one-page summary:
+          - Total public pages: N
+          - Total authenticated pages: N
+          - Total admin-only pages: N
+          - Total hidden/uncrawled routes: N
+          - Deepest nesting level: N
+          - Most complex section (most sub-pages): [area name]

