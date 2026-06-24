@@ -31,6 +31,7 @@ pub struct StreamItem {
     pub detail: Option<String>,
     pub status: Option<String>,
     pub local: bool,
+    pub task_id: Option<String>,
 }
 
 /// A single form field requested by `request_human_input`.
@@ -65,7 +66,8 @@ pub enum AppEvent {
 pub struct PulseHandle {
     out: mpsc::UnboundedSender<String>,
     workspace_id: std::sync::Arc<std::sync::Mutex<Option<String>>>,
-    llm_model: Option<i64>,
+    /// Mutable so the user can change the model mid-chat via the model picker.
+    llm_model: std::sync::Arc<std::sync::Mutex<Option<i64>>>,
     stop: Arc<AtomicBool>,
     stop_notify: Arc<Notify>,
 }
@@ -85,12 +87,19 @@ impl PulseHandle {
         }
     }
 
+    /// Change the AI model used for subsequent messages (live, no reconnect needed).
+    pub fn set_model(&self, model: Option<i64>) {
+        if let Ok(mut m) = self.llm_model.lock() {
+            *m = model;
+        }
+    }
+
     pub fn send_user_message(&self, text: &str) {
         let mut ctx = json!({ "client_type": "cli" });
         if let Some(ws) = self.workspace_id.lock().ok().and_then(|w| w.clone()) {
             ctx["workspace_id"] = json!(ws);
         }
-        if let Some(m) = self.llm_model {
+        if let Some(m) = self.llm_model.lock().ok().and_then(|m| *m) {
             ctx["llm_model"] = json!(m);
         }
         let frame = json!({ "type": "send_message", "text": text, "context": ctx });
@@ -174,7 +183,7 @@ pub async fn connect(
                     Some(s) => s,
                     None => break,
                 };
-                run_session(sock, &mut out_rx, &out_tx, &app_tx, &stop, &stop_notify).await;
+                run_session(sock, &mut out_rx, &out_tx, &app_tx, &stop, &stop_notify, profile.workspace_id.as_deref()).await;
                 if stop.load(Ordering::Relaxed) {
                     break;
                 }
@@ -211,7 +220,7 @@ pub async fn connect(
     Ok(PulseHandle {
         out: out_tx,
         workspace_id: std::sync::Arc::new(std::sync::Mutex::new(profile.workspace_id.clone())),
-        llm_model,
+        llm_model: std::sync::Arc::new(std::sync::Mutex::new(llm_model)),
         stop,
         stop_notify,
     })
@@ -227,6 +236,7 @@ async fn run_session(
     app_tx: &mpsc::UnboundedSender<AppEvent>,
     stop: &Arc<AtomicBool>,
     stop_notify: &Arc<Notify>,
+    workspace_id: Option<&str>,
 ) {
     let (mut write, mut read) = ws.split();
     let _ = app_tx.send(AppEvent::Connected);
@@ -247,7 +257,7 @@ async fn run_session(
             msg = read.next() => match msg {
                 Some(Ok(Message::Text(txt))) => {
                     if let Ok(v) = serde_json::from_str::<Value>(&txt) {
-                        handle_frame(v, app_tx, out_tx);
+                        handle_frame(v, app_tx, out_tx, workspace_id);
                     }
                 }
                 Some(Ok(_)) => {}
@@ -324,7 +334,7 @@ fn compact(v: &Value, limit: usize) -> String {
     }
 }
 
-fn handle_frame(v: Value, app_tx: &mpsc::UnboundedSender<AppEvent>, out_tx: &mpsc::UnboundedSender<String>) {
+fn handle_frame(v: Value, app_tx: &mpsc::UnboundedSender<AppEvent>, out_tx: &mpsc::UnboundedSender<String>, workspace_id: Option<&str>) {
     let mtype = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
     match mtype {
         "message_sent" => {
@@ -333,7 +343,7 @@ fn handle_frame(v: Value, app_tx: &mpsc::UnboundedSender<AppEvent>, out_tx: &mps
                 let _ = app_tx.send(AppEvent::Stream(StreamItem {
                     kind: "note".into(), agent: None,
                     text: Some("queued — will be injected after the current turn".into()),
-                    tool_name: None, detail: None, status: None, local: false,
+                    tool_name: None, detail: None, status: None, local: false, task_id: None,
                 }));
             } else {
                 let _ = app_tx.send(AppEvent::RunStarted);
@@ -354,7 +364,7 @@ fn handle_frame(v: Value, app_tx: &mpsc::UnboundedSender<AppEvent>, out_tx: &mps
             // Defensive: handle a wrapped form too.
             let inner = v.get("data").or_else(|| v.get("event")).cloned().unwrap_or(Value::Null);
             if inner.is_object() {
-                return handle_frame(inner, app_tx, out_tx);
+                return handle_frame(inner, app_tx, out_tx, workspace_id);
             }
             return;
         }
@@ -371,7 +381,15 @@ fn handle_frame(v: Value, app_tx: &mpsc::UnboundedSender<AppEvent>, out_tx: &mps
     if etype == "tool" && status.as_deref() == Some("local_execute") {
         let tool_name = sval(&b, "toolName").unwrap_or_default();
         let request_id = sval(&b, "requestId").unwrap_or_default();
-        let input = b.get("input").cloned().unwrap_or(json!({}));
+        // Save agent name before `agent` is moved into the StreamItem below.
+        let agent_name_str = agent.as_deref().unwrap_or("default").to_string();
+        let mut input = b.get("input").cloned().unwrap_or(json!({}));
+        // For browser tools: inject routing metadata so browser::handle() can
+        // select the right Chrome process (per workspace) and tab (per agent).
+        if tool_name.starts_with("browser_") {
+            input["_agent_name"] = json!(agent_name_str);
+            input["_workspace_id"] = json!(workspace_id.unwrap_or("default"));
+        }
         let arg_summary = concise_args(&tool_name, &input);
         let _ = app_tx.send(AppEvent::Stream(StreamItem {
             kind: "tool_start".into(),
@@ -381,6 +399,7 @@ fn handle_frame(v: Value, app_tx: &mpsc::UnboundedSender<AppEvent>, out_tx: &mps
             detail: Some(arg_summary),
             status: Some("local_execute".into()),
             local: true,
+            task_id: None,
         }));
         let app_tx = app_tx.clone();
         let out_tx = out_tx.clone();
@@ -392,10 +411,15 @@ fn handle_frame(v: Value, app_tx: &mpsc::UnboundedSender<AppEvent>, out_tx: &mps
                 json!({ "type": "tool.local_error", "payload": {
                     "request_id": request_id, "tool_name": tool_name,
                     "error": err, "error_type": "Error" }})
-            } else {
+            } else if res.captured_network.is_empty() {
                 json!({ "type": "tool.local_result", "payload": {
                     "request_id": request_id, "tool_name": tool_name,
                     "output": res.output, "exit_code": res.exit_code, "duration_ms": ms }})
+            } else {
+                json!({ "type": "tool.local_result", "payload": {
+                    "request_id": request_id, "tool_name": tool_name,
+                    "output": res.output, "exit_code": res.exit_code, "duration_ms": ms,
+                    "captured_network": res.captured_network }})
             };
             let _ = out_tx.send(frame.to_string());
             let _ = app_tx.send(AppEvent::LocalToolDone {
@@ -414,7 +438,7 @@ fn handle_frame(v: Value, app_tx: &mpsc::UnboundedSender<AppEvent>, out_tx: &mps
         );
         let _ = app_tx.send(AppEvent::Stream(StreamItem {
             kind: "approval".into(), agent, text: sval(&b, "preview"),
-            tool_name: None, detail: sval(&b, "module"), status: Some("requested".into()), local: false,
+            tool_name: None, detail: sval(&b, "module"), status: Some("requested".into()), local: false, task_id: None,
         }));
         return;
     }
@@ -443,7 +467,7 @@ fn handle_frame(v: Value, app_tx: &mpsc::UnboundedSender<AppEvent>, out_tx: &mps
             Some(other) => {
                 let _ = app_tx.send(AppEvent::Stream(StreamItem {
                     kind: "note".into(), agent: None, text: Some(format!("interrupt {other}")),
-                    tool_name: None, detail: None, status: None, local: false,
+                    tool_name: None, detail: None, status: None, local: false, task_id: None,
                 }));
             }
             None => {}
@@ -461,6 +485,26 @@ fn handle_frame(v: Value, app_tx: &mpsc::UnboundedSender<AppEvent>, out_tx: &mps
         return;
     }
 
+    // plan.updated — batch task upserts from workspace_add_tasks.
+    // payload: { "tasks": [{ "id", "title", "agentName", "status" }] }
+    if etype == "plan.updated" {
+        if let Some(tasks) = b.get("tasks").and_then(|t| t.as_array()) {
+            for task in tasks {
+                let tid = task.get("id").and_then(|v| v.as_str()).map(|s| s.to_string());
+                let title = task.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                if title.is_empty() { continue; }
+                let status = task.get("status").and_then(|v| v.as_str()).unwrap_or("pending").to_string();
+                let agent = task.get("agentName").and_then(|v| v.as_str()).map(|s| s.to_string());
+                let _ = app_tx.send(AppEvent::Stream(StreamItem {
+                    kind: "task".into(), agent, text: Some(title),
+                    tool_name: None, detail: None, status: Some(status),
+                    local: false, task_id: tid,
+                }));
+            }
+        }
+        return;
+    }
+
     // Run lifecycle → finished.
     let terminal = etype == "run.completed"
         || etype == "run.failed"
@@ -471,12 +515,12 @@ fn handle_frame(v: Value, app_tx: &mpsc::UnboundedSender<AppEvent>, out_tx: &mps
         "token" => Some(StreamItem {
             kind: "token".into(), agent,
             text: sval(&v, "content").or_else(|| sval(&b, "text")).or_else(|| sval(&b, "content")),
-            tool_name: None, detail: None, status: None, local: false,
+            tool_name: None, detail: None, status: None, local: false, task_id: None,
         }),
         "thinking" => Some(StreamItem {
             kind: "thinking".into(), agent,
             text: sval(&v, "content").or_else(|| sval(&b, "text")).or_else(|| sval(&b, "content")),
-            tool_name: None, detail: None, status: None, local: false,
+            tool_name: None, detail: None, status: None, local: false, task_id: None,
         }),
         "tool" => {
             let name = sval(&b, "toolName");
@@ -485,17 +529,17 @@ fn handle_frame(v: Value, app_tx: &mpsc::UnboundedSender<AppEvent>, out_tx: &mps
                     let detail = concise_args(name.as_deref().unwrap_or(""), b.get("arguments").unwrap_or(&Value::Null));
                     Some(StreamItem {
                         kind: "tool_start".into(), agent, text: None, tool_name: name,
-                        detail: Some(detail), status: Some("start".into()), local: false,
+                        detail: Some(detail), status: Some("start".into()), local: false, task_id: None,
                     })
                 }
                 Some("output") => Some(StreamItem {
                     kind: "tool_output".into(), agent, text: None, tool_name: name,
                     detail: Some(compact(b.get("result").unwrap_or(&Value::Null), 600)),
-                    status: b.get("durationMs").map(|d| format!("{d}ms")), local: false,
+                    status: b.get("durationMs").map(|d| format!("{d}ms")), local: false, task_id: None,
                 }),
                 Some("failed") => Some(StreamItem {
                     kind: "tool_failed".into(), agent, text: None, tool_name: name,
-                    detail: sval(&b, "error"), status: Some("failed".into()), local: false,
+                    detail: sval(&b, "error"), status: Some("failed".into()), local: false, task_id: None,
                 }),
                 _ => None,
             }
@@ -504,22 +548,23 @@ fn handle_frame(v: Value, app_tx: &mpsc::UnboundedSender<AppEvent>, out_tx: &mps
             kind: "task".into(), agent,
             text: sval(&b, "title").or_else(|| sval(&b, "taskId")),
             tool_name: None, detail: sval(&b, "error"), status: sval(&b, "status"), local: false,
+            task_id: sval(&v, "taskId").or_else(|| sval(&b, "taskId")),
         }),
         "artifact" => Some(StreamItem {
             kind: "note".into(), agent,
             text: Some(format!("artifact {}: {}", sval(&b, "status").unwrap_or_default(), sval(&b, "name").unwrap_or_default())),
-            tool_name: None, detail: sval(&b, "downloadUrl"), status: None, local: false,
+            tool_name: None, detail: sval(&b, "downloadUrl"), status: None, local: false, task_id: None,
         }),
         "system" => {
             let kind = sval(&b, "type").unwrap_or_default();
             Some(StreamItem {
                 kind: "system".into(), agent, text: Some(kind),
-                tool_name: None, detail: None, status: None, local: false,
+                tool_name: None, detail: None, status: None, local: false, task_id: None,
             })
         }
         s if s.starts_with("run.") => Some(StreamItem {
             kind: "system".into(), agent, text: Some(s.to_string()),
-            tool_name: None, detail: None, status: None, local: false,
+            tool_name: None, detail: None, status: None, local: false, task_id: None,
         }),
         _ => None,
     };

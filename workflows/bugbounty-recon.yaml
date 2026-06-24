@@ -1,0 +1,142 @@
+name: "bug-bounty-recon"
+description: "Passive and active reconnaissance for bug bounty targets — subdomain discovery, port scan, tech fingerprinting, and endpoint crawl, all in parallel after initial scoping."
+
+workspace:
+  name: "Bug Bounty Recon — ${PROGRAM}"
+
+variables:
+  TARGET: "example.com"           # primary scope domain
+  PROGRAM: "Example Bug Bounty"   # programme name (used in workspace / report)
+  SCOPE: "*.example.com"          # wildcard scope (used in prompt context)
+  OUT_OF_SCOPE: "blog.example.com, status.example.com"
+  DEPTH: "3"                       # crawl depth
+  THREADS: "20"                    # concurrency hint for the agent
+
+phases:
+
+  # ── Phase 1: define scope ─────────────────────────────────────────────────
+  - name: "scope-definition"
+    tasks:
+      - name: "define-scope"
+        prompt: |
+          You are a professional bug bounty hunter targeting the programme "${PROGRAM}".
+
+          Primary domain: ${TARGET}
+          In-scope: ${SCOPE}
+          Out-of-scope: ${OUT_OF_SCOPE}
+
+          1. Summarise the attack surface based on the scope declaration above.
+          2. List the most valuable asset categories to focus on (auth flows, API endpoints, file uploads, OAuth integrations, etc.).
+          3. Identify any common exclusions that typically appear in this type of programme.
+          4. Output a structured recon plan (what to run, in what order, and why).
+
+          Be concise — this output seeds all downstream parallel tasks.
+
+  # ── Phase 2: parallel discovery ──────────────────────────────────────────
+  - name: "discovery"
+    tasks:
+
+      - name: "subdomain-enumeration"
+        depends_on: ["define-scope"]
+        prompt: |
+          Target: ${TARGET}  |  Scope: ${SCOPE}
+
+          Perform comprehensive subdomain enumeration for ${TARGET}:
+          1. Use passive techniques: check certificate transparency logs (crt.sh), DNS datasets, web archives (Wayback Machine), GitHub/GitLab leaks, and OSINT sources.
+          2. Attempt zone transfer (AXFR) and brute-force common subdomain wordlists (top-10k at minimum).
+          3. Resolve all discovered subdomains to IP addresses. Flag those pointing to cloud providers (AWS/Azure/GCP) as potential subdomain takeover candidates.
+          4. Check each live subdomain for HTTP/HTTPS response and note status codes.
+          5. Produce a deduplicated list sorted by interest (admin panels > API hosts > auth endpoints > everything else).
+          6. Exclude: ${OUT_OF_SCOPE}
+
+      - name: "port-and-service-scan"
+        depends_on: ["define-scope"]
+        prompt: |
+          Target: ${TARGET}  |  Scope: ${SCOPE}
+
+          Perform a port and service scan across the primary target and any known IP ranges:
+          1. Run a fast TCP scan of the top-1000 ports on ${TARGET} and its apex IP.
+          2. For any open ports beyond 80/443, run a detailed service/version probe.
+          3. Check for services that should never be internet-facing: FTP (21), Telnet (23), SMTP relay (25), SMB (445), RDP (3389), Redis (6379), Elasticsearch (9200), MongoDB (27017), Jenkins, Jupyter notebooks.
+          4. Note any non-standard ports that serve web applications (potential scope expansion).
+          5. For each interesting finding add a severity estimate (Critical / High / Medium / Low / Info).
+
+      - name: "technology-fingerprint"
+        depends_on: ["define-scope"]
+        prompt: |
+          Target: ${TARGET}  |  Scope: ${SCOPE}
+
+          Fingerprint the technology stack of ${TARGET} and its primary subdomains:
+          1. Identify the web server (Nginx, Apache, IIS, Caddy…), application framework, and programming language from HTTP response headers, cookies, and HTML source.
+          2. Check for WAF / CDN presence (Cloudflare, Akamai, Fastly, AWS WAF). Note bypass considerations.
+          3. Identify third-party integrations visible in page source (analytics, CRMs, payment processors, auth providers).
+          4. Look for version strings — correlate with known CVEs from the last 3 years.
+          5. Use browser tools to check for exposed source maps, interesting JS bundles, and hardcoded API keys / tokens in client-side code.
+          6. Summarise: stack, WAF, interesting third-parties, any exposed credentials or keys.
+
+      - name: "google-dorking"
+        depends_on: ["define-scope"]
+        prompt: |
+          Target: ${TARGET}  |  Programme: ${PROGRAM}
+
+          Conduct Google dork searches to surface hidden or sensitive content for ${TARGET}:
+          1. Run the following dork categories and document any results:
+             - site:${TARGET} ext:php OR ext:asp OR ext:aspx OR ext:jsp (legacy tech)
+             - site:${TARGET} inurl:admin OR inurl:login OR inurl:dashboard OR inurl:panel
+             - site:${TARGET} inurl:api OR inurl:v1 OR inurl:v2 OR inurl:graphql
+             - site:${TARGET} filetype:pdf OR filetype:xlsx OR filetype:env OR filetype:sql
+             - site:${TARGET} "internal use only" OR "confidential" OR "do not distribute"
+             - "${TARGET}" site:pastebin.com OR site:github.com OR site:gitlab.com
+          2. For any interesting URL found, note the URL and why it's interesting.
+          3. Search GitHub / GitLab for leaked API keys, secrets, or config files referencing ${TARGET}.
+
+  # ── Phase 3: crawl and API discovery ─────────────────────────────────────
+  - name: "crawl"
+    tasks:
+
+      - name: "web-crawl"
+        depends_on: ["subdomain-enumeration", "technology-fingerprint"]
+        prompt: |
+          Target: ${TARGET}  |  Depth: ${DEPTH}
+
+          Crawl ${TARGET} to map all accessible endpoints:
+          1. Spider the main application up to depth ${DEPTH}, starting from the homepage. Follow all HTML links, form actions, and JS-injected routes.
+          2. Capture: full URL, HTTP method, response code, and interesting response headers (Content-Type, Set-Cookie, X-Frame-Options, CSP, CORS headers).
+          3. Identify: login pages, registration flows, password reset, OAuth callbacks, file upload endpoints, API endpoints, admin interfaces, and any page that accepts user input.
+          4. Note parameters (query string + POST body) for each endpoint — these are injection targets for the next phase.
+          5. Look for hidden endpoints referenced in JS bundles (api base URLs, feature-flagged routes, internal paths).
+          6. Flag any unauthenticated endpoints that look like they should require auth.
+
+      - name: "api-discovery"
+        depends_on: ["subdomain-enumeration", "technology-fingerprint"]
+        prompt: |
+          Target: ${TARGET}
+
+          Discover and document the API attack surface for ${TARGET}:
+          1. Check for OpenAPI / Swagger specs at common paths: /swagger.json, /swagger/v1/swagger.json, /api-docs, /openapi.json, /api/v1/docs, /.well-known/openapi.
+          2. Check for GraphQL: /graphql, /api/graphql — run introspection query if found.
+          3. Probe REST API versioning: /api/v1/, /api/v2/, /api/v3/ — note which versions are still live.
+          4. Look for API keys in Authorization headers via CORS preflight responses.
+          5. Test for API documentation exposure (Redoc, Stoplight, Postman collections).
+          6. Summarise all discovered API endpoints, their authentication requirements, and data types handled.
+
+  # ── Phase 4: consolidate ─────────────────────────────────────────────────
+  - name: "recon-report"
+    tasks:
+      - name: "consolidate-findings"
+        depends_on: ["subdomain-enumeration", "port-and-service-scan", "technology-fingerprint", "google-dorking", "web-crawl", "api-discovery"]
+        prompt: |
+          Programme: ${PROGRAM}  |  Target: ${TARGET}
+
+          Consolidate all recon findings into a structured attack surface report:
+
+          ## Required sections
+          1. **Executive Summary** — scope, total assets discovered, top 3 immediate findings.
+          2. **Subdomains** — table: subdomain | IP | status | notes | takeover risk.
+          3. **Open Ports & Services** — highlight anything unexpected or critical.
+          4. **Technology Stack** — framework, server, WAF, known CVEs.
+          5. **Endpoints of Interest** — prioritised list of URLs/APIs to test next.
+          6. **Sensitive Exposures** — leaked keys, credentials, sensitive files found.
+          7. **Recommended Test Queue** — ordered list of what to test first in the pentest phase, with rationale.
+
+          Write in Markdown. Be precise and actionable — a pentester should be able to pick up this report and immediately know where to start.
