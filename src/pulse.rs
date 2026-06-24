@@ -172,6 +172,7 @@ pub async fn connect(
         let out_tx = out_tx.clone();
         let stop = stop.clone();
         let stop_notify = stop_notify.clone();
+        let thread_id_owned = thread_id.to_string();
         tokio::spawn(async move {
             let mut out_rx = out_rx;
             let mut next = Some(ws);
@@ -183,7 +184,7 @@ pub async fn connect(
                     Some(s) => s,
                     None => break,
                 };
-                run_session(sock, &mut out_rx, &out_tx, &app_tx, &stop, &stop_notify, profile.workspace_id.as_deref()).await;
+                run_session(sock, &mut out_rx, &out_tx, &app_tx, &stop, &stop_notify, profile.workspace_id.as_deref(), &thread_id_owned).await;
                 if stop.load(Ordering::Relaxed) {
                     break;
                 }
@@ -237,6 +238,7 @@ async fn run_session(
     stop: &Arc<AtomicBool>,
     stop_notify: &Arc<Notify>,
     workspace_id: Option<&str>,
+    thread_id: &str,
 ) {
     let (mut write, mut read) = ws.split();
     let _ = app_tx.send(AppEvent::Connected);
@@ -257,7 +259,7 @@ async fn run_session(
             msg = read.next() => match msg {
                 Some(Ok(Message::Text(txt))) => {
                     if let Ok(v) = serde_json::from_str::<Value>(&txt) {
-                        handle_frame(v, app_tx, out_tx, workspace_id);
+                        handle_frame(v, app_tx, out_tx, workspace_id, thread_id);
                     }
                 }
                 Some(Ok(_)) => {}
@@ -334,7 +336,7 @@ fn compact(v: &Value, limit: usize) -> String {
     }
 }
 
-fn handle_frame(v: Value, app_tx: &mpsc::UnboundedSender<AppEvent>, out_tx: &mpsc::UnboundedSender<String>, workspace_id: Option<&str>) {
+fn handle_frame(v: Value, app_tx: &mpsc::UnboundedSender<AppEvent>, out_tx: &mpsc::UnboundedSender<String>, workspace_id: Option<&str>, thread_id: &str) {
     let mtype = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
     match mtype {
         "message_sent" => {
@@ -364,7 +366,7 @@ fn handle_frame(v: Value, app_tx: &mpsc::UnboundedSender<AppEvent>, out_tx: &mps
             // Defensive: handle a wrapped form too.
             let inner = v.get("data").or_else(|| v.get("event")).cloned().unwrap_or(Value::Null);
             if inner.is_object() {
-                return handle_frame(inner, app_tx, out_tx, workspace_id);
+                return handle_frame(inner, app_tx, out_tx, workspace_id, thread_id);
             }
             return;
         }
@@ -381,14 +383,14 @@ fn handle_frame(v: Value, app_tx: &mpsc::UnboundedSender<AppEvent>, out_tx: &mps
     if etype == "tool" && status.as_deref() == Some("local_execute") {
         let tool_name = sval(&b, "toolName").unwrap_or_default();
         let request_id = sval(&b, "requestId").unwrap_or_default();
-        // Save agent name before `agent` is moved into the StreamItem below.
-        let agent_name_str = agent.as_deref().unwrap_or("default").to_string();
+        // Inject routing metadata into every local tool call.
+        // _thread_id keys the per-task sandbox directory in local.rs so each
+        // workflow task (which has its own thread) gets a fully isolated
+        // working directory for execute_command / execute_code / todo_*.
         let mut input = b.get("input").cloned().unwrap_or(json!({}));
-        // For browser tools: inject routing metadata so browser::handle() can
-        // select the right Chrome process (per workspace) and tab (per agent).
-        if tool_name.starts_with("browser_") {
-            input["_agent_name"] = json!(agent_name_str);
-            input["_workspace_id"] = json!(workspace_id.unwrap_or("default"));
+        input["_thread_id"] = json!(thread_id);
+        if let Some(ws) = workspace_id {
+            input["_workspace_id"] = json!(ws);
         }
         let arg_summary = concise_args(&tool_name, &input);
         let _ = app_tx.send(AppEvent::Stream(StreamItem {
