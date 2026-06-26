@@ -1,0 +1,1037 @@
+name: "crawl-application"
+description: >
+  Implements the CrawlApplication algorithm exactly.
+  Phase 1 initialises state and understands the application — identifies user
+  roles, entry points, and main workflows, writing role discovery to a shared
+  table so all downstream agents can read it.  Phase 2 establishes one
+  authenticated session per discovered role in parallel using saved credentials
+  when available, falling back to manual browser handover for CAPTCHA/MFA.
+  Phase 3 runs the full BFS crawl loop for every role concurrently — each agent
+  reads its session from the shared table, maintains its BFS queue/visited state
+  in shared tables (so discoveries are visible to synthesis), and for every page
+  popped from the queue executes: Discover Navigation, Discover Features, and
+  Explore Interactions.  Phase 4 reads all shared-table crawl data and generates
+  a complete sitemap, feature inventory, user flow map, and coverage report.
+
+workspace:
+  name: "CrawlApplication — ${TARGET_DOMAIN}"
+
+variables:
+  TARGET_URL: ""                  # application entry point, e.g. https://app.example.com  (required)
+  TARGET_DOMAIN: ""               # stay-in-scope domain, e.g. app.example.com              (required)
+  USER_CREDENTIALS: ""            # "email:password" for the regular-user role  (leave blank to skip)
+  ADMIN_CREDENTIALS: ""           # "email:password" for the admin role         (leave blank to skip)
+  SIGNUP_EMAIL: ""                # auto-register email if no USER_CREDENTIALS   (leave blank to skip)
+  SIGNUP_PASSWORD: "Crawl2024!"   # password used when auto-registering
+  MAX_PAGES: "60"                 # BFS page cap per role  (prevents runaway crawls)
+  MAX_DEPTH: "6"                  # maximum link-follow depth from entry point
+  INTERACTION_DEPTH: "2"          # depth at which to exercise interactive components
+
+
+phases:
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # PHASE 1 — INITIALISE & UNDERSTAND APPLICATION
+  #
+  # Algorithm step 1 (Initialize) + step 2 (Understand Application).
+  # Sets up the initial queue {EntryPoint} and discovers user roles,
+  # entry points, and main workflows.  Writes discoveries to shared tables
+  # so auth-setup and crawl phases can read them.
+  # ══════════════════════════════════════════════════════════════════════════
+  - name: "initialise"
+    tasks:
+
+      - name: "understand-application"
+        prompt: |
+          CrawlApplication — PHASE 1: Initialise & Understand Application
+
+          Entry point : ${TARGET_URL}
+          Domain scope: ${TARGET_DOMAIN}
+
+          ╔══════════════════════════════════════════════════════╗
+          ║  Algorithm step 1 — Initialize                      ║
+          ║    queue          ← { ${TARGET_URL} }               ║
+          ║    visitedPages   ← {}                              ║
+          ║    discoveredPages← {}                              ║
+          ║    discoveredFeatures ← {}                          ║
+          ╚══════════════════════════════════════════════════════╝
+
+          ╔══════════════════════════════════════════════════════╗
+          ║  Algorithm step 2 — Understand Application          ║
+          ║    Identify:                                        ║
+          ║      - User roles                                   ║
+          ║      - Main workflows                               ║
+          ║      - Entry points                                 ║
+          ╚══════════════════════════════════════════════════════╝
+
+          ── STEP 0: Recall prior knowledge ──────────────────────────────────
+          Call `semantic_search_learnings` with query="${TARGET_DOMAIN} application
+          roles entry points" to recall anything previously discovered about this
+          target. If relevant learnings exist, use them to skip re-discovery and
+          jump straight to verifying the current state.
+
+          ── STEP 1: Fetch machine-readable discovery files ──────────────────
+          Use `http_request` (GET, no auth) for each:
+            • ${TARGET_URL}/robots.txt  — note Disallow paths (scope hints)
+            • ${TARGET_URL}/sitemap.xml — extract all <loc> URLs
+            • ${TARGET_URL}/sitemap_index.xml — if sitemap.xml doesn't exist
+
+          Record all URLs found — they are guaranteed discoverable entry points.
+
+          ── STEP 2: Load the homepage ───────────────────────────────────────
+          Use `browser_navigate` to open ${TARGET_URL}.
+          Use `browser_snapshot` to get the full page HTML.
+          Use `browser_screenshot` to capture a visual record of the landing page.
+          Use `view_image` on the screenshot to visually inspect the layout —
+          note the navigation structure, visible CTAs, login/register links.
+
+          ── STEP 3: Identify User Roles ─────────────────────────────────────
+          From the snapshot, look for evidence of multiple user roles:
+          - Navigation items: Admin, Manager, Member, Viewer, Guest, Operator
+          - Login/signup page: role selector, plan tiers, account types
+          - URL patterns: /admin/*, /dashboard/*, /manage/*, /operator/*
+          - Pricing page: describes what each plan/role can do
+
+          Use `browser_execute_script` to scan JS source for role indicators:
+          ```js
+          JSON.stringify(
+            Object.entries(window).filter(([k]) =>
+              /role|permission|plan|tier|admin|member/i.test(k)
+            ).slice(0, 20)
+          )
+          ```
+          Use `browser_execute_script` to extract embedded route config:
+          ```js
+          JSON.stringify(window.__ROUTES__ || window.__NEXT_DATA__ ||
+            window.__NUXT__ || document.querySelector('[data-page]')?.dataset || {})
+          ```
+
+          Always include "anonymous" (unauthenticated) as the base role.
+
+          ── STEP 4: Identify Entry Points ───────────────────────────────────
+          Entry points are starting URLs for the BFS crawl per role:
+          - Anonymous: ${TARGET_URL} (homepage)
+          - Authenticated user: post-login landing (/dashboard, /home, /app)
+          - Admin: admin panel (/admin, /manage, /console, /superadmin)
+
+          Use `browser_navigate` to each candidate to verify it exists (not 404).
+          Record the final URL after any redirects.
+
+          ── STEP 5: Identify Main Workflows ─────────────────────────────────
+          From homepage, docs, feature list, or pricing page, use `browser_snapshot`
+          to identify the application's primary workflows.
+          Use `web_search` "${TARGET_DOMAIN} user guide features workflow" to
+          supplement what the UI reveals if public documentation exists.
+
+          ── STEP 6: Tech Stack Quick-check ──────────────────────────────────
+          Use `browser_execute_script` to detect the framework:
+          ```js
+          JSON.stringify({
+            react: !!(window.React || document.querySelector('[data-reactroot]')),
+            vue: !!(window.__vue_app__ || window.Vue),
+            angular: !!document.querySelector('[ng-version]'),
+            next: !!window.__NEXT_DATA__,
+            nuxt: !!window.__NUXT__,
+            framework: document.querySelector('meta[name=generator]')?.content
+          })
+          ```
+          Note: SPA = must click/interact to reveal pages; MPA = links work directly.
+
+          ── STEP 7: Persist discoveries to shared tables ────────────────────
+          Write each discovered role to the `crawl_sessions` shared table
+          (one row per role) so auth-setup and crawl agents can read them:
+
+          `write_to_shared_table` table="crawl_sessions", one row per role:
+          {
+            "role": "anonymous",
+            "entry_point": "${TARGET_URL}",
+            "requires_auth": false,
+            "auth_status": "NOT_REQUIRED",
+            "description": "unauthenticated visitor"
+          }
+
+          Write the initial BFS queue entry to the `crawl_queue` table:
+          `write_to_shared_table` table="crawl_queue":
+          {
+            "url": "${TARGET_URL}",
+            "role": "anonymous",
+            "status": "pending",
+            "depth": 0,
+            "source": "entry_point"
+          }
+
+          Write app metadata to the `crawl_meta` table:
+          `write_to_shared_table` table="crawl_meta":
+          {
+            "target_url": "${TARGET_URL}",
+            "domain": "${TARGET_DOMAIN}",
+            "app_type": "SPA|MPA|Hybrid",
+            "auth_mechanism": "cookie|jwt|oauth",
+            "captcha_on_login": false,
+            "captcha_on_signup": false,
+            "has_realtime_features": false,
+            "sitemap_urls": ["..."],
+            "robots_disallowed": ["..."],
+            "known_entry_points": ["..."],
+            "main_workflows": [{"name": "...", "first_url": "..."}]
+          }
+
+          ── STEP 8: Save learnings ───────────────────────────────────────────
+          Call `create_learning` for each meaningful discovery:
+          - One learning per identified role (name, entry point, capabilities)
+          - One learning for the tech stack (framework, auth mechanism, SPA/MPA)
+          - One learning for any CAPTCHA or MFA protection detected
+          - One learning for any interesting paths from robots.txt
+
+          ── OUTPUT ─────────────────────────────────────────────────────────
+          {
+            "roles_discovered": ["anonymous", "user", "admin"],
+            "entry_points": { "anonymous": "...", "user": "...", "admin": "..." },
+            "app_type": "SPA|MPA|Hybrid",
+            "auth_mechanism": "cookie|jwt|oauth",
+            "captcha_detected": false,
+            "main_workflows_count": N,
+            "sitemap_urls_count": N,
+            "shared_tables_written": ["crawl_sessions", "crawl_queue", "crawl_meta"]
+          }
+
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # PHASE 2 — AUTHENTICATION SETUP
+  #
+  # Establish one session per role that requires authentication.
+  # Reads role info from the crawl_sessions shared table.
+  # Writes session cookies/tokens back to crawl_sessions for the crawl phase.
+  # ══════════════════════════════════════════════════════════════════════════
+  - name: "auth-setup"
+    tasks:
+
+      - name: "session-user"
+        depends_on: ["understand-application"]
+        prompt: |
+          CrawlApplication — PHASE 2: Session Setup (user role)
+
+          Target         : ${TARGET_URL}
+          Credentials    : ${USER_CREDENTIALS}
+          Signup email   : ${SIGNUP_EMAIL}
+          Signup password: ${SIGNUP_PASSWORD}
+
+          Read app metadata first:
+          `read_from_shared_table` table="crawl_meta" — get app_type,
+          auth_mechanism, captcha_on_login, captcha_on_signup.
+
+          ── STEP 1: Check saved credentials ─────────────────────────────────
+          Call `list_credentials` to check if any saved credentials exist for
+          ${TARGET_DOMAIN} with type "user" or "member". If found, prefer them
+          over ${USER_CREDENTIALS}.
+
+          ── STEP 2: Find the login portal ───────────────────────────────────
+          Call `detect_login_portal` with target="${TARGET_URL}" to locate the
+          login page URL. Use the detected URL for navigation.
+
+          ── STEP 3: Establish session ────────────────────────────────────────
+          Priority order:
+          1. If saved credentials found → call `bind_credentials_to_session` to
+             apply them automatically, then verify with `browser_snapshot`.
+          2. Else if ${USER_CREDENTIALS} is not empty → manual login:
+             a. `browser_navigate` to the login page
+             b. `browser_snapshot` to identify username and password fields
+             c. `browser_fill_credential` for the email/username field
+             d. `browser_fill_credential` for the password field
+             e. `browser_click` the submit button
+             f. `browser_snapshot` to verify the result
+          3. Else if ${SIGNUP_EMAIL} is not empty → auto-register:
+             a. `browser_navigate` to the signup page
+             b. `browser_snapshot` to map form fields
+             c. `browser_fill_credential` for each field (name, email, password)
+             d. `browser_click` submit; then loop back to step 2 to login
+          4. Else → skip; `update_shared_table` crawl_sessions role="user":
+             { auth_status: "NO_SESSION" } and stop.
+
+          ── STEP 4: Handle CAPTCHA / MFA ─────────────────────────────────────
+          If a CAPTCHA is encountered during login or signup:
+          - Call `request_browser_handover` with message: "CAPTCHA detected on
+            ${TARGET_URL}. Please solve it and complete the login, then return."
+          - After handover returns: `browser_snapshot` to confirm login state.
+
+          If MFA/2FA prompt appears after password entry:
+          - Call `request_human_input` with prompt="Enter the 6-digit MFA code
+            for ${TARGET_DOMAIN}" fields=[{"name":"otp","type":"text"}].
+          - Enter the OTP via `browser_fill_credential` and submit.
+
+          If email verification is required after signup:
+          - Call `request_human_input` prompt="Verification email sent to
+            ${SIGNUP_EMAIL}. Enter the verification code (if any)."
+            fields=[{"name":"code","type":"text"}].
+
+          ── STEP 5: Capture session ──────────────────────────────────────────
+          After a successful login:
+          - `browser_get_cookies` to capture all session cookies
+          - `browser_execute_script` to extract tokens from browser storage:
+            ```js
+            JSON.stringify({
+              localStorage: Object.entries(localStorage).filter(([k]) =>
+                /token|jwt|auth|session|access/i.test(k)),
+              sessionStorage: Object.entries(sessionStorage).filter(([k]) =>
+                /token|jwt|auth|session|access/i.test(k))
+            })
+            ```
+          - `browser_snapshot` to record the post-login URL and user-specific
+            nav elements (username display, role badge)
+          - `browser_screenshot` to document the authenticated state
+
+          ── STEP 6: Write session to shared table ────────────────────────────
+          `update_shared_table` table="crawl_sessions" where role="user":
+          {
+            "auth_status": "LOGGED_IN|REGISTERED|PENDING_VERIFY|MFA_REQUIRED|NO_SESSION",
+            "post_login_url": "...",
+            "cookies": [...],
+            "csrf_token": "...",
+            "bearer_token": "...",
+            "user_id": "...",
+            "entry_point": "..."
+          }
+
+          Call `create_learning` to save the auth mechanism details and any
+          quirks (e.g. "login requires email verification before dashboard is
+          accessible on ${TARGET_DOMAIN}").
+
+          ── OUTPUT ─────────────────────────────────────────────────────────
+          { "role": "user", "auth_status": "...", "post_login_url": "...",
+            "session_written_to_shared_table": true }
+
+      - name: "session-admin"
+        depends_on: ["understand-application"]
+        prompt: |
+          CrawlApplication — PHASE 2: Session Setup (admin role)
+
+          Target           : ${TARGET_URL}
+          Admin credentials: ${ADMIN_CREDENTIALS}
+
+          `read_from_shared_table` table="crawl_meta" — get app_type, auth_mechanism.
+
+          If ${ADMIN_CREDENTIALS} is empty:
+          - `update_shared_table` table="crawl_sessions" where role="admin":
+            { "auth_status": "NO_SESSION", "reason": "no credentials provided" }
+          - Output { "role": "admin", "auth_status": "NO_SESSION" } and stop.
+
+          ── STEP 1: Check saved admin credentials ────────────────────────────
+          Call `list_credentials` to check for saved credentials on ${TARGET_DOMAIN}
+          with type "admin" or "superadmin". Use saved credentials if found.
+
+          ── STEP 2: Find the login portal ───────────────────────────────────
+          Call `detect_login_portal` with target="${TARGET_URL}".
+          Also use `http_request` GET to ${TARGET_URL}/admin/login,
+          ${TARGET_URL}/superadmin, ${TARGET_URL}/manage/login — record which
+          return 200.
+
+          ── STEP 3: Test credentials ────────────────────────────────────────
+          Call `test_credentials` with the admin credentials and the login endpoint
+          discovered above — verifies credentials are valid before browser flow.
+
+          ── STEP 4: Log in via browser ──────────────────────────────────────
+          If test_credentials succeeded:
+          a. `browser_navigate` to the login page
+          b. `browser_snapshot` to identify form fields
+          c. `browser_fill_credential` for email (split ${ADMIN_CREDENTIALS} on ":")
+          d. `browser_fill_credential` for password
+          e. `browser_click` submit
+          f. `browser_snapshot` to verify admin landing page
+
+          If CAPTCHA encountered:
+          - `request_browser_handover` "Admin CAPTCHA on ${TARGET_URL}. Please
+            solve and complete admin login, then return."
+
+          If MFA encountered:
+          - `request_human_input` prompt="Admin MFA code for ${TARGET_DOMAIN}"
+            fields=[{"name":"otp","type":"text"}].
+
+          ── STEP 5: Verify admin privileges ─────────────────────────────────
+          `browser_snapshot` — check for admin-specific nav: Users, Audit Log,
+          System, Billing, Permissions. Navigate to the admin entry point and
+          take `browser_screenshot`.
+
+          ── STEP 6: Capture session ─────────────────────────────────────────
+          - `browser_get_cookies` to capture all cookies
+          - `browser_execute_script` to extract JWT/localStorage tokens (same
+            script as session-user task)
+
+          ── STEP 7: Write session to shared table ────────────────────────────
+          `update_shared_table` table="crawl_sessions" where role="admin":
+          {
+            "auth_status": "LOGGED_IN|LOGIN_FAILED|NO_SESSION",
+            "post_login_url": "...",
+            "admin_entry_point": "...",
+            "cookies": [...],
+            "csrf_token": "...",
+            "bearer_token": "..."
+          }
+
+          Call `create_learning` to save admin login method and entry point.
+
+          ── OUTPUT ─────────────────────────────────────────────────────────
+          { "role": "admin", "auth_status": "...", "admin_entry_point": "...",
+            "session_written_to_shared_table": true }
+
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # PHASE 3 — BFS CRAWL PER ROLE
+  #
+  # Algorithm step 3 — "For each userRole: While queue is not empty"
+  #
+  # Three parallel crawl agents, one per role.  Each reads its session from
+  # the crawl_sessions shared table, then implements the complete BFS loop:
+  #
+  #   while queue not empty:
+  #     currentPage ← queue.pop()
+  #     if currentPage ∈ visitedPages: continue
+  #     visitedPages.add(currentPage)
+  #     → Discover Navigation
+  #     → Discover Features
+  #     → Explore Interactions
+  #
+  # BFS state (queue, visitedPages) and discoveries (pages, features, flows)
+  # are ALL written to shared tables so the synthesis phase can merge them
+  # without needing to parse per-agent output.
+  # ══════════════════════════════════════════════════════════════════════════
+  - name: "crawl"
+    tasks:
+
+      - name: "crawl-anonymous"
+        depends_on: ["understand-application"]
+        prompt: |
+          CrawlApplication — PHASE 3: BFS Crawl (role: anonymous)
+
+          Domain scope     : ${TARGET_DOMAIN}
+          Max pages        : ${MAX_PAGES}
+          Max depth        : ${MAX_DEPTH}
+          Interaction depth: ${INTERACTION_DEPTH}
+
+          ── STEP 0: Read metadata and seed queue ─────────────────────────────
+          `read_from_shared_table` table="crawl_meta" — get app_type, auth_mechanism.
+          `read_from_shared_table` table="crawl_queue" filter role="anonymous",
+          status="pending" — get initial queue entries.
+          `semantic_search_learnings` query="${TARGET_DOMAIN} anonymous public pages"
+          — recall any prior knowledge about publicly accessible sections.
+
+          You are crawling as an UNAUTHENTICATED VISITOR.
+          Do NOT log in. If you hit a login wall (redirect to /login, 401,
+          "please sign in"), record the blocked URL and do NOT follow it.
+
+          ════════════════════════════════════════════════════════════════════
+          ALGORITHM: CrawlApplication — anonymous role
+          ════════════════════════════════════════════════════════════════════
+
+          Maintain in memory (mirrored to shared tables after each page):
+            queue        : entries from crawl_queue where role="anonymous", status="pending"
+            visitedPages : set of URLs already processed
+            page_count   : 0
+
+          ──────────────────────────────────────────────────────────────────────
+          MAIN LOOP — repeat until queue empty OR page_count ≥ ${MAX_PAGES}
+          ──────────────────────────────────────────────────────────────────────
+
+          currentPage ← queue.pop() (BFS order — take oldest pending entry)
+          if currentPage ∈ visitedPages → continue.
+          visitedPages.add(currentPage); page_count++.
+
+          Mark visited: `update_shared_table` table="crawl_queue" where
+          url=currentPage AND role="anonymous" → { "status": "visited" }
+
+          ── A. NAVIGATE TO PAGE ───────────────────────────────────────────────
+          `browser_navigate` to currentPage.
+          `browser_snapshot` to get full page HTML. Record:
+            - Page title, HTTP status, whether login wall detected.
+
+          If HTTP 403 or login-wall redirect:
+          - `update_shared_table` table="crawl_queue" → { "status": "blocked" }
+          - `write_to_shared_table` table="crawl_pages":
+            { url, title:"blocked", role:"anonymous", status:403, access:"blocked",
+              depth:N, category:"Auth" }
+          - Continue to next queue item.
+
+          `browser_screenshot` every 5th page, or any page with notable features
+          (dashboard, form, data table). Use `view_image` to inspect it visually.
+
+          Use `browser_scroll` to reveal lazy-loaded content:
+          `browser_execute_script` → `window.scrollTo(0, document.body.scrollHeight)`
+          Then `browser_snapshot` again to capture newly loaded content.
+
+          ── B. DISCOVER NAVIGATION ────────────────────────────────────────────
+          From the `browser_snapshot` HTML, identify ALL navigable elements:
+
+            Links    : all <a href="..."> within ${TARGET_DOMAIN}
+            Buttons  : <button>, <input type="button/submit"> that trigger navigation
+            Menus    : top nav, sidebar nav, hamburger/dropdown menus
+            Tabs     : tab bars, pill nav, segmented controls
+            Modals   : triggers that open modal dialogs with navigation
+            Popups   : flyouts, popovers, tooltips with links
+            Nav ctrl : breadcrumbs, prev/next, pagination, stepper
+
+          For links (href available): extract href directly from snapshot.
+          - Normalise URL (resolve relative paths, strip fragments)
+          - If within ${TARGET_DOMAIN} and not in visitedPages:
+            `write_to_shared_table` table="crawl_queue":
+            { "url": destination, "role": "anonymous", "status": "pending",
+              "depth": currentDepth+1, "source": currentPage }
+
+          For buttons/tabs/modals (no href):
+          - `browser_click` the element
+          - `browser_snapshot` to read the new state/URL
+          - `browser_navigate` back to currentPage
+          - If destination is a new URL: add to queue as above.
+
+          Record all nav elements:
+          `write_to_shared_table` table="crawl_flows":
+          { "from_url": currentPage, "via": element_label, "to_url": destination,
+            "element_type": "link|button|tab|menu|modal", "role": "anonymous" }
+
+          Use `http_history` after processing each page to capture XHR/fetch
+          requests triggered by navigation clicks — reveals API endpoints and
+          URL patterns not visible in the HTML.
+
+          Use `browser_execute_script` to extract SPA route config:
+          ```js
+          const router = window.__ROUTER__ || window.app?._router;
+          JSON.stringify(router?.options?.routes?.map(r => r.path) ||
+            window.__NEXT_DATA__?.page || [])
+          ```
+          Add any discovered route paths to the queue.
+
+          ── C. DISCOVER FEATURES ──────────────────────────────────────────────
+          Scan the current page snapshot for each feature type:
+
+          FORMS — find all <form> elements:
+          - Record action URL, method, all field names+types+required+placeholder
+          - Submit with safe sample data via `browser_fill_credential` + `browser_click`
+          - `browser_snapshot` after submit to record success/error messages
+          - `http_history` after submit to capture the API endpoint and payload
+          - `browser_navigate` back to currentPage after each submission
+
+          TABLES — find data tables or data-grid elements:
+          - Record column headers, row count, sortable/filterable columns
+          - `browser_click` a sortable column header; `http_history` to capture
+            the sort endpoint and parameters
+
+          SEARCH — find search inputs:
+          - `browser_fill_credential` a test query ("test")
+          - `browser_snapshot` to record results format
+          - `http_history` to capture the search endpoint and query parameter name
+
+          FILTERS — find filter panels, dropdowns, checkboxes:
+          - `browser_click` a filter option; `browser_snapshot` for effect
+          - `http_history` to capture filter parameters
+
+          CRUD operations — infer from URL patterns and button labels:
+          - "New/Create/Add" → record create form
+          - "Edit/Update" → record edit form
+          - "Delete/Remove" → note confirmation dialog
+          - URL pattern /:id → record as detail page for entity type
+
+          UPLOADS — find file input elements:
+          - Record accepted types (accept attribute), upload endpoint from
+            form action or `http_history`
+
+          DOWNLOADS — find export/download links or buttons:
+          - `browser_click`; `http_history` to capture endpoint and format
+
+          SETTINGS — find /settings or /preferences pages:
+          - List all setting categories and toggle labels from `browser_snapshot`
+
+          REPORTS/DASHBOARDS — find chart/widget elements:
+          - List widget names, metric labels, chart types, date range controls
+
+          Write each feature: `write_to_shared_table` table="crawl_features":
+          {
+            "page_url": currentPage,
+            "role": "anonymous",
+            "feature_type": "form|table|search|filter|crud|upload|download|settings|report|dashboard",
+            "name": "descriptive name",
+            "details": { ...field-specific... },
+            "api_endpoint": "METHOD /path (from http_history)"
+          }
+
+          ── D. EXPLORE INTERACTIONS ───────────────────────────────────────────
+          (Only execute if current BFS depth ≤ ${INTERACTION_DEPTH})
+
+          For each interactive component (buttons, toggles, dropdowns, accordions,
+          carousels, date pickers, sliders, rating controls):
+
+          1. `browser_click` the component.
+          2. `browser_snapshot` to observe the result.
+          3. `http_history` to capture any API calls triggered.
+          4. Record: state change, navigation change, dynamic content, data update,
+             validation messages.
+          5. Restore: `browser_navigate` back to currentPage if URL changed,
+             or close modal before moving to the next component.
+
+          ── E. WRITE PAGE RECORD ─────────────────────────────────────────────
+          `write_to_shared_table` table="crawl_pages":
+          {
+            "url": currentPage,
+            "title": "...",
+            "role": "anonymous",
+            "depth": N,
+            "status": 200,
+            "access": "public",
+            "category": "Landing|List|Detail|Create|Edit|Settings|Dashboard|Auth|Utility",
+            "nav_elements_count": N,
+            "features_found": ["form:contact", "table:articles"],
+            "interactions_tested": N,
+            "api_endpoints_observed": ["GET /api/articles", "POST /api/search"]
+          }
+
+          ── F. NOTABLE OBSERVATIONS ──────────────────────────────────────────
+          If you discover anything notable, call `create_learning`:
+          - Any page leaking data without auth (potential IDOR surface)
+          - API endpoints returning more data than the UI displays
+          - Debug endpoints (/debug, /test, /health with interesting data)
+          - Error pages revealing stack traces or technology details
+          - Interesting cookies or headers from `browser_get_cookies` or `http_history`
+
+          ── LOOP END ─────────────────────────────────────────────────────────
+          Stop when crawl_queue has no pending rows for role="anonymous", OR
+          page_count ≥ ${MAX_PAGES}.
+
+          ── FINAL OUTPUT ─────────────────────────────────────────────────────
+          {
+            "role": "anonymous",
+            "pages_visited": N,
+            "queue_exhausted": true|false,
+            "cap_reached": true|false,
+            "blocked_urls": ["..."],
+            "shared_tables_written": {
+              "crawl_pages": N, "crawl_features": N,
+              "crawl_flows": N, "crawl_queue": N
+            }
+          }
+
+      - name: "crawl-user"
+        depends_on: ["session-user"]
+        prompt: |
+          CrawlApplication — PHASE 3: BFS Crawl (role: user)
+
+          Domain scope     : ${TARGET_DOMAIN}
+          Max pages        : ${MAX_PAGES}
+          Max depth        : ${MAX_DEPTH}
+          Interaction depth: ${INTERACTION_DEPTH}
+
+          ── STEP 0: Read session and app metadata ────────────────────────────
+          `read_from_shared_table` table="crawl_sessions" filter role="user"
+            → get auth_status, post_login_url, cookies, csrf_token, bearer_token.
+          `read_from_shared_table` table="crawl_meta" → get app_type, auth_mechanism.
+          `semantic_search_learnings` query="${TARGET_DOMAIN} authenticated user features"
+
+          If auth_status is "NO_SESSION", "PENDING_VERIFY", or "MFA_REQUIRED":
+          - `write_to_shared_table` table="crawl_pages":
+            { skipped: true, role: "user", reason: auth_status }
+          - Output { "role": "user", "skipped": true, "reason": auth_status } and stop.
+
+          ── STEP 1: Restore browser session ─────────────────────────────────
+          `browser_set_cookies` to inject the session cookies from crawl_sessions.
+          `browser_navigate` to post_login_url.
+          `browser_snapshot` — confirm user-specific navigation is visible.
+          If session expired (login page shown):
+          - `request_browser_handover` "User session expired on ${TARGET_URL}.
+            Please log in again and return."
+          - `browser_get_cookies` to re-capture the new session.
+
+          ── STEP 2: Seed the BFS queue ───────────────────────────────────────
+          `write_to_shared_table` table="crawl_queue":
+          { "url": post_login_url, "role": "user", "status": "pending",
+            "depth": 0, "source": "entry_point" }
+
+          ── BFS LOOP ─────────────────────────────────────────────────────────
+          Follow the IDENTICAL BFS algorithm as crawl-anonymous with these differences:
+
+          DIFFERENCE 1 — session maintenance:
+          Every 10 pages, `browser_get_cookies` to verify the session cookie is
+          still present. If gone: `browser_set_cookies` with the captured cookies
+          to restore the session.
+
+          DIFFERENCE 2 — access level:
+          Mark all pages as access="authenticated".
+
+          DIFFERENCE 3 — additional features to discover:
+          - User profile / account settings (/settings/profile, /account)
+          - Notification center (bell icon, /notifications)
+          - Team / workspace management (/team, /workspace/members)
+          - Billing / subscription management (/billing, /settings/billing)
+          - API key / integration settings (/settings/api, /integrations)
+          - Activity log / audit trail (/activity, /audit)
+          - Data import / export (import/export buttons)
+          - Feature-gated content: call `create_learning` for any "upgrade to Pro"
+            prompts or greyed-out actions, noting the feature name and plan required.
+
+          DIFFERENCE 4 — API exploration via http_request:
+          After finding an API endpoint via `http_history`, call `http_request`
+          directly with the auth cookies/bearer token to verify the response and
+          explore available parameters. Record any over-permissive responses
+          (e.g. GET /api/users returns all users) with `create_learning`.
+
+          All other steps (navigate, snapshot, scroll, click, fill, discover nav,
+          discover features, explore interactions, write_to_shared_table) are
+          identical to crawl-anonymous.
+
+          ── FINAL OUTPUT ─────────────────────────────────────────────────────
+          Same schema as crawl-anonymous with "role": "user".
+
+      - name: "crawl-admin"
+        depends_on: ["session-admin"]
+        prompt: |
+          CrawlApplication — PHASE 3: BFS Crawl (role: admin)
+
+          Domain scope     : ${TARGET_DOMAIN}
+          Max pages        : ${MAX_PAGES}
+          Max depth        : ${MAX_DEPTH}
+          Interaction depth: ${INTERACTION_DEPTH}
+
+          ── STEP 0: Read session and app metadata ────────────────────────────
+          `read_from_shared_table` table="crawl_sessions" filter role="admin"
+            → get auth_status, admin_entry_point, cookies, csrf_token, bearer_token.
+          `read_from_shared_table` table="crawl_meta" → get app_type, auth_mechanism.
+          `semantic_search_learnings` query="${TARGET_DOMAIN} admin panel features"
+
+          If auth_status is "NO_SESSION" or "LOGIN_FAILED":
+          - Output { "role": "admin", "skipped": true, "reason": auth_status } and stop.
+
+          ── STEP 1: Restore browser session ─────────────────────────────────
+          `browser_set_cookies` to inject admin session cookies.
+          `browser_navigate` to admin_entry_point.
+          `browser_snapshot` to verify admin panel is accessible.
+          `browser_screenshot` to document the admin panel homepage.
+          If session expired:
+          - `request_browser_handover` "Admin session expired on ${TARGET_URL}.
+            Please re-authenticate as admin and return."
+          - `browser_get_cookies` to re-capture the session.
+
+          ── STEP 2: Seed the BFS queue ───────────────────────────────────────
+          `write_to_shared_table` table="crawl_queue":
+          { "url": admin_entry_point, "role": "admin", "status": "pending",
+            "depth": 0, "source": "entry_point" }
+
+          ── BFS LOOP ─────────────────────────────────────────────────────────
+          Follow the IDENTICAL BFS algorithm as crawl-anonymous with these differences:
+
+          DIFFERENCE 1 — admin-specific feature focus.
+          In addition to all standard features, specifically look for:
+
+          1. User management: list users, create/edit/delete/impersonate user,
+             change role, suspend/activate. After finding the users API endpoint
+             via `http_history`, call `http_request` GET /api/users with admin auth
+             to verify the full user list is accessible.
+          2. Organization/tenant management: list orgs, create, manage limits.
+          3. System settings: global config, feature flags, system toggles.
+             Note any flags visible in `browser_snapshot`.
+          4. Audit logs: `browser_navigate` to audit log; `browser_scroll` through
+             entries; `http_history` to find the audit log API endpoint.
+          5. Billing admin: plan overrides, usage stats, subscription management.
+          6. Content moderation: approval queues, flagged content review.
+          7. System-wide analytics: `browser_screenshot` any admin dashboard.
+          8. Integrations/webhooks: list configured webhooks; `http_request` to
+             the webhook list endpoint to see full data.
+          9. Email templates: list system emails, preview templates.
+          10. Data management: bulk import/export; test `http_request` to any
+              bulk data endpoints found.
+
+          DIFFERENCE 2 — before dangerous operations:
+          Before exercising any destructive admin action (delete all, reset, purge,
+          revoke, bulk delete), call `request_plan_approval` listing what you intend
+          to click so the user can confirm or deny.
+
+          DIFFERENCE 3 — cross-role access control testing:
+          After finding each admin-only API endpoint via `http_history`, also call
+          `http_request` to the same endpoint with the regular user session cookies
+          (from `read_from_shared_table` table="crawl_sessions" role="user") to
+          test for broken access control. Record any endpoint accessible without
+          admin auth with `create_learning` tagged "potential access control issue".
+
+          DIFFERENCE 4 — session maintenance every 10 pages (same as crawl-user).
+
+          All other steps identical to crawl-anonymous.
+
+          ── FINAL OUTPUT ─────────────────────────────────────────────────────
+          Same schema as crawl-anonymous with "role": "admin".
+
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # PHASE 4 — GENERATE RESULTS
+  #
+  # Algorithm step 5 — "Generate Results: sitemap, feature inventory,
+  # user flow map, coverage summary"
+  #
+  # Four parallel synthesis tasks. Each reads exclusively from shared tables
+  # (crawl_pages, crawl_features, crawl_flows, crawl_meta) to merge all roles.
+  # ══════════════════════════════════════════════════════════════════════════
+  - name: "generate-results"
+    tasks:
+
+      - name: "sitemap"
+        depends_on:
+          - "crawl-anonymous"
+          - "crawl-user"
+          - "crawl-admin"
+        prompt: |
+          CrawlApplication — PHASE 4: Generate Results → Sitemap
+
+          ── STEP 1: Read all crawl data ─────────────────────────────────────
+          `read_from_shared_table` table="crawl_pages" — ALL rows across all roles.
+          `read_from_shared_table` table="crawl_meta" — domain, app_type.
+
+          ── STEP 2: Deduplicate and normalise ────────────────────────────────
+          Collect every URL from all rows. Normalise:
+          - Remove trailing slashes, lowercase domain, strip fragments
+          - Collapse duplicate path parameters (/projects/123 + /projects/456
+            → /projects/:id)
+
+          For each unique normalised URL, determine access level:
+          - [PUBLIC]   — appears in anonymous role rows
+          - [AUTH]     — appears in user role rows but not anonymous
+          - [ADMIN]    — appears in admin role rows only
+          - [BOTH]     — appears in user + admin rows
+          - [BLOCKED]  — status=blocked or status=403
+
+          ── STEP 3: Build the ASCII tree ────────────────────────────────────
+          If more than 30 pages, use `workspace_execute_code` to run a Python
+          script that builds and renders the ASCII tree programmatically:
+          ```python
+          import json, sys
+          pages = json.loads(sys.stdin.read())
+          # build tree from URL path segments, render with ├── / └──
+          ```
+
+          Render:
+          ```
+          https://${TARGET_DOMAIN}/
+          ├── [PUBLIC]  /  (Homepage — Landing — 200)
+          ├── [PUBLIC]  /about  (About — Info — 200)
+          ├── [AUTH]    /dashboard  (Dashboard — Dashboard — 200)
+          │   └── [AUTH]    /dashboard/analytics  (Analytics — Report — 200)
+          ├── [AUTH]    /projects  (Projects — List — 200)
+          │   ├── [AUTH]    /projects/new  (New Project — Create — 200)
+          │   └── [AUTH]    /projects/:id  (Project Detail — Detail — 200)
+          ├── [ADMIN]   /admin  (Admin Panel — Admin — 200)
+          │   └── [ADMIN]   /admin/users  (Users — List — 200)
+          └── [BLOCKED] /api/internal  (blocked — 403)
+          ```
+
+          ── STEP 4: Summary table ────────────────────────────────────────────
+          | Section | Public | Auth | Admin | Blocked | Total |
+          |---------|--------|------|-------|---------|-------|
+
+          ── STEP 5: Write reports ────────────────────────────────────────────
+          `workspace_write_file` path="sitemap.md" with the full Markdown report.
+          `export_shared_table_csv` table="crawl_pages" filename="crawl_pages.csv"
+
+          Return the Markdown content as output.
+
+      - name: "feature-inventory"
+        depends_on:
+          - "crawl-anonymous"
+          - "crawl-user"
+          - "crawl-admin"
+        prompt: |
+          CrawlApplication — PHASE 4: Generate Results → Feature Inventory
+
+          ── STEP 1: Read all feature data ───────────────────────────────────
+          `read_from_shared_table` table="crawl_features" — all feature rows.
+          `read_from_shared_table` table="crawl_pages" — cross-reference page categories.
+
+          ── STEP 2: Deduplicate features ────────────────────────────────────
+          Group by (normalised_page_url, feature_type, name). For duplicates across
+          roles, merge details and note which roles have access.
+
+          ── STEP 3: Build CRUD matrix ────────────────────────────────────────
+          Infer entity types from URL patterns (/projects/:id, /users/:id, /tasks/:id).
+          For each entity: note which of Create/Read/Update/Delete/Bulk were found
+          and which roles can perform them.
+
+          Use `workspace_execute_code` to build the matrix if > 10 entity types.
+
+          ── STEP 4: Document each feature ────────────────────────────────────
+          Per feature in Markdown:
+
+          **[Feature Name]**
+          - **Type**: form|table|search|filter|crud|upload|download|settings|report|dashboard
+          - **Page URL(s)**: where it appears
+          - **Accessible to**: anonymous|user|admin|all
+          - **Description**: one sentence
+          - **Inputs**: field names, types, validation rules
+          - **API endpoint**: method + path (from http_history data in crawl_features)
+          - **Business rules**: limits, validation messages, conditionals
+          - **State changes**: what changes after using this feature
+          - **Feature-gated**: yes/no — upgrade prompt observed?
+
+          ── STEP 5: Write reports ────────────────────────────────────────────
+          `workspace_write_file` path="feature-inventory.md"
+          `export_shared_table_csv` table="crawl_features" filename="crawl_features.csv"
+
+          Return the Markdown content as output.
+
+      - name: "user-flows"
+        depends_on:
+          - "crawl-anonymous"
+          - "crawl-user"
+          - "crawl-admin"
+        prompt: |
+          CrawlApplication — PHASE 4: Generate Results → User Flow Map
+
+          ── STEP 1: Read flow data ───────────────────────────────────────────
+          `read_from_shared_table` table="crawl_flows" — all flow rows
+          (from_url, via, to_url, element_type, role) across all roles.
+          `read_from_shared_table` table="crawl_pages" — for page metadata.
+          `read_from_shared_table` table="crawl_meta" — for main_workflows list.
+
+          ── STEP 2: Reconstruct multi-step flows ─────────────────────────────
+          Chain crawl_flows entries where one step's to_url = next step's from_url.
+
+          Identify flow types:
+          1. Authentication flows: register, login, password reset, OAuth
+          2. Core feature flows: trace main_workflows from crawl_meta
+          3. CRUD flows per entity type: list → create → detail → edit → delete
+          4. Settings flows: settings → change → save
+          5. Admin flows: admin-specific multi-step processes
+
+          Use `workspace_execute_code` to chain flows programmatically if
+          there are > 200 flow edges.
+
+          ── STEP 3: Render flows ─────────────────────────────────────────────
+          For each flow:
+
+          **[Flow Name]**
+          - Role: anonymous|user|admin
+          - Trigger: what initiates this flow
+          - Steps:
+            ```
+            Step 1: GET /register
+                    ↓ (fill name, email, password)
+            Step 2: POST /api/auth/register → 201
+                    ↓
+            Step 3: GET /dashboard
+            ```
+          - Exit conditions: success + failure + abandonment points
+
+          ── STEP 4: Flow graph ──────────────────────────────────────────────
+          ```
+          [/] ──(signup)──→ [/register] ──(submit)──→ [/dashboard]
+           └──(login)────→ [/login] ─────(success)──→ [/dashboard]
+          [/dashboard] ──(nav)──→ [/projects] ──(new)──→ [/projects/new]
+          ```
+
+          ── STEP 5: Write reports ────────────────────────────────────────────
+          `workspace_write_file` path="user-flows.md"
+          `export_shared_table_csv` table="crawl_flows" filename="crawl_flows.csv"
+
+          Return the Markdown content as output.
+
+      - name: "coverage-report"
+        depends_on:
+          - "crawl-anonymous"
+          - "crawl-user"
+          - "crawl-admin"
+          - "sitemap"
+          - "feature-inventory"
+          - "user-flows"
+        prompt: |
+          CrawlApplication — PHASE 4: Generate Results → Coverage Report
+
+          ── STEP 1: Read all data ────────────────────────────────────────────
+          `read_from_shared_table` table="crawl_pages"
+          `read_from_shared_table` table="crawl_features"
+          `read_from_shared_table` table="crawl_flows"
+          `read_from_shared_table` table="crawl_sessions"
+          `read_from_shared_table` table="crawl_meta"
+          `list_learnings` — retrieve all learnings saved during the crawl
+          (look for tags: "potential access control issue", "data exposure",
+          "interesting endpoint")
+
+          ── STEP 2: Compute metrics ──────────────────────────────────────────
+          Use `workspace_execute_code` to compute statistics:
+          - Pages by role, access level, status
+          - Features by type, by role
+          - Flows by type, by role
+          - Blocked/capped page counts
+
+          ── STEP 3: Algorithm coverage summary ───────────────────────────────
+
+          **Roles covered**
+          | Role      | Crawled | Pages Visited | Queue Exhausted | Cap Hit |
+          |-----------|---------|---------------|-----------------|---------|
+          | anonymous |         |               |                 |         |
+          | user      |         |               |                 |         |
+          | admin     |         |               |                 |         |
+
+          **Page coverage**
+          - Total unique pages discovered: N
+          - Total unique pages visited: N
+          - Pages blocked (403/401/login wall): N
+          - Pages cap-limited (never visited): N
+
+          **Navigation coverage**
+          | Role | Links | Buttons | Menus | Tabs | Modals | Nav Controls |
+          |------|-------|---------|-------|------|--------|--------------|
+
+          **Feature coverage**
+          | Feature Type | Found | API Endpoints Captured | Interactions Tested |
+          |--------------|-------|------------------------|---------------------|
+          | Forms        |       |                        |                     |
+          | Tables       |       |                        |                     |
+          | Search       |       |                        |                     |
+          | Filters      |       |                        |                     |
+          | CRUD ops     |       |                        |                     |
+          | Uploads      |       |                        |                     |
+          | Downloads    |       |                        |                     |
+          | Settings     |       |                        |                     |
+          | Reports      |       |                        |                     |
+          | Dashboards   |       |                        |                     |
+
+          ── STEP 4: Gaps & limitations ───────────────────────────────────────
+          List everything NOT covered and why:
+          - Auth-blocked sections (no valid session)
+          - CAPTCHA-protected forms (request_browser_handover was called but user
+            returned an unresolved state)
+          - MFA-protected sections (request_human_input OTP timed out)
+          - Email-verification gated features
+          - Plan/feature-gated content (list feature names from list_learnings)
+          - Rate-limited endpoints
+          - JavaScript-heavy sections not reachable via standard navigation
+          - Depth/page cap limits reached
+
+          ── STEP 5: Quality score ────────────────────────────────────────────
+          | Dimension           | Score | Notes |
+          |---------------------|-------|-------|
+          | Page coverage       |  /100 |       |
+          | Feature discovery   |  /100 |       |
+          | Interaction testing |  /100 |       |
+          | Flow completeness   |  /100 |       |
+          | Role coverage       |  /100 |       |
+          | **Overall**         |  /100 |       |
+
+          ── STEP 6: Notable findings from learnings ──────────────────────────
+          List any learnings tagged "potential access control issue", "data
+          exposure", or "interesting endpoint" verbatim — these are the security-
+          relevant observations captured during the crawl.
+
+          ── STEP 7: Recommendations ──────────────────────────────────────────
+          Top 5 actions to improve coverage on the next crawl run, informed by
+          the gaps identified and the learnings saved.
+
+          ── STEP 8: Write final reports ──────────────────────────────────────
+          `workspace_write_file` path="coverage-report.md"
+          `workspace_write_file` path="crawl-summary.json":
+          {
+            "target": "${TARGET_URL}",
+            "domain": "${TARGET_DOMAIN}",
+            "total_pages": N,
+            "total_features": N,
+            "total_flows": N,
+            "roles": ["anonymous", "user", "admin"],
+            "overall_score": N,
+            "reports": [
+              "sitemap.md", "feature-inventory.md", "user-flows.md",
+              "coverage-report.md", "crawl_pages.csv", "crawl_features.csv",
+              "crawl_flows.csv"
+            ]
+          }
+
+          Return the Markdown coverage report as output.

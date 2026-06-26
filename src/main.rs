@@ -14,6 +14,7 @@ mod markdown;
 mod picker;
 mod pulse;
 mod workflow;
+mod remote_wf_tui;
 mod workflow_runner;
 mod workflow_state;
 mod workflow_tui;
@@ -243,6 +244,122 @@ enum WorkflowCmd {
         #[arg(long)]
         no_tui: bool,
     },
+    /// Manage remote workflows via the Strobes GraphQL API.
+    Remote {
+        #[command(subcommand)]
+        sub: RemoteWorkflowCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum RemoteWorkflowCmd {
+    /// List available workflow templates (built-in and custom:).
+    Templates,
+    /// Show the workflow currently attached to a workspace.
+    Status {
+        #[arg(long, short)]
+        workspace: Option<String>,
+    },
+    /// Attach a workflow template to a workspace and start it.
+    Attach {
+        #[arg(long, short)]
+        workspace: Option<String>,
+        /// Template slug, e.g. "web-pentest" or "custom:my-template".
+        /// Omit to pick interactively.
+        #[arg(long, short)]
+        template: Option<String>,
+        /// Set a workflow variable (KEY=VALUE). Repeatable.
+        #[arg(long, short = 'v', value_name = "KEY=VALUE")]
+        var: Vec<String>,
+    },
+    /// Detach (cancel + remove) the workflow from a workspace.
+    Detach {
+        #[arg(long, short)]
+        workspace: Option<String>,
+    },
+    /// Create a new remote workflow from a local YAML file.
+    Create {
+        #[arg(long, short)]
+        workspace: Option<String>,
+        /// Local workflow YAML file to push.
+        #[arg(long, short)]
+        file: String,
+        /// Override a workflow variable (KEY=VALUE). Repeatable.
+        #[arg(long, short = 'v', value_name = "KEY=VALUE")]
+        var: Vec<String>,
+    },
+    /// Edit the existing remote workflow from a local YAML file.
+    /// Not allowed while the workflow is running.
+    Edit {
+        #[arg(long, short)]
+        workspace: Option<String>,
+        /// Local workflow YAML file.
+        #[arg(long, short)]
+        file: String,
+    },
+    /// Smart sync: push a local YAML to remote — creates if none, edits if one exists.
+    Sync {
+        #[arg(long, short)]
+        workspace: Option<String>,
+        /// Local workflow YAML file.
+        #[arg(long, short)]
+        file: String,
+        /// Override a workflow variable (KEY=VALUE). Repeatable.
+        #[arg(long, short = 'v', value_name = "KEY=VALUE")]
+        var: Vec<String>,
+    },
+    /// Save the current remote workflow as a reusable custom template.
+    Save {
+        #[arg(long, short)]
+        workspace: Option<String>,
+        /// Display name for the template (gets a custom: prefix automatically).
+        #[arg(long, short)]
+        name: String,
+        /// Template description.
+        #[arg(long, short = 'd')]
+        description: Option<String>,
+        /// Emoji icon shown next to the template.
+        #[arg(long, short = 'i', default_value = "🔒")]
+        icon: String,
+    },
+    /// Delete a custom workflow template (only custom: slugs can be deleted).
+    DeleteTemplate {
+        /// Template slug, e.g. "custom:my-template".
+        slug: String,
+    },
+    /// Pause the running workflow.
+    Pause {
+        #[arg(long, short)]
+        workspace: Option<String>,
+    },
+    /// Resume a paused workflow.
+    Resume {
+        #[arg(long, short)]
+        workspace: Option<String>,
+    },
+    /// Cancel the running or paused workflow.
+    Cancel {
+        #[arg(long, short)]
+        workspace: Option<String>,
+    },
+    /// Restart the workflow (from the beginning, or from a specific phase).
+    Restart {
+        #[arg(long, short)]
+        workspace: Option<String>,
+        /// Restart from this phase key rather than from the beginning.
+        #[arg(long)]
+        from_phase: Option<String>,
+    },
+    /// Advance past a manual-gate phase.
+    Advance {
+        #[arg(long, short)]
+        workspace: Option<String>,
+    },
+    /// Open a live TUI showing workflow phase status with pause/resume/detach controls.
+    Watch {
+        #[arg(long, short)]
+        workspace: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -407,21 +524,44 @@ async fn resolve_workspace_interactive(
             .cmp(&cfg.workspace_open_count(&a.id))
             .then(cfg.workspace_last_opened(&b.id).cmp(&cfg.workspace_last_opened(&a.id)))
     });
+
+    // Fetch workflow state for every workspace concurrently so we can badge rows.
+    let wf_states: Vec<Option<api::WorkflowState>> = {
+        let futs: Vec<_> = workspaces.iter().map(|w| client.workspace_workflow(&w.id)).collect();
+        futures_util::future::join_all(futs)
+            .await
+            .into_iter()
+            .map(|r| r.ok().flatten())
+            .collect()
+    };
+
     let cur = profile.workspace_id.as_deref();
-    // Item 0 = create new, item 1 = no workspace, then existing workspaces.
+    // Item 0 = create new, item 1 = no workspace, then existing workspaces (offset 2).
     let mut labels = vec![
         "➕  New workspace".to_string(),
         "↪  No workspace (all threads)".to_string(),
     ];
-    for w in &workspaces {
+    for (w, wf) in workspaces.iter().zip(wf_states.iter()) {
         let name = if w.name.is_empty() { "(unnamed)" } else { &w.name };
         let mark = if Some(w.id.as_str()) == cur { "  ✓" } else { "" };
         let count = cfg.workspace_open_count(&w.id);
-        let recent = if count > 0 { format!("  · ↻ recent ×{count}") } else { String::new() };
-        labels.push(format!("{name}   [{}]{mark}{recent}", w.status));
+        let recent = if count > 0 { format!("  · ↻ ×{count}") } else { String::new() };
+        let wf_badge = match wf.as_ref().map(|s| s.status.as_str()) {
+            Some("running") => "  ⚙ running",
+            Some("paused") => "  ⚙ paused",
+            Some("pending") => "  ⚙ pending",
+            Some("failed") => "  ⚙ failed",
+            Some("completed") => "  ⚙ done",
+            _ => "",
+        };
+        labels.push(format!("{name}   [{}]{mark}{recent}{wf_badge}", w.status));
     }
+
+    // Add Tab hint as a context line below the auth banner.
+    let auth_with_hint = format!("{auth}\n↹ Tab on a workspace: open live workflow TUI");
+
     loop {
-        match picker::select_with(terminal, "Select a workspace", &labels, &auth).await? {
+        match picker::select_with(terminal, "Select a workspace", &labels, &auth_with_hint).await? {
             picker::Nav::Item(0) => {
                 // Ask for a name and an optional setup prompt; Esc on the name
                 // cancels back to the picker.
@@ -444,6 +584,16 @@ async fn resolve_workspace_interactive(
             }
             picker::Nav::Item(1) => return Ok(WsChoice::Pick(None)),
             picker::Nav::Item(i) => return Ok(WsChoice::Pick(Some(workspaces[i - 2].id.clone()))),
+            // Tab on a workspace row → open the Watch TUI inline if a workflow exists.
+            picker::Nav::Shortcut(i) if i >= 2 => {
+                let ws = &workspaces[i - 2];
+                if wf_states[i - 2].is_some() {
+                    let _ = remote_wf_tui::run(terminal, &client, ws.id.clone(), profile.clone(), tenant.to_string()).await;
+                    terminal.clear()?;
+                }
+                // Fall through to re-show the workspace picker.
+            }
+            picker::Nav::Shortcut(_) => {} // Tab on "New" / "No workspace" — ignore.
             // Esc on the first screen quits cleanly (no prior screen to return to).
             picker::Nav::Back | picker::Nav::Quit => return Ok(WsChoice::Quit),
         }
@@ -509,7 +659,7 @@ async fn resolve_thread_interactive(
             Ok(ThreadChoice::Pick(id))
         }
         picker::Nav::Item(i) => Ok(ThreadChoice::Pick(threads[i - 1].id.clone())),
-        picker::Nav::Back => Ok(ThreadChoice::Back),
+        picker::Nav::Back | picker::Nav::Shortcut(_) => Ok(ThreadChoice::Back),
         picker::Nav::Quit => Ok(ThreadChoice::Quit),
     }
 }
@@ -544,7 +694,7 @@ async fn cmd_bind(
             .collect();
         match picker::select("Select a workspace", &labels).await? {
             picker::Nav::Item(i) => workspaces[i].id.clone(),
-            picker::Nav::Back | picker::Nav::Quit => return Ok(()),
+            _ => return Ok(()),
         }
     };
 
@@ -2397,6 +2547,7 @@ async fn workspace_overlay_items(
 
 async fn cmd_workflow(profile: config::Profile, sub: WorkflowCmd, tenant: &str) -> Result<()> {
     match sub {
+        WorkflowCmd::Remote { sub } => return cmd_workflow_remote(profile, sub, tenant.to_string()).await,
         WorkflowCmd::Run { file, var, no_tui } => {
             require_complete(&profile)?;
             let def = workflow::load(&file)?;
@@ -2704,6 +2855,470 @@ async fn cmd_workflow(profile: config::Profile, sub: WorkflowCmd, tenant: &str) 
             Ok(())
         }
     }
+}
+
+// ── Remote workflow management (GraphQL API) ─────────────────────────────────
+
+fn resolve_workspace(w: Option<String>, profile: &config::Profile) -> Result<String> {
+    w.or_else(|| profile.workspace_id.clone())
+        .ok_or_else(|| anyhow!("no workspace — pass --workspace <UUID> or run `strobes bind` first"))
+}
+
+/// Like `resolve_workspace` but shows a workspace picker when no workspace is bound.
+/// Returns `None` if the user cancels the picker.
+async fn resolve_workspace_or_pick(
+    workspace: Option<String>,
+    profile: &config::Profile,
+    client: &api::ApiClient,
+) -> Result<Option<String>> {
+    if let Some(w) = workspace.or_else(|| profile.workspace_id.clone()) {
+        return Ok(Some(w));
+    }
+    let workspaces = client.list_workspaces().await?;
+    if workspaces.is_empty() {
+        return Err(anyhow!("no workspaces found — create one with `strobes bind`"));
+    }
+    let labels: Vec<String> = workspaces
+        .iter()
+        .map(|w| format!("{}…  {}", &w.id[..8.min(w.id.len())], w.name))
+        .collect();
+    match picker::select("Select workspace", &labels).await? {
+        picker::Nav::Item(i) => Ok(Some(workspaces[i].id.clone())),
+        _ => Ok(None),
+    }
+}
+
+/// Convert a kebab-case / lower-case name to Title Case words.
+fn title_case(s: &str) -> String {
+    s.replace('-', " ")
+        .replace('_', " ")
+        .split_whitespace()
+        .map(|w| {
+            let mut c = w.chars();
+            match c.next() {
+                None => String::new(),
+                Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Serialise `Vec<PhaseDef>` from a workflow YAML into a GraphQL input literal
+/// suitable for `createCustomWorkflow` / `editCustomWorkflow`.
+fn yaml_to_gql_phases(phases: &[workflow::PhaseDef]) -> String {
+    let phases_str: Vec<String> = phases
+        .iter()
+        .enumerate()
+        .map(|(i, phase)| {
+            let tasks_str: Vec<String> = phase
+                .tasks
+                .iter()
+                .map(|task| {
+                    let instructions = api::gql_string(&task.prompt);
+                    format!(
+                        "{{ key: {}, title: {}, instructions: {}, agentType: \"general\", taskType: \"agent\" }}",
+                        api::gql_string(&task.name),
+                        api::gql_string(&title_case(&task.name)),
+                        instructions
+                    )
+                })
+                .collect();
+            format!(
+                "{{ key: {}, name: {}, order: {i}, gateType: \"all_complete\", failurePolicy: \"continue\", tasks: [{}] }}",
+                api::gql_string(&phase.name),
+                api::gql_string(&title_case(&phase.name)),
+                tasks_str.join(", ")
+            )
+        })
+        .collect();
+    format!("[{}]", phases_str.join(", "))
+}
+
+async fn cmd_workflow_remote(
+    profile: config::Profile,
+    sub: RemoteWorkflowCmd,
+    tenant: String,
+) -> Result<()> {
+    require_complete(&profile)?;
+    let client = api::ApiClient::new(profile.clone())?;
+
+    match sub {
+        RemoteWorkflowCmd::Templates => {
+            let templates = client.workflow_templates().await?;
+            if templates.is_empty() {
+                println!("(no templates available)");
+                return Ok(());
+            }
+            for t in &templates {
+                let req = if t.required_variables.is_empty() {
+                    String::new()
+                } else {
+                    format!("  requires: {}", t.required_variables.join(", "))
+                };
+                println!(
+                    "{} {}  [{}]  {} phases{}",
+                    if t.icon.is_empty() { "•" } else { &t.icon },
+                    t.slug,
+                    t.name,
+                    t.phase_count,
+                    req
+                );
+                if !t.description.is_empty() {
+                    println!("   {}", t.description);
+                }
+                for p in &t.phases {
+                    println!("   {}: {} ({} tasks)", p.order, p.name, p.task_count);
+                }
+                println!();
+            }
+        }
+
+        RemoteWorkflowCmd::Status { workspace } => {
+            let ws = match resolve_workspace_or_pick(workspace, &profile, &client).await? {
+                Some(w) => w,
+                None => return Ok(()),
+            };
+            match client.workspace_workflow(&ws).await? {
+                None => println!("(no workflow attached to workspace {}…)", &ws[..8.min(ws.len())]),
+                Some(wf) => {
+                    println!("workflow  {}", wf.workflow_id);
+                    println!("status    {}", wf.status);
+                    if let Some(slug) = &wf.template_slug {
+                        println!("template  {slug}");
+                    }
+                    if let Some(v) = &wf.template_version {
+                        println!("version   {v}");
+                    }
+                    if let Some(phase) = &wf.current_phase_key {
+                        println!("phase     {phase}");
+                    }
+                    println!("tasks     {}/{}", wf.completed_tasks, wf.total_tasks);
+                    if let Some(s) = &wf.started_at { println!("started   {s}"); }
+                    if let Some(c) = &wf.completed_at { println!("finished  {c}"); }
+                    if !wf.phases.is_empty() {
+                        println!("\nphases:");
+                        for p in &wf.phases {
+                            let cur = if wf.current_phase_key.as_deref() == Some(&p.phase_key) {
+                                " ←"
+                            } else {
+                                ""
+                            };
+                            println!("  {:>12}  {}  {}{cur}", p.status, p.phase_key, p.phase_name);
+                        }
+                    }
+                }
+            }
+        }
+
+        RemoteWorkflowCmd::Attach { workspace, template, var } => {
+            // For attach, always show the workspace picker when --workspace is not
+            // given explicitly — defaulting silently to the bound workspace would
+            // attach to the wrong place without the user realising.
+            let ws = match workspace {
+                Some(w) => w,
+                None => {
+                    let workspaces = client.list_workspaces().await?;
+                    if workspaces.is_empty() {
+                        return Err(anyhow!("no workspaces found — create one with `strobes bind`"));
+                    }
+                    let labels: Vec<String> = workspaces.iter()
+                        .map(|w| format!("{}…  {}", &w.id[..8.min(w.id.len())], w.name))
+                        .collect();
+                    match picker::select("Select workspace", &labels).await? {
+                        picker::Nav::Item(i) => workspaces[i].id.clone(),
+                        _ => return Ok(()),
+                    }
+                }
+            };
+
+            // Fetch templates once — needed for both the picker and required-var lookup.
+            let templates = client.workflow_templates().await?;
+
+            // Resolve template slug and its required variables.
+            let (slug, required_vars) = match template {
+                Some(s) => {
+                    let req = templates.iter()
+                        .find(|t| t.slug == s)
+                        .map(|t| t.required_variables.clone())
+                        .unwrap_or_default();
+                    (s, req)
+                }
+                None => {
+                    if templates.is_empty() {
+                        return Err(anyhow!("no workflow templates available"));
+                    }
+                    let labels: Vec<String> = templates.iter().map(|t| {
+                        let req_hint = if t.required_variables.is_empty() {
+                            String::new()
+                        } else {
+                            format!("  [{}]", t.required_variables.join(", "))
+                        };
+                        format!(
+                            "{} {}  — {}{}",
+                            if t.icon.is_empty() { "•" } else { &t.icon },
+                            t.slug,
+                            t.name,
+                            req_hint,
+                        )
+                    }).collect();
+                    match picker::select("Select a workflow template", &labels).await? {
+                        picker::Nav::Item(i) => {
+                            let t = &templates[i];
+                            (t.slug.clone(), t.required_variables.clone())
+                        }
+                        _ => return Ok(()),
+                    }
+                }
+            };
+
+            // Start with variables supplied via -v flags.
+            let mut vars: std::collections::HashMap<String, String> = var.iter()
+                .filter_map(|kv| {
+                    let mut it = kv.splitn(2, '=');
+                    Some((it.next()?.to_string(), it.next()?.to_string()))
+                })
+                .collect();
+
+            // Prompt for any required variables not yet provided.
+            let missing: Vec<&String> = required_vars.iter()
+                .filter(|k| !vars.contains_key(k.as_str()))
+                .collect();
+            if !missing.is_empty() {
+                println!("  This template requires the following variables:");
+                use std::io::Write;
+                for key in missing {
+                    print!("  {key}: ");
+                    std::io::stdout().flush()?;
+                    let mut line = String::new();
+                    std::io::stdin().read_line(&mut line)?;
+                    let val = line.trim().to_string();
+                    if val.is_empty() {
+                        return Err(anyhow!("variable '{key}' is required and cannot be empty"));
+                    }
+                    vars.insert(key.clone(), val);
+                }
+            }
+
+            let variables: serde_json::Value = vars.iter()
+                .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+                .collect::<serde_json::Map<_, _>>()
+                .into();
+
+            let wf = client.attach_workflow_template(&ws, &slug, &variables).await?;
+            println!("✔ attached '{slug}' to workspace {}…", &ws[..8.min(ws.len())]);
+            println!("  workflow {} [{}]", wf.workflow_id, wf.status);
+        }
+
+        RemoteWorkflowCmd::Detach { workspace } => {
+            let ws = match resolve_workspace_or_pick(workspace, &profile, &client).await? {
+                Some(w) => w,
+                None => return Ok(()),
+            };
+            print!(
+                "detach workflow from workspace {}…? [y/N] ",
+                &ws[..8.min(ws.len())]
+            );
+            use std::io::Write;
+            std::io::stdout().flush()?;
+            let mut line = String::new();
+            std::io::stdin().read_line(&mut line)?;
+            if !line.trim().eq_ignore_ascii_case("y") {
+                println!("cancelled.");
+                return Ok(());
+            }
+            client.detach_workflow(&ws).await?;
+            println!("✔ workflow detached");
+        }
+
+        RemoteWorkflowCmd::Create { workspace, file, var } => {
+            let ws = match resolve_workspace_or_pick(workspace, &profile, &client).await? {
+                Some(w) => w,
+                None => return Ok(()),
+            };
+            let def = workflow::load(&file)?;
+            let phases_gql = yaml_to_gql_phases(&def.phases);
+            let mut vars: serde_json::Map<String, serde_json::Value> = def
+                .variables
+                .iter()
+                .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+                .collect();
+            for kv in &var {
+                let mut it = kv.splitn(2, '=');
+                if let (Some(k), Some(v)) = (it.next(), it.next()) {
+                    vars.insert(k.to_string(), serde_json::Value::String(v.to_string()));
+                }
+            }
+            let vars_json = serde_json::Value::Object(vars);
+            let wf = client
+                .create_custom_workflow(&ws, &def.name, &phases_gql, &vars_json)
+                .await?;
+            let total_tasks: usize = def.phases.iter().map(|p| p.tasks.len()).sum();
+            println!("✔ workflow created: {} [{}]", wf.workflow_id, wf.status);
+            println!(
+                "  {} phases, {total_tasks} tasks from '{file}'",
+                def.phases.len()
+            );
+        }
+
+        RemoteWorkflowCmd::Edit { workspace, file } => {
+            let ws = match resolve_workspace_or_pick(workspace, &profile, &client).await? {
+                Some(w) => w,
+                None => return Ok(()),
+            };
+            let def = workflow::load(&file)?;
+            let phases_gql = yaml_to_gql_phases(&def.phases);
+            let wf = client
+                .edit_custom_workflow(&ws, &def.name, &phases_gql)
+                .await?;
+            println!("✔ workflow updated: {} [{}]", wf.workflow_id, wf.status);
+        }
+
+        RemoteWorkflowCmd::Sync { workspace, file, var } => {
+            let ws = match resolve_workspace_or_pick(workspace, &profile, &client).await? {
+                Some(w) => w,
+                None => return Ok(()),
+            };
+            let def = workflow::load(&file)?;
+            let phases_gql = yaml_to_gql_phases(&def.phases);
+            let mut vars: serde_json::Map<String, serde_json::Value> = def
+                .variables
+                .iter()
+                .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+                .collect();
+            for kv in &var {
+                let mut it = kv.splitn(2, '=');
+                if let (Some(k), Some(v)) = (it.next(), it.next()) {
+                    vars.insert(k.to_string(), serde_json::Value::String(v.to_string()));
+                }
+            }
+            let vars_json = serde_json::Value::Object(vars);
+            match client.workspace_workflow(&ws).await? {
+                None => {
+                    let wf = client
+                        .create_custom_workflow(&ws, &def.name, &phases_gql, &vars_json)
+                        .await?;
+                    println!(
+                        "✔ created workflow from '{file}': {} [{}]",
+                        wf.workflow_id, wf.status
+                    );
+                }
+                Some(wf) if wf.status == "running" => {
+                    return Err(anyhow!(
+                        "workflow {} is currently running — cancel it first before syncing",
+                        wf.workflow_id
+                    ));
+                }
+                Some(existing) => {
+                    let updated = client
+                        .edit_custom_workflow(&ws, &def.name, &phases_gql)
+                        .await?;
+                    println!(
+                        "✔ updated workflow {} from '{file}' [{} → {}]",
+                        existing.workflow_id, existing.status, updated.status
+                    );
+                }
+            }
+        }
+
+        RemoteWorkflowCmd::Save { workspace, name, description, icon } => {
+            let ws = match resolve_workspace_or_pick(workspace, &profile, &client).await? {
+                Some(w) => w,
+                None => return Ok(()),
+            };
+            let slug = client
+                .save_workflow_as_template(
+                    &ws,
+                    &name,
+                    &description.unwrap_or_default(),
+                    &icon,
+                )
+                .await?;
+            println!("✔ saved as template '{slug}'");
+            println!("  use with: strobes workflow remote attach --template {slug}");
+        }
+
+        RemoteWorkflowCmd::DeleteTemplate { slug } => {
+            if !slug.starts_with("custom:") {
+                return Err(anyhow!(
+                    "only custom: templates can be deleted (got '{slug}')"
+                ));
+            }
+            print!("delete template '{slug}'? [y/N] ");
+            use std::io::Write;
+            std::io::stdout().flush()?;
+            let mut line = String::new();
+            std::io::stdin().read_line(&mut line)?;
+            if !line.trim().eq_ignore_ascii_case("y") {
+                println!("cancelled.");
+                return Ok(());
+            }
+            client.delete_custom_workflow_template(&slug).await?;
+            println!("✔ deleted template '{slug}'");
+        }
+
+        RemoteWorkflowCmd::Pause { workspace } => {
+            let ws = match resolve_workspace_or_pick(workspace, &profile, &client).await? {
+                Some(w) => w,
+                None => return Ok(()),
+            };
+            client.pause_workflow(&ws).await?;
+            println!("✔ workflow paused");
+        }
+        RemoteWorkflowCmd::Resume { workspace } => {
+            let ws = match resolve_workspace_or_pick(workspace, &profile, &client).await? {
+                Some(w) => w,
+                None => return Ok(()),
+            };
+            client.resume_workflow(&ws).await?;
+            println!("✔ workflow resumed");
+        }
+        RemoteWorkflowCmd::Cancel { workspace } => {
+            let ws = match resolve_workspace_or_pick(workspace, &profile, &client).await? {
+                Some(w) => w,
+                None => return Ok(()),
+            };
+            client.cancel_workflow(&ws).await?;
+            println!("✔ workflow cancelled");
+        }
+        RemoteWorkflowCmd::Restart { workspace, from_phase } => {
+            let ws = match resolve_workspace_or_pick(workspace, &profile, &client).await? {
+                Some(w) => w,
+                None => return Ok(()),
+            };
+            match from_phase {
+                Some(phase_key) => {
+                    client.restart_workflow_from_phase(&ws, &phase_key).await?;
+                    println!("✔ workflow restarted from phase '{phase_key}'");
+                }
+                None => {
+                    client.restart_workflow(&ws).await?;
+                    println!("✔ workflow restarted");
+                }
+            }
+        }
+        RemoteWorkflowCmd::Advance { workspace } => {
+            let ws = match resolve_workspace_or_pick(workspace, &profile, &client).await? {
+                Some(w) => w,
+                None => return Ok(()),
+            };
+            client.advance_workflow_phase(&ws).await?;
+            println!("✔ phase advanced");
+        }
+        RemoteWorkflowCmd::Watch { workspace } => {
+            let ws = match resolve_workspace_or_pick(workspace, &profile, &client).await? {
+                Some(w) => w,
+                None => return Ok(()),
+            };
+            let mut terminal = ratatui::init();
+            enable_mouse();
+            let r = remote_wf_tui::run(&mut terminal, &client, ws, profile.clone(), tenant.to_string()).await;
+            disable_mouse();
+            ratatui::restore();
+            r?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
