@@ -55,6 +55,8 @@ pub struct Thread {
     pub last_message: String,
     #[serde(default)]
     pub workspace_id: Option<String>,
+    #[serde(default)]
+    pub created_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -395,6 +397,401 @@ impl ApiClient {
     /// Cheap auth/connectivity check.
     pub async fn ping(&self) -> Result<()> {
         self.list_workspaces().await.map(|_| ())
+    }
+
+    // ── GraphQL (workflow API) ────────────────────────────────────────────────
+
+    fn graphql_url(&self) -> String {
+        format!("{}/api/graphql/", self.profile.base_url.trim_end_matches('/'))
+    }
+
+    /// POST a GraphQL query/mutation to /api/graphql/ using Bearer auth.
+    /// Returns the `data` object from the response, or errors on HTTP failure
+    /// or a non-empty `errors` array.
+    pub async fn graphql(&self, query: &str) -> Result<serde_json::Value> {
+        let url = self.graphql_url();
+        let body = serde_json::json!({ "query": query });
+        let resp = self
+            .http
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", self.profile.master_key))
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(anyhow!(
+                "GraphQL HTTP {}: {}",
+                status.as_u16(),
+                trunc(&text, 300)
+            ));
+        }
+        let val: serde_json::Value = serde_json::from_str(&text)
+            .map_err(|e| anyhow!("GraphQL parse error: {e}: {}", trunc(&text, 200)))?;
+        if let Some(errors) = val.get("errors") {
+            let nonempty = errors
+                .as_array()
+                .map(|a| !a.is_empty())
+                .unwrap_or(!errors.is_null());
+            if nonempty {
+                let msg = errors
+                    .as_array()
+                    .and_then(|a| a.first())
+                    .and_then(|e| e.get("message"))
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("unknown GraphQL error");
+                return Err(anyhow!("GraphQL error: {msg}"));
+            }
+        }
+        Ok(val.get("data").cloned().unwrap_or(val))
+    }
+
+    // ── Queries ───────────────────────────────────────────────────────────────
+
+    pub async fn workflow_templates(&self) -> Result<Vec<WorkflowTemplate>> {
+        let q = r#"query {
+            workflowTemplates {
+                slug name description icon version phaseCount requiredVariables
+                phases { key name order taskCount }
+            }
+        }"#;
+        let data = self.graphql(q).await?;
+        let arr = data.get("workflowTemplates").cloned().unwrap_or_default();
+        Ok(serde_json::from_value(arr).unwrap_or_default())
+    }
+
+    pub async fn workspace_workflow(
+        &self,
+        workspace_id: &str,
+    ) -> Result<Option<WorkflowState>> {
+        let q = format!(
+            r#"query {{
+                workspaceWorkflow(workspaceId: "{workspace_id}") {{
+                    workflowId templateSlug templateVersion status currentPhaseKey
+                    totalTasks completedTasks startedAt completedAt
+                    phases {{ phaseKey phaseName order status startedAt completedAt }}
+                }}
+            }}"#
+        );
+        let data = self.graphql(&q).await?;
+        let v = data
+            .get("workspaceWorkflow")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        if v.is_null() {
+            return Ok(None);
+        }
+        Ok(serde_json::from_value(v).ok())
+    }
+
+    // ── Template mutations ────────────────────────────────────────────────────
+
+    pub async fn attach_workflow_template(
+        &self,
+        workspace_id: &str,
+        template_slug: &str,
+        variables: &serde_json::Value,
+    ) -> Result<WorkflowState> {
+        let vars_gql = json_to_gql_input(variables);
+        let q = format!(
+            r#"mutation {{
+                attachWorkflowTemplate(
+                    workspaceId: "{workspace_id}"
+                    templateSlug: "{template_slug}"
+                    variables: {vars_gql}
+                ) {{
+                    workflow {{ workflowId status }}
+                }}
+            }}"#
+        );
+        let data = self.graphql(&q).await?;
+        let wf = data
+            .pointer("/attachWorkflowTemplate/workflow")
+            .cloned()
+            .unwrap_or_default();
+        Ok(serde_json::from_value(wf).unwrap_or_default())
+    }
+
+    pub async fn create_custom_workflow(
+        &self,
+        workspace_id: &str,
+        name: &str,
+        phases_gql: &str,
+        variables: &serde_json::Value,
+    ) -> Result<WorkflowState> {
+        let vars_gql = json_to_gql_input(variables);
+        let name_esc = name.replace('"', "\\\"");
+        let q = format!(
+            r#"mutation {{
+                createCustomWorkflow(
+                    workspaceId: "{workspace_id}"
+                    name: "{name_esc}"
+                    phases: {phases_gql}
+                    variables: {vars_gql}
+                ) {{
+                    workflow {{ workflowId status }}
+                }}
+            }}"#
+        );
+        let data = self.graphql(&q).await?;
+        let wf = data
+            .pointer("/createCustomWorkflow/workflow")
+            .cloned()
+            .unwrap_or_default();
+        Ok(serde_json::from_value(wf).unwrap_or_default())
+    }
+
+    pub async fn edit_custom_workflow(
+        &self,
+        workspace_id: &str,
+        name: &str,
+        phases_gql: &str,
+    ) -> Result<WorkflowState> {
+        let name_esc = name.replace('"', "\\\"");
+        let q = format!(
+            r#"mutation {{
+                editCustomWorkflow(
+                    workspaceId: "{workspace_id}"
+                    name: "{name_esc}"
+                    phases: {phases_gql}
+                ) {{
+                    workflow {{ workflowId status }}
+                }}
+            }}"#
+        );
+        let data = self.graphql(&q).await?;
+        let wf = data
+            .pointer("/editCustomWorkflow/workflow")
+            .cloned()
+            .unwrap_or_default();
+        Ok(serde_json::from_value(wf).unwrap_or_default())
+    }
+
+    pub async fn save_workflow_as_template(
+        &self,
+        workspace_id: &str,
+        name: &str,
+        description: &str,
+        icon: &str,
+    ) -> Result<String> {
+        let name_esc = name.replace('"', "\\\"");
+        let desc_esc = description.replace('"', "\\\"");
+        let icon_esc = icon.replace('"', "\\\"");
+        let q = format!(
+            r#"mutation {{
+                saveWorkflowAsTemplate(
+                    workspaceId: "{workspace_id}"
+                    name: "{name_esc}"
+                    description: "{desc_esc}"
+                    icon: "{icon_esc}"
+                ) {{
+                    templateSlug success
+                }}
+            }}"#
+        );
+        let data = self.graphql(&q).await?;
+        Ok(data
+            .pointer("/saveWorkflowAsTemplate/templateSlug")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string())
+    }
+
+    pub async fn delete_custom_workflow_template(&self, template_slug: &str) -> Result<bool> {
+        let q = format!(
+            r#"mutation {{
+                deleteCustomWorkflowTemplate(templateSlug: "{template_slug}") {{ success }}
+            }}"#
+        );
+        let data = self.graphql(&q).await?;
+        Ok(data
+            .pointer("/deleteCustomWorkflowTemplate/success")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false))
+    }
+
+    // ── Execution control mutations ───────────────────────────────────────────
+
+    pub async fn pause_workflow(&self, workspace_id: &str) -> Result<()> {
+        let q = format!(
+            r#"mutation {{ pauseWorkflow(workspaceId: "{workspace_id}") {{ success }} }}"#
+        );
+        self.graphql(&q).await?;
+        Ok(())
+    }
+
+    pub async fn resume_workflow(&self, workspace_id: &str) -> Result<()> {
+        let q = format!(
+            r#"mutation {{ resumeWorkflow(workspaceId: "{workspace_id}") {{ success }} }}"#
+        );
+        self.graphql(&q).await?;
+        Ok(())
+    }
+
+    pub async fn cancel_workflow(&self, workspace_id: &str) -> Result<()> {
+        let q = format!(
+            r#"mutation {{ cancelWorkflow(workspaceId: "{workspace_id}") {{ success }} }}"#
+        );
+        self.graphql(&q).await?;
+        Ok(())
+    }
+
+    pub async fn restart_workflow(&self, workspace_id: &str) -> Result<()> {
+        let q = format!(
+            r#"mutation {{ restartWorkflow(workspaceId: "{workspace_id}") {{ success }} }}"#
+        );
+        self.graphql(&q).await?;
+        Ok(())
+    }
+
+    pub async fn restart_workflow_from_phase(
+        &self,
+        workspace_id: &str,
+        phase_key: &str,
+    ) -> Result<()> {
+        let q = format!(
+            r#"mutation {{
+                restartWorkflowFromPhase(workspaceId: "{workspace_id}" phaseKey: "{phase_key}") {{ success }}
+            }}"#
+        );
+        self.graphql(&q).await?;
+        Ok(())
+    }
+
+    pub async fn advance_workflow_phase(&self, workspace_id: &str) -> Result<()> {
+        let q = format!(
+            r#"mutation {{ advanceWorkflowPhase(workspaceId: "{workspace_id}") {{ success }} }}"#
+        );
+        self.graphql(&q).await?;
+        Ok(())
+    }
+
+    pub async fn detach_workflow(&self, workspace_id: &str) -> Result<()> {
+        let q = format!(
+            r#"mutation {{ detachWorkflow(workspaceId: "{workspace_id}") {{ success }} }}"#
+        );
+        self.graphql(&q).await?;
+        Ok(())
+    }
+}
+
+// ── GraphQL type structs ──────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct WorkflowTemplate {
+    #[serde(default)]
+    pub slug: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub icon: String,
+    #[serde(default)]
+    pub version: String,
+    #[serde(default, rename = "phaseCount")]
+    pub phase_count: i64,
+    #[serde(default, rename = "requiredVariables")]
+    pub required_variables: Vec<String>,
+    #[serde(default)]
+    pub phases: Vec<WorkflowTemplatePhase>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct WorkflowTemplatePhase {
+    #[serde(default)]
+    pub key: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub order: i64,
+    #[serde(default, rename = "taskCount")]
+    pub task_count: i64,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct WorkflowState {
+    #[serde(default, rename = "workflowId")]
+    pub workflow_id: String,
+    #[serde(default, rename = "templateSlug")]
+    pub template_slug: Option<String>,
+    #[serde(default, rename = "templateVersion")]
+    pub template_version: Option<String>,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default, rename = "currentPhaseKey")]
+    pub current_phase_key: Option<String>,
+    #[serde(default, rename = "totalTasks")]
+    pub total_tasks: i64,
+    #[serde(default, rename = "completedTasks")]
+    pub completed_tasks: i64,
+    #[serde(default, rename = "startedAt")]
+    pub started_at: Option<String>,
+    #[serde(default, rename = "completedAt")]
+    pub completed_at: Option<String>,
+    #[serde(default)]
+    pub phases: Vec<WorkflowStatePhase>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct WorkflowStatePhase {
+    #[serde(default, rename = "phaseKey")]
+    pub phase_key: String,
+    #[serde(default, rename = "phaseName")]
+    pub phase_name: String,
+    #[serde(default)]
+    pub order: i64,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default, rename = "startedAt")]
+    pub started_at: Option<String>,
+    #[serde(default, rename = "completedAt")]
+    pub completed_at: Option<String>,
+}
+
+// ── GraphQL input literal serialisation ──────────────────────────────────────
+
+/// Recursively convert a `serde_json::Value` to an inline GraphQL input literal.
+/// Strings are serialized with proper escaping (block strings for multi-line content).
+pub fn json_to_gql_input(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::Object(map) if map.is_empty() => "{}".to_string(),
+        serde_json::Value::Object(map) => {
+            let pairs: Vec<String> = map
+                .iter()
+                .map(|(k, v)| format!("{k}: {}", json_to_gql_input(v)))
+                .collect();
+            format!("{{ {} }}", pairs.join(", "))
+        }
+        serde_json::Value::Array(arr) => {
+            let items: Vec<String> = arr.iter().map(json_to_gql_input).collect();
+            format!("[{}]", items.join(", "))
+        }
+        serde_json::Value::String(s) => gql_string(s),
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::Bool(b) => b.to_string(),
+        serde_json::Value::Null => "null".to_string(),
+    }
+}
+
+/// Encode a string as a GraphQL string literal.
+/// Uses block strings (`"""..."""`) for multi-line or special-char content
+/// to avoid character-by-character escaping; falls back to regular escaping
+/// when the content itself contains `"""`.
+pub fn gql_string(s: &str) -> String {
+    if s.contains("\"\"\"") {
+        // Block strings can't contain """; fall back to regular escaped string.
+        let escaped = s
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n")
+            .replace('\r', "\\r")
+            .replace('\t', "\\t");
+        format!("\"{escaped}\"")
+    } else {
+        format!("\"\"\"{}\"\"\"", s)
     }
 }
 

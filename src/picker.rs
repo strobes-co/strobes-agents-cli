@@ -20,6 +20,9 @@ pub enum Nav {
     Back,
     /// The user pressed ^C or the input stream ended (quit the app).
     Quit,
+    /// The user pressed Tab while item at this index was highlighted.
+    /// Callers that don't handle shortcuts should treat this as `Back`.
+    Shortcut(usize),
 }
 
 /// Show a selectable list on its own terminal (enters/leaves the alternate
@@ -103,7 +106,7 @@ pub async fn select_with(
                 .highlight_symbol("➤ ");
             f.render_stateful_widget(list, list_area, &mut state);
             f.render_widget(
-                Paragraph::new(" type to search · ↑/↓ move · Enter select · Esc back · ^C quit")
+                Paragraph::new(" type to search · ↑/↓ move · Enter select · Tab shortcut · Esc back · ^C quit")
                     .style(Style::default().fg(Color::DarkGray)),
                 chunks[1],
             );
@@ -119,6 +122,11 @@ pub async fn select_with(
                     KeyCode::Enter => {
                         if let Some(&orig) = visible.get(state.selected().unwrap_or(0)) {
                             break Nav::Item(orig);
+                        }
+                    }
+                    KeyCode::Tab => {
+                        if let Some(&orig) = visible.get(state.selected().unwrap_or(0)) {
+                            break Nav::Shortcut(orig);
                         }
                     }
                     KeyCode::Esc => break Nav::Back,
