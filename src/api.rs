@@ -401,85 +401,56 @@ impl ApiClient {
 
     // ── GraphQL (workflow API) ────────────────────────────────────────────────
 
-    fn graphql_url(&self) -> String {
-        format!("{}/api/graphql/", self.profile.base_url.trim_end_matches('/'))
-    }
-
-    /// POST a GraphQL query/mutation to /api/graphql/ using Bearer auth.
-    /// Returns the `data` object from the response, or errors on HTTP failure
-    /// or a non-empty `errors` array.
-    pub async fn graphql(&self, query: &str) -> Result<serde_json::Value> {
-        let url = self.graphql_url();
-        let body = serde_json::json!({ "query": query });
+    /// PATCH JSON to a REST path (MasterKey token auth). Returns the parsed body.
+    async fn patch_json(&self, path: &str, body: serde_json::Value) -> Result<serde_json::Value> {
+        let url = self.url(path)?;
         let resp = self
             .http
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", self.profile.master_key))
-            .header("Content-Type", "application/json")
+            .patch(&url)
+            .header("Authorization", format!("token {}", self.profile.master_key))
+            .header("Accept", "application/json")
             .json(&body)
             .send()
             .await?;
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
         if !status.is_success() {
-            return Err(anyhow!(
-                "GraphQL HTTP {}: {}",
-                status.as_u16(),
-                trunc(&text, 300)
-            ));
+            return Err(anyhow!("PATCH {path} -> HTTP {}: {}", status.as_u16(), trunc(&text, 300)));
         }
-        let val: serde_json::Value = serde_json::from_str(&text)
-            .map_err(|e| anyhow!("GraphQL parse error: {e}: {}", trunc(&text, 200)))?;
-        if let Some(errors) = val.get("errors") {
-            let nonempty = errors
-                .as_array()
-                .map(|a| !a.is_empty())
-                .unwrap_or(!errors.is_null());
-            if nonempty {
-                let msg = errors
-                    .as_array()
-                    .and_then(|a| a.first())
-                    .and_then(|e| e.get("message"))
-                    .and_then(|m| m.as_str())
-                    .unwrap_or("unknown GraphQL error");
-                return Err(anyhow!("GraphQL error: {msg}"));
-            }
+        Ok(serde_json::from_str(&text).unwrap_or(serde_json::Value::Null))
+    }
+
+    /// DELETE a REST path (MasterKey token auth). Returns the parsed body.
+    async fn delete_req(&self, path: &str) -> Result<serde_json::Value> {
+        let url = self.url(path)?;
+        let resp = self
+            .http
+            .delete(&url)
+            .header("Authorization", format!("token {}", self.profile.master_key))
+            .header("Accept", "application/json")
+            .send()
+            .await?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(anyhow!("DELETE {path} -> HTTP {}: {}", status.as_u16(), trunc(&text, 300)));
         }
-        Ok(val.get("data").cloned().unwrap_or(val))
+        Ok(serde_json::from_str(&text).unwrap_or(serde_json::Value::Null))
     }
 
     // ── Queries ───────────────────────────────────────────────────────────────
 
     pub async fn workflow_templates(&self) -> Result<Vec<WorkflowTemplate>> {
-        let q = r#"query {
-            workflowTemplates {
-                slug name description icon version phaseCount requiredVariables
-                phases { key name order taskCount }
-            }
-        }"#;
-        let data = self.graphql(q).await?;
-        let arr = data.get("workflowTemplates").cloned().unwrap_or_default();
-        Ok(serde_json::from_value(arr).unwrap_or_default())
+        let v = self.get_json(&self.org_path("/cli/workflow-templates/")).await?;
+        Ok(serde_json::from_value(v).unwrap_or_default())
     }
 
     pub async fn workspace_workflow(
         &self,
         workspace_id: &str,
     ) -> Result<Option<WorkflowState>> {
-        let q = format!(
-            r#"query {{
-                workspaceWorkflow(workspaceId: "{workspace_id}") {{
-                    workflowId templateSlug templateVersion status currentPhaseKey
-                    totalTasks completedTasks startedAt completedAt
-                    phases {{ phaseKey phaseName order status startedAt completedAt }}
-                }}
-            }}"#
-        );
-        let data = self.graphql(&q).await?;
-        let v = data
-            .get("workspaceWorkflow")
-            .cloned()
-            .unwrap_or(serde_json::Value::Null);
+        let path = self.org_path(&format!("/cli/workspaces/{workspace_id}/workflow/"));
+        let v = self.get_json(&path).await?;
         if v.is_null() {
             return Ok(None);
         }
@@ -494,79 +465,45 @@ impl ApiClient {
         template_slug: &str,
         variables: &serde_json::Value,
     ) -> Result<WorkflowState> {
-        let vars_gql = json_to_gql_input(variables);
-        let q = format!(
-            r#"mutation {{
-                attachWorkflowTemplate(
-                    workspaceId: "{workspace_id}"
-                    templateSlug: "{template_slug}"
-                    variables: {vars_gql}
-                ) {{
-                    workflow {{ workflowId status }}
-                }}
-            }}"#
-        );
-        let data = self.graphql(&q).await?;
-        let wf = data
-            .pointer("/attachWorkflowTemplate/workflow")
-            .cloned()
-            .unwrap_or_default();
-        Ok(serde_json::from_value(wf).unwrap_or_default())
+        let path = self.org_path(&format!("/cli/workspaces/{workspace_id}/workflow/"));
+        let body = serde_json::json!({
+            "template_slug": template_slug,
+            "variables": variables,
+        });
+        let data = self.post_json(&path, body).await?;
+        Ok(serde_json::from_value(data).unwrap_or_default())
     }
 
     pub async fn create_custom_workflow(
         &self,
         workspace_id: &str,
         name: &str,
-        phases_gql: &str,
+        phases: &serde_json::Value,
         variables: &serde_json::Value,
     ) -> Result<WorkflowState> {
-        let vars_gql = json_to_gql_input(variables);
-        let name_esc = name.replace('"', "\\\"");
-        let q = format!(
-            r#"mutation {{
-                createCustomWorkflow(
-                    workspaceId: "{workspace_id}"
-                    name: "{name_esc}"
-                    phases: {phases_gql}
-                    variables: {vars_gql}
-                ) {{
-                    workflow {{ workflowId status }}
-                }}
-            }}"#
-        );
-        let data = self.graphql(&q).await?;
-        let wf = data
-            .pointer("/createCustomWorkflow/workflow")
-            .cloned()
-            .unwrap_or_default();
-        Ok(serde_json::from_value(wf).unwrap_or_default())
+        let path = self.org_path(&format!("/cli/workspaces/{workspace_id}/workflow/"));
+        let body = serde_json::json!({
+            "name": name,
+            "phases": phases,
+            "variables": variables,
+        });
+        let data = self.post_json(&path, body).await?;
+        Ok(serde_json::from_value(data).unwrap_or_default())
     }
 
     pub async fn edit_custom_workflow(
         &self,
         workspace_id: &str,
         name: &str,
-        phases_gql: &str,
+        phases: &serde_json::Value,
     ) -> Result<WorkflowState> {
-        let name_esc = name.replace('"', "\\\"");
-        let q = format!(
-            r#"mutation {{
-                editCustomWorkflow(
-                    workspaceId: "{workspace_id}"
-                    name: "{name_esc}"
-                    phases: {phases_gql}
-                ) {{
-                    workflow {{ workflowId status }}
-                }}
-            }}"#
-        );
-        let data = self.graphql(&q).await?;
-        let wf = data
-            .pointer("/editCustomWorkflow/workflow")
-            .cloned()
-            .unwrap_or_default();
-        Ok(serde_json::from_value(wf).unwrap_or_default())
+        let path = self.org_path(&format!("/cli/workspaces/{workspace_id}/workflow/"));
+        let body = serde_json::json!({
+            "name": name,
+            "phases": phases,
+        });
+        let data = self.patch_json(&path, body).await?;
+        Ok(serde_json::from_value(data).unwrap_or_default())
     }
 
     pub async fn save_workflow_as_template(
@@ -576,74 +513,61 @@ impl ApiClient {
         description: &str,
         icon: &str,
     ) -> Result<String> {
-        let name_esc = name.replace('"', "\\\"");
-        let desc_esc = description.replace('"', "\\\"");
-        let icon_esc = icon.replace('"', "\\\"");
-        let q = format!(
-            r#"mutation {{
-                saveWorkflowAsTemplate(
-                    workspaceId: "{workspace_id}"
-                    name: "{name_esc}"
-                    description: "{desc_esc}"
-                    icon: "{icon_esc}"
-                ) {{
-                    templateSlug success
-                }}
-            }}"#
-        );
-        let data = self.graphql(&q).await?;
+        let path = self.org_path(&format!(
+            "/cli/workspaces/{workspace_id}/workflow/save-as-template/"
+        ));
+        let body = serde_json::json!({
+            "name": name,
+            "description": description,
+            "icon": icon,
+        });
+        let data = self.post_json(&path, body).await?;
         Ok(data
-            .pointer("/saveWorkflowAsTemplate/templateSlug")
+            .get("templateSlug")
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string())
     }
 
     pub async fn delete_custom_workflow_template(&self, template_slug: &str) -> Result<bool> {
-        let q = format!(
-            r#"mutation {{
-                deleteCustomWorkflowTemplate(templateSlug: "{template_slug}") {{ success }}
-            }}"#
-        );
-        let data = self.graphql(&q).await?;
+        let path = self.org_path(&format!("/cli/workflow-templates/{template_slug}/"));
+        let data = self.delete_req(&path).await?;
         Ok(data
-            .pointer("/deleteCustomWorkflowTemplate/success")
+            .get("success")
             .and_then(|v| v.as_bool())
             .unwrap_or(false))
     }
 
     // ── Execution control mutations ───────────────────────────────────────────
 
-    pub async fn pause_workflow(&self, workspace_id: &str) -> Result<()> {
-        let q = format!(
-            r#"mutation {{ pauseWorkflow(workspaceId: "{workspace_id}") {{ success }} }}"#
-        );
-        self.graphql(&q).await?;
+    /// POST a workflow control action (pause/resume/cancel/restart/advance/...).
+    async fn workflow_action(
+        &self,
+        workspace_id: &str,
+        action: &str,
+        body: serde_json::Value,
+    ) -> Result<()> {
+        let path = self.org_path(&format!(
+            "/cli/workspaces/{workspace_id}/workflow/{action}/"
+        ));
+        self.post_json(&path, body).await?;
         Ok(())
+    }
+
+    pub async fn pause_workflow(&self, workspace_id: &str) -> Result<()> {
+        self.workflow_action(workspace_id, "pause", serde_json::json!({})).await
     }
 
     pub async fn resume_workflow(&self, workspace_id: &str) -> Result<()> {
-        let q = format!(
-            r#"mutation {{ resumeWorkflow(workspaceId: "{workspace_id}") {{ success }} }}"#
-        );
-        self.graphql(&q).await?;
-        Ok(())
+        self.workflow_action(workspace_id, "resume", serde_json::json!({})).await
     }
 
     pub async fn cancel_workflow(&self, workspace_id: &str) -> Result<()> {
-        let q = format!(
-            r#"mutation {{ cancelWorkflow(workspaceId: "{workspace_id}") {{ success }} }}"#
-        );
-        self.graphql(&q).await?;
-        Ok(())
+        self.workflow_action(workspace_id, "cancel", serde_json::json!({})).await
     }
 
     pub async fn restart_workflow(&self, workspace_id: &str) -> Result<()> {
-        let q = format!(
-            r#"mutation {{ restartWorkflow(workspaceId: "{workspace_id}") {{ success }} }}"#
-        );
-        self.graphql(&q).await?;
-        Ok(())
+        self.workflow_action(workspace_id, "restart", serde_json::json!({})).await
     }
 
     pub async fn restart_workflow_from_phase(
@@ -651,28 +575,21 @@ impl ApiClient {
         workspace_id: &str,
         phase_key: &str,
     ) -> Result<()> {
-        let q = format!(
-            r#"mutation {{
-                restartWorkflowFromPhase(workspaceId: "{workspace_id}" phaseKey: "{phase_key}") {{ success }}
-            }}"#
-        );
-        self.graphql(&q).await?;
-        Ok(())
+        self.workflow_action(
+            workspace_id,
+            "restart-from-phase",
+            serde_json::json!({ "phase_key": phase_key }),
+        )
+        .await
     }
 
     pub async fn advance_workflow_phase(&self, workspace_id: &str) -> Result<()> {
-        let q = format!(
-            r#"mutation {{ advanceWorkflowPhase(workspaceId: "{workspace_id}") {{ success }} }}"#
-        );
-        self.graphql(&q).await?;
-        Ok(())
+        self.workflow_action(workspace_id, "advance", serde_json::json!({})).await
     }
 
     pub async fn detach_workflow(&self, workspace_id: &str) -> Result<()> {
-        let q = format!(
-            r#"mutation {{ detachWorkflow(workspaceId: "{workspace_id}") {{ success }} }}"#
-        );
-        self.graphql(&q).await?;
+        let path = self.org_path(&format!("/cli/workspaces/{workspace_id}/workflow/"));
+        self.delete_req(&path).await?;
         Ok(())
     }
 }
