@@ -2906,33 +2906,35 @@ fn title_case(s: &str) -> String {
 
 /// Serialise `Vec<PhaseDef>` from a workflow YAML into a GraphQL input literal
 /// suitable for `createCustomWorkflow` / `editCustomWorkflow`.
-fn yaml_to_gql_phases(phases: &[workflow::PhaseDef]) -> String {
-    let phases_str: Vec<String> = phases
+fn phases_to_json(phases: &[workflow::PhaseDef]) -> serde_json::Value {
+    let arr: Vec<serde_json::Value> = phases
         .iter()
         .enumerate()
         .map(|(i, phase)| {
-            let tasks_str: Vec<String> = phase
+            let tasks: Vec<serde_json::Value> = phase
                 .tasks
                 .iter()
                 .map(|task| {
-                    let instructions = api::gql_string(&task.prompt);
-                    format!(
-                        "{{ key: {}, title: {}, instructions: {}, agentType: \"general\", taskType: \"agent\" }}",
-                        api::gql_string(&task.name),
-                        api::gql_string(&title_case(&task.name)),
-                        instructions
-                    )
+                    serde_json::json!({
+                        "key": task.name,
+                        "title": title_case(&task.name),
+                        "instructions": task.prompt,
+                        "agentType": "general",
+                        "taskType": "agent",
+                    })
                 })
                 .collect();
-            format!(
-                "{{ key: {}, name: {}, order: {i}, gateType: \"all_complete\", failurePolicy: \"continue\", tasks: [{}] }}",
-                api::gql_string(&phase.name),
-                api::gql_string(&title_case(&phase.name)),
-                tasks_str.join(", ")
-            )
+            serde_json::json!({
+                "key": phase.name,
+                "name": title_case(&phase.name),
+                "order": i,
+                "gateType": "all_complete",
+                "failurePolicy": "continue",
+                "tasks": tasks,
+            })
         })
         .collect();
-    format!("[{}]", phases_str.join(", "))
+    serde_json::Value::Array(arr)
 }
 
 async fn cmd_workflow_remote(
@@ -3137,7 +3139,7 @@ async fn cmd_workflow_remote(
                 None => return Ok(()),
             };
             let def = workflow::load(&file)?;
-            let phases_gql = yaml_to_gql_phases(&def.phases);
+            let phases_json = phases_to_json(&def.phases);
             let mut vars: serde_json::Map<String, serde_json::Value> = def
                 .variables
                 .iter()
@@ -3151,7 +3153,7 @@ async fn cmd_workflow_remote(
             }
             let vars_json = serde_json::Value::Object(vars);
             let wf = client
-                .create_custom_workflow(&ws, &def.name, &phases_gql, &vars_json)
+                .create_custom_workflow(&ws, &def.name, &phases_json, &vars_json)
                 .await?;
             let total_tasks: usize = def.phases.iter().map(|p| p.tasks.len()).sum();
             println!("✔ workflow created: {} [{}]", wf.workflow_id, wf.status);
@@ -3167,9 +3169,9 @@ async fn cmd_workflow_remote(
                 None => return Ok(()),
             };
             let def = workflow::load(&file)?;
-            let phases_gql = yaml_to_gql_phases(&def.phases);
+            let phases_json = phases_to_json(&def.phases);
             let wf = client
-                .edit_custom_workflow(&ws, &def.name, &phases_gql)
+                .edit_custom_workflow(&ws, &def.name, &phases_json)
                 .await?;
             println!("✔ workflow updated: {} [{}]", wf.workflow_id, wf.status);
         }
@@ -3180,7 +3182,7 @@ async fn cmd_workflow_remote(
                 None => return Ok(()),
             };
             let def = workflow::load(&file)?;
-            let phases_gql = yaml_to_gql_phases(&def.phases);
+            let phases_json = phases_to_json(&def.phases);
             let mut vars: serde_json::Map<String, serde_json::Value> = def
                 .variables
                 .iter()
@@ -3196,7 +3198,7 @@ async fn cmd_workflow_remote(
             match client.workspace_workflow(&ws).await? {
                 None => {
                     let wf = client
-                        .create_custom_workflow(&ws, &def.name, &phases_gql, &vars_json)
+                        .create_custom_workflow(&ws, &def.name, &phases_json, &vars_json)
                         .await?;
                     println!(
                         "✔ created workflow from '{file}': {} [{}]",
@@ -3211,7 +3213,7 @@ async fn cmd_workflow_remote(
                 }
                 Some(existing) => {
                     let updated = client
-                        .edit_custom_workflow(&ws, &def.name, &phases_gql)
+                        .edit_custom_workflow(&ws, &def.name, &phases_json)
                         .await?;
                     println!(
                         "✔ updated workflow {} from '{file}' [{} → {}]",
