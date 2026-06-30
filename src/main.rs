@@ -210,6 +210,32 @@ enum Cmd {
         /// LLM model picker id.
         #[arg(long, short)]
         model: Option<i64>,
+        /// Output format: text (default) or json.
+        #[arg(long, default_value = "text", value_name = "FORMAT")]
+        output: String,
+        /// Do not prompt for human input on interrupts; fail immediately instead (CI-safe).
+        #[arg(long)]
+        non_interactive: bool,
+        /// Abort after this many seconds if the agent has not finished.
+        #[arg(long, value_name = "SECS")]
+        timeout: Option<u64>,
+        /// Exit 1 if any findings at or above this severity exist after the run
+        /// (critical, high, medium, low).
+        #[arg(long, value_name = "SEVERITY")]
+        fail_on_findings: Option<String>,
+    },
+    /// List or export workspace findings (JSON / SARIF for CI integration).
+    Findings {
+        /// Workspace to query (defaults to the bound workspace).
+        #[arg(long, short)]
+        workspace: Option<String>,
+        /// Output format: text (default), json, or sarif.
+        #[arg(long, default_value = "text", value_name = "FORMAT")]
+        format: String,
+        /// Exit 1 if any findings at or above this severity exist
+        /// (critical, high, medium, low).
+        #[arg(long, value_name = "SEVERITY")]
+        fail_on: Option<String>,
     },
 }
 
@@ -225,6 +251,19 @@ enum WorkflowCmd {
         /// Print events to stdout instead of opening the TUI.
         #[arg(long)]
         no_tui: bool,
+        /// Do not prompt for missing variables; fail if any are unset (CI-safe).
+        #[arg(long)]
+        non_interactive: bool,
+        /// Load workflow variables from a JSON file ({"KEY": "VALUE"} map).
+        #[arg(long, value_name = "FILE")]
+        var_file: Option<String>,
+        /// Abort after this many seconds if the workflow has not finished.
+        #[arg(long, value_name = "SECS")]
+        timeout: Option<u64>,
+        /// Exit 1 if any findings at or above this severity exist after the
+        /// workflow completes (critical, high, medium, low).
+        #[arg(long, value_name = "SEVERITY")]
+        fail_on_findings: Option<String>,
     },
     /// List workflow YAML files (.yaml/.yml with phases:) in the current directory.
     List,
@@ -406,8 +445,11 @@ async fn main() -> Result<()> {
         }
         Cmd::Probe { thread, send, secs, model } => cmd_probe(&profile, &thread, send, secs, model).await,
         Cmd::Workflow { sub } => cmd_workflow(profile, sub, &tenant).await,
-        Cmd::Send { message, workspace, new_workspace, title, model } => {
-            cmd_send(&profile, message, workspace, new_workspace, title, model).await
+        Cmd::Send { message, workspace, new_workspace, title, model, output, non_interactive, timeout, fail_on_findings } => {
+            cmd_send(&profile, message, workspace, new_workspace, title, model, &output, non_interactive, timeout, fail_on_findings).await
+        }
+        Cmd::Findings { workspace, format, fail_on } => {
+            cmd_findings(&profile, workspace, &format, fail_on).await
         }
     }
 }
@@ -1008,9 +1050,10 @@ async fn cmd_probe(p: &config::Profile, thread_id: &str, send: Option<String>, s
 
 /// Create a new thread, send one message, stream the response to stdout.
 ///
-/// Tokens are printed inline (no trailing newline until a natural one arrives),
-/// tool events are prefixed with ▶ / ◀ / ✗, and the process exits cleanly on
-/// `RunFinished`. `Interrupt` events prompt the user interactively.
+/// Tokens are printed inline, tool events are prefixed with ▶/◀/✗, and the
+/// process exits with a non-zero code on agent errors or interrupt in
+/// non-interactive mode. Pass `--output json` for machine-readable output.
+#[allow(clippy::too_many_arguments)]
 async fn cmd_send(
     p: &config::Profile,
     message: String,
@@ -1018,11 +1061,14 @@ async fn cmd_send(
     new_workspace: Option<String>,
     title: Option<String>,
     model: Option<i64>,
+    output_fmt: &str,
+    non_interactive: bool,
+    timeout_secs: Option<u64>,
+    fail_on_findings: Option<String>,
 ) -> Result<()> {
     require_complete(p)?;
     let client = api::ApiClient::new(p.clone())?;
 
-    // Resolve workspace: prefer explicit --workspace, then create one if --new-workspace given.
     let workspace_id: Option<String> = match (workspace, new_workspace) {
         (Some(ws), _) => Some(ws),
         (None, Some(name)) => {
@@ -1035,126 +1081,155 @@ async fn cmd_send(
 
     let thread_title = title.unwrap_or_else(|| {
         let truncated: String = message.chars().take(60).collect();
-        if message.chars().count() > 60 {
-            format!("{truncated}…")
-        } else {
-            truncated
-        }
+        if message.chars().count() > 60 { format!("{truncated}…") } else { truncated }
     });
 
-    let thread_id = client
-        .create_thread(&thread_title, workspace_id.as_deref())
-        .await?;
+    let thread_id = client.create_thread(&thread_title, workspace_id.as_deref()).await?;
     eprintln!("thread: {thread_id}");
 
     let (tx, mut rx) = mpsc::unbounded_channel::<pulse::AppEvent>();
     let handle = pulse::connect(p, &thread_id, tx, model).await?;
     handle.send_user_message(&message);
 
+    let json_mode = output_fmt == "json";
+    let mut json_text = String::new();
+    let mut json_tools: Vec<serde_json::Value> = Vec::new();
+    let mut json_status = "success".to_string();
+    let mut json_error: Option<String> = None;
+
+    let deadline = timeout_secs
+        .map(|s| tokio::time::Instant::now() + std::time::Duration::from_secs(s));
+
     let mut needs_newline = false;
-    loop {
-        match rx.recv().await {
-            None => {
-                if needs_newline {
-                    println!();
+    let run_result: Result<()> = loop {
+        let ev_opt = if let Some(dl) = deadline {
+            tokio::select! {
+                _ = tokio::time::sleep_until(dl) => {
+                    json_status = "timeout".into();
+                    json_error = Some(format!("timed out after {}s", timeout_secs.unwrap_or(0)));
+                    if !json_mode {
+                        if needs_newline { println!(); }
+                        eprintln!("error: timed out after {}s", timeout_secs.unwrap_or(0));
+                    }
+                    break Err(anyhow!("timed out after {}s", timeout_secs.unwrap_or(0)));
                 }
-                break;
+                ev = rx.recv() => ev,
+            }
+        } else {
+            rx.recv().await
+        };
+
+        match ev_opt {
+            None => {
+                if !json_mode && needs_newline { println!(); }
+                break Ok(());
             }
             Some(ev) => match ev {
                 pulse::AppEvent::RunFinished(_) => {
-                    if needs_newline {
-                        println!();
-                    }
-                    break;
+                    if !json_mode && needs_newline { println!(); }
+                    break Ok(());
                 }
                 pulse::AppEvent::Stream(item) => match item.kind.as_str() {
                     "token" => {
                         if let Some(text) = &item.text {
-                            print!("{text}");
-                            let _ = std::io::Write::flush(&mut std::io::stdout());
-                            needs_newline = !text.ends_with('\n');
+                            if json_mode {
+                                json_text.push_str(text);
+                            } else {
+                                print!("{text}");
+                                let _ = std::io::Write::flush(&mut std::io::stdout());
+                                needs_newline = !text.ends_with('\n');
+                            }
                         }
                     }
                     "thinking" => {
                         if let Some(text) = &item.text {
-                            if needs_newline {
-                                println!();
-                                needs_newline = false;
+                            if !json_mode {
+                                if needs_newline { println!(); needs_newline = false; }
+                                println!("💭 {text}");
                             }
-                            println!("💭 {text}");
                         }
                     }
                     "tool_start" => {
-                        if needs_newline {
-                            println!();
-                            needs_newline = false;
-                        }
-                        let name = item.tool_name.as_deref().unwrap_or("?");
-                        let detail = item.detail.as_deref().unwrap_or("");
-                        if detail.is_empty() {
-                            println!("▶ {name}");
+                        let name = item.tool_name.as_deref().unwrap_or("?").to_string();
+                        let detail = item.detail.as_deref().unwrap_or("").to_string();
+                        if json_mode {
+                            json_tools.push(serde_json::json!({
+                                "name": name, "status": "running", "detail": detail
+                            }));
                         } else {
-                            println!("▶ {name}({detail})");
+                            if needs_newline { println!(); needs_newline = false; }
+                            if detail.is_empty() { println!("▶ {name}"); } else { println!("▶ {name}({detail})"); }
                         }
                     }
                     "tool_output" => {
-                        if needs_newline {
-                            println!();
-                            needs_newline = false;
-                        }
-                        let name = item.tool_name.as_deref().unwrap_or("?");
-                        let detail = item.detail.as_deref().unwrap_or("");
-                        if !detail.is_empty() {
-                            println!("◀ {name}: {detail}");
+                        let name = item.tool_name.as_deref().unwrap_or("?").to_string();
+                        let detail = item.detail.as_deref().unwrap_or("").to_string();
+                        if json_mode {
+                            if let Some(last) = json_tools.iter_mut().rev().find(|t| t["name"] == name && t["status"] == "running") {
+                                last["status"] = serde_json::Value::String("done".into());
+                                last["output"] = serde_json::Value::String(detail);
+                            }
+                        } else {
+                            if needs_newline { println!(); needs_newline = false; }
+                            if !detail.is_empty() { println!("◀ {name}: {detail}"); }
                         }
                     }
                     "tool_failed" => {
-                        if needs_newline {
-                            println!();
-                            needs_newline = false;
+                        let name = item.tool_name.as_deref().unwrap_or("?").to_string();
+                        let err = item.detail.as_deref().unwrap_or("error").to_string();
+                        if json_mode {
+                            if let Some(last) = json_tools.iter_mut().rev().find(|t| t["name"] == name && t["status"] == "running") {
+                                last["status"] = serde_json::Value::String("failed".into());
+                                last["error"] = serde_json::Value::String(err);
+                            }
+                        } else {
+                            if needs_newline { println!(); needs_newline = false; }
+                            println!("✗ {name}: {err}");
                         }
-                        let name = item.tool_name.as_deref().unwrap_or("?");
-                        let err = item.detail.as_deref().unwrap_or("error");
-                        println!("✗ {name}: {err}");
                     }
                     "note" | "system" => {
-                        if needs_newline {
-                            println!();
-                            needs_newline = false;
-                        }
                         if let Some(text) = &item.text {
-                            println!("ℹ {text}");
+                            if !json_mode {
+                                if needs_newline { println!(); needs_newline = false; }
+                                println!("ℹ {text}");
+                            }
                         }
                     }
                     _ => {
                         if let Some(text) = &item.text {
-                            print!("{text}");
-                            let _ = std::io::Write::flush(&mut std::io::stdout());
-                            needs_newline = !text.ends_with('\n');
+                            if json_mode {
+                                json_text.push_str(text);
+                            } else {
+                                print!("{text}");
+                                let _ = std::io::Write::flush(&mut std::io::stdout());
+                                needs_newline = !text.ends_with('\n');
+                            }
                         }
                     }
                 },
                 pulse::AppEvent::Error(e) => {
-                    if needs_newline {
-                        println!();
-                        needs_newline = false;
+                    json_status = "error".into();
+                    json_error = Some(e.clone());
+                    if !json_mode {
+                        if needs_newline { println!(); needs_newline = false; }
+                        eprintln!("error: {e}");
                     }
-                    eprintln!("error: {e}");
-                    break;
+                    break Err(anyhow!("agent error: {e}"));
                 }
-                pulse::AppEvent::Interrupt {
-                    id,
-                    title,
-                    message: msg,
-                    fields,
-                } => {
-                    if needs_newline {
-                        println!();
-                        needs_newline = false;
+                pulse::AppEvent::Interrupt { id, title, message: msg, fields } => {
+                    if non_interactive {
+                        json_status = "interrupted".into();
+                        json_error = Some(format!("agent requested human input: {title}"));
+                        if !json_mode {
+                            if needs_newline { println!(); needs_newline = false; }
+                            eprintln!("error: agent requested human input ({title}) — re-run interactively or suppress with --non-interactive");
+                        }
+                        break Err(anyhow!("agent requested human input in non-interactive mode: {title}"));
                     }
-                    println!("\n[interrupt] {title}");
-                    if !msg.is_empty() {
-                        println!("{msg}");
+                    if !json_mode {
+                        if needs_newline { println!(); needs_newline = false; }
+                        println!("\n[interrupt] {title}");
+                        if !msg.is_empty() { println!("{msg}"); }
                     }
                     let mut resp = serde_json::Map::new();
                     for f in &fields {
@@ -1167,7 +1242,169 @@ async fn cmd_send(
                 _ => {}
             },
         }
+    };
+
+    if json_mode {
+        let obj = serde_json::json!({
+            "thread_id": thread_id,
+            "workspace_id": workspace_id,
+            "status": json_status,
+            "text": json_text,
+            "tools": json_tools,
+            "error": json_error,
+        });
+        println!("{}", serde_json::to_string_pretty(&obj)?);
     }
+
+    // Propagate any run-level error before checking findings.
+    run_result?;
+
+    // --fail-on-findings: fetch findings and gate on severity threshold.
+    if let (Some(threshold), Some(ws)) = (&fail_on_findings, &workspace_id) {
+        let level = severity_level(threshold);
+        let findings = client.list_workspace_findings(ws).await.unwrap_or_default();
+        let matching: Vec<_> = findings.iter()
+            .filter(|f| severity_level(&f.severity_label) >= level)
+            .collect();
+        if !matching.is_empty() {
+            eprintln!("findings: {} finding(s) at or above '{threshold}' severity", matching.len());
+            for f in &matching {
+                eprintln!("  [{}] {}", f.severity_label, f.title);
+            }
+            return Err(anyhow!("{} finding(s) at or above '{}' severity — failing build", matching.len(), threshold));
+        }
+    }
+
+    Ok(())
+}
+
+/// Map a Strobes severity label to a numeric level for threshold comparisons.
+fn severity_level(label: &str) -> u8 {
+    match label.to_lowercase().as_str() {
+        "critical" => 4,
+        "high" => 3,
+        "medium" => 2,
+        "low" => 1,
+        _ => 0,
+    }
+}
+
+/// Emit findings as a SARIF 2.1.0 JSON string for GitHub Code Scanning.
+fn findings_to_sarif(findings: &[api::Finding], workspace_id: &str) -> Result<String> {
+    let rules: Vec<serde_json::Value> = findings.iter().map(|f| {
+        serde_json::json!({
+            "id": format!("STROBES-{}", f.id),
+            "shortDescription": { "text": f.title },
+            "properties": { "severity": f.severity_label },
+        })
+    }).collect();
+
+    let results: Vec<serde_json::Value> = findings.iter().map(|f| {
+        let level = match f.severity_label.to_lowercase().as_str() {
+            "critical" | "high" => "error",
+            "medium" => "warning",
+            "low" => "note",
+            _ => "none",
+        };
+        let body = if f.description.is_empty() {
+            f.title.clone()
+        } else {
+            format!("{}\n\n{}", f.title, f.description)
+        };
+        serde_json::json!({
+            "ruleId": format!("STROBES-{}", f.id),
+            "level": level,
+            "message": { "text": body },
+            "locations": [{
+                "physicalLocation": {
+                    "artifactLocation": {
+                        "uri": f.asset.as_deref().unwrap_or("unknown"),
+                        "uriBaseId": "%SRCROOT%",
+                    }
+                }
+            }],
+            "properties": {
+                "severity": f.severity_label,
+                "state": f.state_label,
+                "cvss": f.cvss,
+            }
+        })
+    }).collect();
+
+    let sarif = serde_json::json!({
+        "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
+        "version": "2.1.0",
+        "runs": [{
+            "tool": {
+                "driver": {
+                    "name": "Strobes Security Assessment",
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "informationUri": "https://strobes.co",
+                    "rules": rules,
+                }
+            },
+            "results": results,
+            "automationDetails": {
+                "id": format!("strobes/workspace/{workspace_id}"),
+            }
+        }]
+    });
+
+    Ok(serde_json::to_string_pretty(&sarif)?)
+}
+
+/// List or export workspace findings (text / JSON / SARIF).
+async fn cmd_findings(
+    p: &config::Profile,
+    workspace: Option<String>,
+    format: &str,
+    fail_on: Option<String>,
+) -> Result<()> {
+    require_complete(p)?;
+    let ws = workspace
+        .or_else(|| p.workspace_id.clone())
+        .ok_or_else(|| anyhow!("no workspace — pass --workspace <UUID> or run `strobes bind` first"))?;
+    let client = api::ApiClient::new(p.clone())?;
+    let findings = client.list_workspace_findings(&ws).await?;
+
+    match format {
+        "json" => {
+            let arr: Vec<serde_json::Value> = findings.iter().map(|f| serde_json::json!({
+                "id": f.id,
+                "title": f.title,
+                "severity": f.severity_label,
+                "state": f.state_label,
+                "cvss": f.cvss,
+                "asset": f.asset,
+                "description": f.description,
+                "mitigation": f.mitigation,
+            })).collect();
+            println!("{}", serde_json::to_string_pretty(&serde_json::Value::Array(arr))?);
+        }
+        "sarif" => {
+            println!("{}", findings_to_sarif(&findings, &ws)?);
+        }
+        _ => {
+            if findings.is_empty() {
+                println!("(no findings in workspace {}…)", &ws[..8.min(ws.len())]);
+            } else {
+                println!("{} finding(s) in workspace {}…:", findings.len(), &ws[..8.min(ws.len())]);
+                for f in &findings {
+                    let cvss = f.cvss.map(|c| format!(" CVSS:{c:.1}")).unwrap_or_default();
+                    println!("  [{}] {}{} · {}", f.severity_label, f.title, cvss, f.state_label);
+                }
+            }
+        }
+    }
+
+    if let Some(threshold) = &fail_on {
+        let level = severity_level(threshold);
+        let count = findings.iter().filter(|f| severity_level(&f.severity_label) >= level).count();
+        if count > 0 {
+            return Err(anyhow!("{count} finding(s) at or above '{threshold}' severity"));
+        }
+    }
+
     Ok(())
 }
 
@@ -2548,7 +2785,7 @@ async fn workspace_overlay_items(
 async fn cmd_workflow(profile: config::Profile, sub: WorkflowCmd, tenant: &str) -> Result<()> {
     match sub {
         WorkflowCmd::Remote { sub } => return cmd_workflow_remote(profile, sub, tenant.to_string()).await,
-        WorkflowCmd::Run { file, var, no_tui } => {
+        WorkflowCmd::Run { file, var, no_tui, non_interactive, var_file, timeout, fail_on_findings } => {
             require_complete(&profile)?;
             let def = workflow::load(&file)?;
             let abs_file = std::path::Path::new(&file)
@@ -2556,7 +2793,19 @@ async fn cmd_workflow(profile: config::Profile, sub: WorkflowCmd, tenant: &str) 
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_else(|_| file.clone());
 
-            // Vars explicitly set via -v flags take priority.
+            // Vars from --var-file (JSON map) are loaded first (lowest priority).
+            let mut file_vars: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+            if let Some(ref vf) = var_file {
+                let raw = std::fs::read_to_string(vf)
+                    .map_err(|e| anyhow!("cannot read var-file '{vf}': {e}"))?;
+                let map: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&raw)
+                    .map_err(|e| anyhow!("var-file '{vf}' must be a JSON object: {e}"))?;
+                for (k, v) in map {
+                    file_vars.insert(k, v.as_str().unwrap_or_default().to_string());
+                }
+            }
+
+            // Vars explicitly set via -v flags take priority over var-file.
             let cli_vars: std::collections::HashMap<String, String> = var
                 .iter()
                 .filter_map(|kv| {
@@ -2565,9 +2814,11 @@ async fn cmd_workflow(profile: config::Profile, sub: WorkflowCmd, tenant: &str) 
                 })
                 .collect();
 
-            // ── Interactive variable prompting ───────────────────────────────
-            // Print a brief workflow summary, then prompt for every variable
-            // that wasn't already supplied via -v, showing its YAML default.
+            // Merge: file_vars < cli_vars
+            let mut extra_vars = file_vars;
+            extra_vars.extend(cli_vars);
+
+            // Print a brief workflow summary.
             let total_tasks: usize = def.phases.iter().map(|p| p.tasks.len()).sum();
             println!(
                 "\n  Workflow : {}\n  Phases   : {}  |  Tasks: {}",
@@ -2579,17 +2830,22 @@ async fn cmd_workflow(profile: config::Profile, sub: WorkflowCmd, tenant: &str) 
                 println!("  {}", def.description);
             }
 
-            let mut extra_vars = cli_vars;
             if !def.variables.is_empty() {
                 let mut keys: Vec<&String> = def.variables.keys().collect();
                 keys.sort();
                 let all_provided = keys.iter().all(|k| extra_vars.contains_key(*k));
+                if !all_provided && non_interactive {
+                    let missing: Vec<&String> = keys.iter().filter(|k| !extra_vars.contains_key(k.as_str())).copied().collect();
+                    return Err(anyhow!(
+                        "missing required workflow variable(s): {} — pass with -v KEY=VALUE or --var-file",
+                        missing.iter().map(|k| k.as_str()).collect::<Vec<_>>().join(", ")
+                    ));
+                }
                 if !all_provided {
                     println!("\n  Variables (Enter to keep default):");
                 }
                 for k in keys {
                     if extra_vars.contains_key(k) {
-                        // Already set via -v; echo so the user sees the final value.
                         println!("  {k} = {}", extra_vars[k]);
                         continue;
                     }
@@ -2624,24 +2880,46 @@ async fn cmd_workflow(profile: config::Profile, sub: WorkflowCmd, tenant: &str) 
                 });
                 let mut rx = ev_rx;
                 let mut failed = false;
-                while let Some(ev) = rx.recv().await {
+                let mut any_tasks_failed = false;
+                let mut run_workspace_id: Option<String> = None;
+                let deadline = timeout.map(|s| tokio::time::Instant::now() + std::time::Duration::from_secs(s));
+                loop {
+                    let ev_opt = if let Some(dl) = deadline {
+                        tokio::select! {
+                            _ = tokio::time::sleep_until(dl) => {
+                                runner.abort();
+                                eprintln!("error: workflow timed out after {}s", timeout.unwrap_or(0));
+                                return Err(anyhow!("workflow timed out after {}s", timeout.unwrap_or(0)));
+                            }
+                            ev = rx.recv() => ev,
+                        }
+                    } else {
+                        rx.recv().await
+                    };
+                    let ev = match ev_opt {
+                        None => break,
+                        Some(e) => e,
+                    };
                     use workflow_runner::WfEvent::*;
                     match &ev {
                         Log(m) => println!("{m}"),
-                        WorkspaceReady { id, name } => println!("workspace: {name} [{id}]"),
+                        WorkspaceReady { id, name } => {
+                            run_workspace_id = Some(id.clone());
+                            println!("workspace: {name} [{id}]");
+                        }
                         SetupStarted { thread_id } => {
                             println!("▶ workspace-setup ({}…)", &thread_id[..8.min(thread_id.len())])
                         }
                         PhaseStarted { phase } => println!("▶ phase: {phase}"),
                         TaskStarted { task, thread_id, .. } => {
-                            println!(
-                                "▶ {task} ({}…)",
-                                &thread_id[..8.min(thread_id.len())]
-                            )
+                            println!("▶ {task} ({}…)", &thread_id[..8.min(thread_id.len())])
                         }
-                        TaskOutput { task, text } => println!("[{task}] {text}"),
+                        TaskOutput { task, text } => print!("[{task}] {text}"),
                         TaskDone { task } => println!("✔ {task}"),
-                        TaskFailed { task, reason } => println!("✗ {task}: {reason}"),
+                        TaskFailed { task, reason } => {
+                            println!("✗ {task}: {reason}");
+                            any_tasks_failed = true;
+                        }
                         TaskSkipped { task } => println!("↷ {task} (skipped)"),
                         WorkflowDone => println!("✔ workflow complete"),
                         WorkflowFailed { reason } => {
@@ -2653,6 +2931,25 @@ async fn cmd_workflow(profile: config::Profile, sub: WorkflowCmd, tenant: &str) 
                 let _ = runner.await;
                 if failed {
                     return Err(anyhow!("workflow failed"));
+                }
+                if any_tasks_failed {
+                    return Err(anyhow!("one or more workflow tasks failed"));
+                }
+                // --fail-on-findings check after successful workflow completion.
+                if let (Some(threshold), Some(ws)) = (&fail_on_findings, &run_workspace_id) {
+                    let client = api::ApiClient::new(profile.clone())?;
+                    let threshold_level = severity_level(threshold);
+                    let findings = client.list_workspace_findings(ws).await.unwrap_or_default();
+                    let matching: Vec<_> = findings.iter()
+                        .filter(|f| severity_level(&f.severity_label) >= threshold_level)
+                        .collect();
+                    if !matching.is_empty() {
+                        eprintln!("findings: {} finding(s) at or above '{threshold}' severity", matching.len());
+                        for f in &matching {
+                            eprintln!("  [{}] {}", f.severity_label, f.title);
+                        }
+                        return Err(anyhow!("{} finding(s) at or above '{}' severity — failing build", matching.len(), threshold));
+                    }
                 }
             } else {
                 // TUI mode — one terminal instance shared with any drill-down chat views.
@@ -3217,7 +3514,7 @@ async fn cmd_workflow_remote(
                         .await?;
                     println!(
                         "✔ updated workflow {} from '{file}' [{} → {}]",
-                        existing.workflow_id, existing.status, updated.status
+                        updated.workflow_id, existing.status, updated.status
                     );
                 }
             }
