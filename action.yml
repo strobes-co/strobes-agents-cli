@@ -1,0 +1,180 @@
+name: 'Strobes Security Assessment'
+description: 'Run a Strobes AI security assessment in your CI/CD pipeline'
+author: 'Strobes Security'
+
+branding:
+  icon: 'shield'
+  color: 'red'
+
+inputs:
+  base-url:
+    description: 'Strobes deployment base URL (e.g. https://app.strobes.co)'
+    required: true
+  org-id:
+    description: 'Strobes organization UUID'
+    required: true
+  master-key:
+    description: 'Strobes master API key'
+    required: true
+  workflow-file:
+    description: 'Path to a local workflow YAML file to run (mutually exclusive with message)'
+    required: false
+    default: ''
+  message:
+    description: 'One-shot assessment prompt sent via `strobes send` (used when workflow-file is not set)'
+    required: false
+    default: ''
+  workspace:
+    description: 'Existing workspace UUID to run the assessment in'
+    required: false
+    default: ''
+  vars:
+    description: 'Workflow variables as newline-separated KEY=VALUE pairs'
+    required: false
+    default: ''
+  var-file:
+    description: 'Path to a JSON file of workflow variables ({"KEY": "VALUE"})'
+    required: false
+    default: ''
+  fail-on-findings:
+    description: 'Fail the job if findings at or above this severity exist (critical, high, medium, low)'
+    required: false
+    default: ''
+  timeout:
+    description: 'Maximum seconds to wait for the assessment to complete (0 = no limit)'
+    required: false
+    default: '3600'
+  output-format:
+    description: 'Output format: text, json, or sarif (sarif also uploads to GitHub Code Scanning)'
+    required: false
+    default: 'text'
+  upload-sarif:
+    description: 'Upload SARIF results to GitHub Code Scanning (requires output-format: sarif and workspace set)'
+    required: false
+    default: 'false'
+  version:
+    description: 'strobes CLI version to install, e.g. v0.6.0 (default: latest)'
+    required: false
+    default: 'latest'
+
+outputs:
+  thread-id:
+    description: 'The Strobes thread ID created for this assessment run'
+    value: ${{ steps.run-assessment.outputs.thread-id }}
+  workspace-id:
+    description: 'The Strobes workspace ID used for this assessment'
+    value: ${{ steps.run-assessment.outputs.workspace-id }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Install strobes CLI
+      shell: bash
+      run: |
+        set -e
+        VERSION="${{ inputs.version }}"
+        OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+        ARCH=$(uname -m)
+
+        case "$OS/$ARCH" in
+          linux/x86_64)  TARGET="x86_64-unknown-linux-gnu"  ;;
+          darwin/arm64)  TARGET="aarch64-apple-darwin"       ;;
+          darwin/x86_64) TARGET="x86_64-apple-darwin"       ;;
+          *)
+            echo "Unsupported platform: $OS/$ARCH"
+            exit 1
+            ;;
+        esac
+
+        if [ "$VERSION" = "latest" ]; then
+          URL="https://github.com/strobes-co/strobes-agents-cli/releases/latest/download/strobes-${TARGET}.tar.gz"
+        else
+          URL="https://github.com/strobes-co/strobes-agents-cli/releases/download/${VERSION}/strobes-${TARGET}.tar.gz"
+        fi
+
+        echo "Downloading strobes ${VERSION} (${TARGET})..."
+        curl -fsSL "$URL" -o /tmp/strobes.tar.gz
+        mkdir -p /tmp/strobes-install
+        tar -xzf /tmp/strobes.tar.gz -C /tmp/strobes-install
+        # Binary lives inside strobes-<target>/ subdirectory
+        find /tmp/strobes-install -name strobes -type f -exec install -m 755 {} /usr/local/bin/strobes \;
+        rm -rf /tmp/strobes.tar.gz /tmp/strobes-install
+        strobes --version
+
+    - name: Run security assessment
+      id: run-assessment
+      shell: bash
+      env:
+        STROBES_AI_BASE_URL: ${{ inputs.base-url }}
+        STROBES_AI_ORG_ID: ${{ inputs.org-id }}
+        STROBES_AI_MASTER_KEY: ${{ inputs.master-key }}
+        STROBES_AI_NOTIFY: 'off'
+      run: |
+        set -e
+
+        WORKFLOW_FILE="${{ inputs.workflow-file }}"
+        MESSAGE="${{ inputs.message }}"
+        WORKSPACE="${{ inputs.workspace }}"
+        FAIL_ON="${{ inputs.fail-on-findings }}"
+        TIMEOUT="${{ inputs.timeout }}"
+        OUTPUT_FMT="${{ inputs.output-format }}"
+        VAR_FILE="${{ inputs.var-file }}"
+
+        if [ -n "$WORKSPACE" ]; then
+          export STROBES_AI_WORKSPACE_ID="$WORKSPACE"
+        fi
+
+        if [ -n "$WORKFLOW_FILE" ]; then
+          CMD="strobes workflow run $WORKFLOW_FILE --no-tui --non-interactive"
+          # Append -v flags from multiline vars input
+          while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            CMD="$CMD -v $(printf '%q' "$line")"
+          done <<< "${{ inputs.vars }}"
+          [ -n "$VAR_FILE" ]  && CMD="$CMD --var-file $VAR_FILE"
+          [ -n "$FAIL_ON" ]   && CMD="$CMD --fail-on-findings $FAIL_ON"
+          [ "$TIMEOUT" != "0" ] && CMD="$CMD --timeout $TIMEOUT"
+
+          eval $CMD
+
+        elif [ -n "$MESSAGE" ]; then
+          CMD="strobes send $(printf '%q' "$MESSAGE") --non-interactive"
+          [ -n "$WORKSPACE" ] && CMD="$CMD --workspace $WORKSPACE"
+          [ -n "$FAIL_ON" ]   && CMD="$CMD --fail-on-findings $FAIL_ON"
+          [ "$TIMEOUT" != "0" ] && CMD="$CMD --timeout $TIMEOUT"
+          [ "$OUTPUT_FMT" != "text" ] && CMD="$CMD --output $OUTPUT_FMT"
+
+          OUTPUT=$(eval $CMD)
+          echo "$OUTPUT"
+
+          # Extract thread-id from stderr (strobes prints "thread: <id>" to stderr)
+          THREAD_ID=$(eval $CMD 2>&1 1>/dev/null | grep '^thread:' | awk '{print $2}' || true)
+          echo "thread-id=$THREAD_ID" >> "$GITHUB_OUTPUT"
+          echo "workspace-id=$WORKSPACE" >> "$GITHUB_OUTPUT"
+
+        else
+          echo "::error::Either 'workflow-file' or 'message' input is required"
+          exit 1
+        fi
+
+    - name: Export findings as SARIF
+      if: ${{ inputs.output-format == 'sarif' && inputs.workspace != '' }}
+      shell: bash
+      env:
+        STROBES_AI_BASE_URL: ${{ inputs.base-url }}
+        STROBES_AI_ORG_ID: ${{ inputs.org-id }}
+        STROBES_AI_MASTER_KEY: ${{ inputs.master-key }}
+      run: |
+        set -e
+        FAIL_ON="${{ inputs.fail-on-findings }}"
+        CMD="strobes findings --workspace ${{ inputs.workspace }} --format sarif"
+        [ -n "$FAIL_ON" ] && CMD="$CMD --fail-on $FAIL_ON"
+        eval $CMD > strobes-findings.sarif
+        echo "SARIF written to strobes-findings.sarif"
+
+    - name: Upload SARIF to GitHub Code Scanning
+      if: ${{ inputs.upload-sarif == 'true' && inputs.output-format == 'sarif' && inputs.workspace != '' }}
+      uses: github/codeql-action/upload-sarif@v3
+      with:
+        sarif_file: strobes-findings.sarif
+        category: strobes-security-assessment
