@@ -1,0 +1,64 @@
+# Example: run a Strobes security assessment on every PR targeting main.
+# Copy this file into your application repo and configure the inputs below.
+#
+# Required repository secrets:
+#   STROBES_BASE_URL   — e.g. https://app.strobes.co
+#   STROBES_ORG_ID     — your organization UUID
+#   STROBES_MASTER_KEY — your 40-char master key
+
+name: Security Assessment
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Target URL or hostname to assess'
+        required: true
+      severity_threshold:
+        description: 'Fail on findings at or above this severity (critical/high/medium/low)'
+        required: false
+        default: 'high'
+
+permissions:
+  contents: read
+  security-events: write  # required for SARIF upload to Code Scanning
+
+jobs:
+  security-assessment:
+    name: Strobes Security Assessment
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ── Option A: run a local workflow YAML file ──────────────────────────
+      - name: Run webapp pentest workflow
+        uses: strobes-co/strobes-agents-cli@main
+        with:
+          base-url: ${{ secrets.STROBES_BASE_URL }}
+          org-id: ${{ secrets.STROBES_ORG_ID }}
+          master-key: ${{ secrets.STROBES_MASTER_KEY }}
+          workflow-file: workflows/webapp-pentest.yaml
+          vars: |
+            TARGET=${{ github.event.inputs.target || 'https://staging.example.com' }}
+            SEVERITY_THRESHOLD=${{ github.event.inputs.severity_threshold || 'high' }}
+          fail-on-findings: ${{ github.event.inputs.severity_threshold || 'high' }}
+          timeout: '3600'
+          output-format: sarif
+          upload-sarif: 'true'
+
+      # ── Option B: one-shot prompt (comment out Option A to use this) ──────
+      # - name: Run one-shot assessment
+      #   uses: strobes-co/strobes-agents-cli@main
+      #   with:
+      #     base-url: ${{ secrets.STROBES_BASE_URL }}
+      #     org-id: ${{ secrets.STROBES_ORG_ID }}
+      #     master-key: ${{ secrets.STROBES_MASTER_KEY }}
+      #     message: >
+      #       Perform a security assessment of https://staging.example.com.
+      #       Focus on OWASP Top 10. Report all critical and high findings.
+      #     fail-on-findings: high
+      #     timeout: '1800'
