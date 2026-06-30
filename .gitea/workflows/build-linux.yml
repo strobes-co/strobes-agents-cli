@@ -1,0 +1,80 @@
+name: Build Linux Binary
+
+on:
+  push:
+    branches: ["main"]
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build aarch64 Linux
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          set -e
+          apt-get update -qq
+          apt-get install -y -qq build-essential pkg-config libssl-dev curl
+
+      - name: Install Rust toolchain
+        run: |
+          set -e
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --quiet
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+      - name: Build release binary
+        run: |
+          set -e
+          export PATH="$HOME/.cargo/bin:$PATH"
+          rustc --version
+          cargo --version
+          cargo build --release
+          ARCH=$(uname -m)
+          OS=linux
+          cp target/release/strobes strobes-${ARCH}-${OS}
+          echo "Binary: strobes-${ARCH}-${OS} ($(du -sh strobes-${ARCH}-${OS} | cut -f1))"
+          file strobes-${ARCH}-${OS}
+
+      - name: Package binary
+        run: |
+          ARCH=$(uname -m)
+          tar -czf strobes-${ARCH}-unknown-linux-gnu.tar.gz strobes-${ARCH}-linux
+          echo "Package: $(ls -lh strobes-${ARCH}-unknown-linux-gnu.tar.gz | awk '{print $5}')"
+
+      - name: Upload artifact
+        run: |
+          ARCH=$(uname -m)
+          TARBALL="strobes-${ARCH}-unknown-linux-gnu.tar.gz"
+          GITEA_URL="http://gitea:3000"
+          TOKEN="${{ secrets.BUILD_TOKEN }}"
+          REPO="admin/strobes-agents-cli"
+
+          # Get version from Cargo.toml
+          VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*= *"//;s/".*//')
+          TAG="v${VERSION}-local"
+          echo "Publishing $TARBALL as release $TAG"
+
+          # Create/overwrite the release
+          RELEASE=$(curl -s -X POST "${GITEA_URL}/api/v1/repos/${REPO}/releases" \
+            -H "Authorization: token $TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{\"tag_name\":\"${TAG}\",\"name\":\"${TAG}\",\"draft\":false}" 2>/dev/null)
+          RELEASE_ID=$(echo "$RELEASE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('id',''))" 2>/dev/null)
+
+          if [ -z "$RELEASE_ID" ]; then
+            # Release might already exist — find it
+            RELEASE_ID=$(curl -s "${GITEA_URL}/api/v1/repos/${REPO}/releases/tags/${TAG}" \
+              -H "Authorization: token $TOKEN" | python3 -c "import sys,json; print(json.load(sys.stdin).get('id',''))" 2>/dev/null)
+          fi
+          echo "Release ID: $RELEASE_ID"
+
+          # Upload binary tarball
+          curl -s -X POST "${GITEA_URL}/api/v1/repos/${REPO}/releases/${RELEASE_ID}/assets" \
+            -H "Authorization: token $TOKEN" \
+            -H "Content-Type: application/octet-stream" \
+            -F "attachment=@${TARBALL}" | python3 -c "import sys,json; d=json.load(sys.stdin); print('Asset:', d.get('name'), 'URL:', d.get('browser_download_url',''))"
