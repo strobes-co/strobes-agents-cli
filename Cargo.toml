@@ -1,6 +1,6 @@
 [package]
 name = "strobes-agents-cli"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 description = "Strobes Agents AI — a Ratatui terminal client for remote Strobes workspaces"
 license = "Proprietary"
