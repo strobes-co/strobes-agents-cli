@@ -110,6 +110,8 @@ strobes chat                    # interactive chat (thread picker)
 strobes chat --thread <UUID> --model 4    # resume a thread with a chosen model
 strobes bind --download         # pick + download a workspace locally
 strobes pull --workspace <UUID> # download a workspace's files to a folder
+strobes export -w <UUID>        # export all thread transcripts to a folder (Markdown + index.md)
+strobes export -w <UUID> --format json --dir out/   # raw event JSON, custom folder
 strobes update                  # self-update to the latest release
 strobes --version               # print the version
 ```

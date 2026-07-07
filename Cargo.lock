@@ -707,6 +707,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "glob"
+version = "0.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
+
+[[package]]
 name = "h2"
 version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1778,7 +1784,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "strobes-agents-cli"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -1787,6 +1793,7 @@ dependencies = [
  "crossterm",
  "dirs",
  "futures-util",
+ "glob",
  "pulldown-cmark",
  "ratatui",
  "reqwest",

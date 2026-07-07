@@ -475,7 +475,7 @@ async fn run_task(
     let client = ApiClient::new(profile.clone()).map_err(|e| e.to_string())?;
     let title = format!("[{phase}] {task}");
     let thread_id = client
-        .create_thread(&title, Some(workspace_id))
+        .create_thread(&title, Some(workspace_id), None)
         .await
         .map_err(|e| format!("create_thread: {e}"))?;
 

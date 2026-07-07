@@ -1927,7 +1927,7 @@ fn truncate(s: &str, n: usize) -> String {
 }
 
 /// Compact a JSON value to a single-line, length-capped string.
-fn compact_json(v: Option<&Value>, limit: usize) -> String {
+pub fn compact_json(v: Option<&Value>, limit: usize) -> String {
     let s = match v {
         None | Some(Value::Null) => return String::new(),
         Some(Value::String(s)) => s.clone(),

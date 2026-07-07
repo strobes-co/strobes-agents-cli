@@ -349,10 +349,18 @@ impl ApiClient {
         Ok(serde_json::from_value(v).unwrap_or_default())
     }
 
-    pub async fn create_thread(&self, title: &str, workspace_id: Option<&str>) -> Result<String> {
+    pub async fn create_thread(
+        &self,
+        title: &str,
+        workspace_id: Option<&str>,
+        agent_id: Option<&str>,
+    ) -> Result<String> {
         let mut body = serde_json::json!({ "title": title });
         if let Some(w) = workspace_id {
             body["workspace_id"] = serde_json::json!(w);
+        }
+        if let Some(aid) = agent_id {
+            body["agent_ids"] = serde_json::json!([aid]);
         }
         let v = self.post_json(&self.org_path("/cli/threads/create/"), body).await?;
         v.get("id").and_then(|x| x.as_str()).map(|s| s.to_string())
