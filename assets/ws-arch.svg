@@ -1,0 +1,86 @@
+<svg width="700" height="196" viewBox="0 0 700 196" xmlns="http://www.w3.org/2000/svg">
+  <style>
+    @media (prefers-color-scheme: dark) {
+      .bg   { fill: #0d1117; }
+      .bd   { stroke: #30363d; }
+      .box  { fill: #161b22; stroke: #30363d; }
+      .eng  { fill: #0e2045; stroke: #1d6ae5; }
+      .t1   { fill: #e6edf3; }
+      .t2   { fill: #8b949e; }
+      .et   { fill: #93c5fd; }
+      .es   { fill: #6b7280; }
+      .ln   { stroke: #4b5563; }
+      .arr  { fill: #4b5563; stroke: none; }
+      .lab  { fill: #58a6ff; }
+      .lsub { fill: #6b7280; }
+      .loc  { fill: #3fb950; }
+    }
+    @media (prefers-color-scheme: light) {
+      .bg   { fill: #f6f8fa; }
+      .bd   { stroke: #d0d7de; }
+      .box  { fill: #ffffff; stroke: #d0d7de; }
+      .eng  { fill: #dbeafe; stroke: #2563eb; }
+      .t1   { fill: #1f2328; }
+      .t2   { fill: #57606a; }
+      .et   { fill: #1e40af; }
+      .es   { fill: #57606a; }
+      .ln   { stroke: #6e7781; }
+      .arr  { fill: #6e7781; stroke: none; }
+      .lab  { fill: #0550ae; }
+      .lsub { fill: #57606a; }
+      .loc  { fill: #1a7f37; }
+    }
+    .m { font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Monaco, monospace; }
+    .s { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; }
+  </style>
+
+  <rect class="bg" width="700" height="196" rx="8"/>
+  <rect class="bg bd" x="0.5" y="0.5" width="699" height="195" rx="7.5" fill="none" stroke-width="1"/>
+
+  <!-- CLI box: x=24, y=44, w=162, h=80, center=(105,84) -->
+  <rect class="box" x="24" y="44" width="162" height="80" rx="6" stroke-width="1"/>
+  <text class="t1 m" x="105" y="76" text-anchor="middle" font-size="13" font-weight="600">strobes</text>
+  <text class="t2 s" x="105" y="94" text-anchor="middle" font-size="12">(local CLI)</text>
+  <text class="t2 m" x="105" y="112" text-anchor="middle" font-size="10">v0.8.0</text>
+
+  <!-- Backend box: x=514, y=24, w=162, h=120, center=(595,84) -->
+  <rect class="eng" x="514" y="24" width="162" height="120" rx="6" stroke-width="2"/>
+  <text class="et m" x="595" y="58" text-anchor="middle" font-size="13" font-weight="600">Strobes Backend</text>
+  <text class="es s" x="595" y="76" text-anchor="middle" font-size="11">remote AI agents</text>
+  <text class="es s" x="595" y="92" text-anchor="middle" font-size="11">orchestration</text>
+  <text class="es s" x="595" y="108" text-anchor="middle" font-size="11">guardrails · LLM</text>
+  <text class="es s" x="595" y="124" text-anchor="middle" font-size="11">workspace files</text>
+
+  <!-- Bidirectional arrows between boxes -->
+  <!-- Line 1 (outbound): from (186, 80) to (514, 80) -->
+  <line class="ln" x1="193" y1="80" x2="506" y2="80" stroke-width="1.5"/>
+  <!-- Arrowhead right at x=514 -->
+  <polygon class="arr" points="514,80 506,76 506,84"/>
+
+  <!-- Line 2 (inbound): from (514, 92) to (186, 92) -->
+  <line class="ln" x1="193" y1="92" x2="506" y2="92" stroke-width="1.5"/>
+  <!-- Arrowhead left at x=186 -->
+  <polygon class="arr" points="186,92 194,88 194,96"/>
+
+  <!-- Arrow labels -->
+  <text class="lab m" x="350" y="73" text-anchor="middle" font-size="10">pulse WebSocket (chat · tool.local_execute)</text>
+  <text class="lsub s" x="350" y="102" text-anchor="middle" font-size="10">workspace files · findings · approvals</text>
+
+  <!-- Vertical lines from bottom of CLI box down to local tool labels -->
+  <!-- CLI box bottom center: (105, 124) -->
+  <line class="ln" x1="105" y1="124" x2="105" y2="148" stroke-width="1.5"/>
+  <line class="ln" x1="105" y1="148" x2="68" y2="148" stroke-width="1.5"/>
+  <line class="ln" x1="105" y1="148" x2="148" y2="148" stroke-width="1.5"/>
+
+  <line class="ln" x1="68" y1="148" x2="68" y2="164" stroke-width="1.5"/>
+  <line class="ln" x1="148" y1="148" x2="148" y2="164" stroke-width="1.5"/>
+
+  <polygon class="arr" points="68,164 64,157 72,157"/>
+  <polygon class="arr" points="148,164 144,157 152,157"/>
+
+  <text class="loc m" x="68" y="178" text-anchor="middle" font-size="10">local shell</text>
+  <text class="loc m" x="68" y="191" text-anchor="middle" font-size="10">sandbox</text>
+
+  <text class="loc m" x="148" y="178" text-anchor="middle" font-size="10">local Chrome</text>
+  <text class="loc m" x="148" y="191" text-anchor="middle" font-size="10">browser_* tools</text>
+</svg>

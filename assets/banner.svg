@@ -1,0 +1,80 @@
+<svg width="800" height="162" viewBox="0 0 800 162" xmlns="http://www.w3.org/2000/svg">
+  <style>
+    @media (prefers-color-scheme: dark) {
+      .bg    { fill: #0d1117; }
+      .bd    { stroke: #30363d; }
+      .title { fill: #e6edf3; }
+      .sub   { fill: #8b949e; }
+      .pk    { fill: #161b22; stroke: #30363d; }
+      .pt    { fill: #8b949e; }
+      .ds    { fill: #a78bfa; }
+      .dg    { fill: #3fb950; }
+      .db    { fill: #58a6ff; }
+      .do    { fill: #d29922; }
+      .dp    { fill: #f778ba; }
+    }
+    @media (prefers-color-scheme: light) {
+      .bg    { fill: #f6f8fa; }
+      .bd    { stroke: #d0d7de; }
+      .title { fill: #1f2328; }
+      .sub   { fill: #57606a; }
+      .pk    { fill: #ffffff; stroke: #d0d7de; }
+      .pt    { fill: #57606a; }
+      .ds    { fill: #8250df; }
+      .dg    { fill: #1a7f37; }
+      .db    { fill: #0550ae; }
+      .do    { fill: #7d4e00; }
+      .dp    { fill: #bf3989; }
+    }
+    .m { font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Monaco, monospace; }
+    .s { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; }
+  </style>
+
+  <!-- Background -->
+  <rect class="bg" width="800" height="162" rx="10"/>
+  <rect class="bg bd" x="0.5" y="0.5" width="799" height="161" rx="9.5" fill="none" stroke-width="1"/>
+
+  <!-- Hex logo: pointy-top, cx=78 cy=78 r=42 -->
+  <!-- angles 270,330,30,90,150,210 → top vertex at top -->
+  <!-- 270°: (78,36) 330°: (78+36.4,78-21)=(114,57) 30°: (114,99) 90°: (78,120) 150°: (42,99) 210°: (42,57) -->
+  <polygon fill="#1d6ae5" points="78,36 114,57 114,99 78,120 42,99 42,57"/>
+  <text class="m" x="78" y="96" text-anchor="middle" fill="white" font-size="46" font-weight="900">S</text>
+
+  <!-- Title -->
+  <text class="title s" x="136" y="68" font-size="28" font-weight="700">STROBES Agents AI</text>
+  <text class="sub s" x="136" y="93" font-size="14">AI-powered security scanning &amp; pentest CLI</text>
+
+  <!-- Feature pill badges -->
+  <!-- SAST -->
+  <rect class="pk" x="136" y="112" width="62" height="22" rx="11" stroke-width="1" fill-opacity="1"/>
+  <circle class="ds" cx="151" cy="123" r="4"/>
+  <text class="pt m" x="160" y="127" font-size="10.5">SAST</text>
+
+  <!-- SCA -->
+  <rect class="pk" x="206" y="112" width="54" height="22" rx="11" stroke-width="1"/>
+  <circle class="dg" cx="220" cy="123" r="4"/>
+  <text class="pt m" x="229" y="127" font-size="10.5">SCA</text>
+
+  <!-- Container -->
+  <rect class="pk" x="268" y="112" width="92" height="22" rx="11" stroke-width="1"/>
+  <circle class="db" cx="283" cy="123" r="4"/>
+  <text class="pt m" x="292" y="127" font-size="10.5">Container</text>
+
+  <!-- IaC -->
+  <rect class="pk" x="368" y="112" width="50" height="22" rx="11" stroke-width="1"/>
+  <circle class="do" cx="382" cy="123" r="4"/>
+  <text class="pt m" x="391" y="127" font-size="10.5">IaC</text>
+
+  <!-- DAST -->
+  <rect class="pk" x="426" y="112" width="60" height="22" rx="11" stroke-width="1"/>
+  <circle class="dp" cx="441" cy="123" r="4"/>
+  <text class="pt m" x="450" y="127" font-size="10.5">DAST</text>
+
+  <!-- Chat -->
+  <rect class="pk" x="494" y="112" width="52" height="22" rx="11" stroke-width="1"/>
+  <text class="pt m" x="520" y="127" text-anchor="middle" font-size="10.5">Chat</text>
+
+  <!-- Workflow -->
+  <rect class="pk" x="554" y="112" width="80" height="22" rx="11" stroke-width="1"/>
+  <text class="pt m" x="594" y="127" text-anchor="middle" font-size="10.5">Workflow</text>
+</svg>

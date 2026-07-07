@@ -1,19 +1,16 @@
-# Strobes Agents AI — CLI
+<p align="center">
+  <img src="assets/banner.svg" alt="Strobes Agents AI" width="800"/>
+</p>
 
-A local, terminal-native client for **Strobes Agents AI** — think *Claude Code,
-but for your Strobes pentest agents*. It binds to a **remote** Strobes
-organization / workspace over MasterKey auth, streams agent runs live in a clean
-Ratatui UI, and runs the **sandbox (shell) and browser on your local machine**.
+A local, terminal-native client for **Strobes Agents AI**. It connects to a
+remote Strobes organization over MasterKey auth, streams agent runs live in a
+clean terminal UI, runs the sandbox (shell) and browser on your local machine —
+and ships a self-contained **CI scanning suite** (SAST · SCA · Container · IaC ·
+DAST) that works without any extra services.
 
-```
-┌──────────────┐   pulse WS (chat + tool.local_execute)   ┌──────────────────┐
-│   strobes    │ ◀──────────────────────────────────────▶ │  Strobes backend │
-│   (local)    │   workspace files · findings · approvals  │  remote agents,  │
-└──────────────┘                                            │ orchestration,   │
-   ▲   ▲                                                     │ guardrails, LLM  │
-   │   └─ local Chrome (browser_* tools)                     └──────────────────┘
-   └───── local shell sandbox (execute_command / execute_code)
-```
+<p align="center">
+  <img src="assets/ws-arch.svg" alt="WebSocket architecture" width="700"/>
+</p>
 
 > **Security:** no credentials are committed to this repo. You provide your own
 > MasterKey at runtime (env vars or interactive `login`); it's stored 0600 under
@@ -22,9 +19,7 @@ Ratatui UI, and runs the **sandbox (shell) and browser on your local machine**.
 ## Install
 
 Prebuilt binaries for every platform are published on
-[**Releases**](../../releases/latest). Pick the one-liner for your OS — it
-detects your architecture, downloads the latest release, and installs `strobes`
-onto your `PATH`.
+[**Releases**](../../releases/latest). Pick the one-liner for your OS:
 
 ### macOS / Linux — one-liner
 
@@ -45,7 +40,7 @@ OS=$(uname -s); ARCH=$(uname -m); case "$OS-$ARCH" in
 esac
 curl -fsSL "https://github.com/strobes-co/strobes-agents-cli/releases/latest/download/strobes-$T.tar.gz" \
   | tar -xz && sudo install -m755 "strobes-$T/strobes" /usr/local/bin/strobes && rm -rf "strobes-$T"
-strobes --help | head -1
+strobes --version
 ```
 </details>
 
@@ -60,7 +55,7 @@ tar -xzf "$env:TEMP\strobes.tgz" -C $env:TEMP; Copy-Item "$env:TEMP\strobes-$T\s
 Write-Host "installed to $dst\strobes.exe — open a new terminal, then run: strobes --help"
 ```
 
-### Pick a binary manually
+### Platform binaries
 
 | Platform | Asset |
 |----------|-------|
@@ -75,17 +70,16 @@ Each ships with a `.sha256` checksum. Verify with
 ### Build from source
 
 ```bash
-cargo build --release        # -> target/release/strobes
-cp target/release/strobes /usr/local/bin/    # optional: put it on your PATH
+cargo build --release        # → target/release/strobes
+cp target/release/strobes /usr/local/bin/
 ```
 
-Requirements: **Rust** (`rustup`). **Google Chrome / Chromium** is optional — only
-needed if you want the agent to drive a local browser (`browser_*` tools).
+Requirements: **Rust** (`rustup`). Chrome/Chromium is optional — only needed
+for the `browser_*` tools in chat and DAST scanning.
 
 ## Configure
 
-Set your deployment + MasterKey via env vars (get a MasterKey from the Strobes
-UI → Organization → API access, or `POST /v1/organizations/<org>/master_key/`):
+Get a MasterKey from **Strobes UI → Organization → API access**:
 
 ```bash
 export STROBES_AI_BASE_URL=https://app.strobes.co     # your deployment
@@ -93,86 +87,308 @@ export STROBES_AI_ORG_ID=<ORG_UUID>
 export STROBES_AI_MASTER_KEY=<40-char-hex-key>
 ```
 
-These persist to `~/.config/strobes-ai/config.json` (macOS:
-`~/Library/Application Support/strobes-ai/config.json`).
+These persist to `~/.config/strobes-ai/config.json`
+(`~/Library/Application Support/strobes-ai/config.json` on macOS).
 
-> The API path prefix defaults to `/api/v1` (what nginx/ALB-fronted Strobes
-> deployments expose) — you normally set nothing else. Only if you hit the
-> Django app **directly** (no proxy) set `STROBES_AI_DEPLOYMENT=direct` for `/v1`.
+> The API path prefix defaults to `/api/v1` (nginx/ALB-fronted deployments).
+> Only if you hit Django directly (no proxy) set `STROBES_AI_DEPLOYMENT=direct`.
 
-## Use
+---
+
+## `strobes ci` — Security Scanning Suite
+
+<p align="center">
+  <img src="assets/ci-pipeline.svg" alt="CI scanning pipeline" width="800"/>
+</p>
+
+`strobes ci` is a self-contained security scanning engine built into the CLI.
+It runs five scan types — source code, dependencies, container images,
+infrastructure-as-code, and live web targets — and sends raw findings to
+Strobes AI for reachability analysis and remediation guidance. All outputs are
+**SARIF 2.1.0** compatible for GitHub Code Scanning and other CI platforms.
+
+```bash
+strobes ci sast .                          # static code analysis
+strobes ci sca .                           # software composition analysis
+strobes ci container nginx:1.24            # Docker image CVE scan
+strobes ci iac ./infra                     # IaC misconfiguration scan
+strobes ci dast https://staging.myapp.com  # live web app testing
+```
+
+### `strobes ci sast` — Static Application Security Testing
+
+Copies the source tree into a local sandbox, prompts the AI to analyze it for
+injection flaws, auth issues, secrets, and unsafe patterns, and streams findings
+with severity and fix guidance.
+
+```bash
+strobes ci sast .
+strobes ci sast ./src --output sarif -o sast.sarif
+strobes ci sast ~/myapp --fail-on high --timeout 600
+strobes ci sast . --exclude "*.lock" --exclude "vendor/**" --max-mb 200
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `<dir>` | `.` | Directory to scan |
+| `--output` | `text` | Output format: `text`, `json`, `sarif` |
+| `-o / --output-file` | — | Save results to a file |
+| `--fail-on <SEVERITY>` | — | Exit 1 if any finding ≥ severity (`critical` / `high` / `medium` / `low`) |
+| `--exclude <GLOB>` | — | Exclude file patterns (repeatable); `node_modules`, `.git`, binaries always excluded |
+| `--max-mb <MB>` | `100` | Maximum sandbox size in MB |
+| `--prompt <TEXT>` | — | Override the default SAST prompt |
+| `--timeout <SECS>` | `600` | Abort if the AI has not finished |
+
+---
+
+### `strobes ci sca` — Software Composition Analysis
+
+Parses all manifest and lock files in the directory, queries **OSV.dev** for
+known CVEs (no API key required), builds the full transitive dependency graph,
+then uses AI to determine which vulnerabilities are actually reachable in your
+code — so only real risk is surfaced.
+
+```bash
+strobes ci sca .
+strobes ci sca ~/myapp --output sarif -o sca.sarif
+strobes ci sca . --skip-ai --min-severity medium
+strobes ci sca . --fail-on high
+```
+
+**Supported ecosystems:**
+
+| Language | Files parsed |
+|----------|-------------|
+| Python | `requirements.txt`, `Pipfile.lock`, `poetry.lock`, `pyproject.toml` |
+| Node.js | `package-lock.json`, `yarn.lock`, `pnpm-lock.yaml` |
+| Go | `go.sum`, `go.mod` |
+| Rust | `Cargo.lock` |
+| Ruby | `Gemfile.lock` |
+| PHP | `composer.lock` |
+| Java | `pom.xml` (Maven), `build.gradle` |
+| .NET | `*.csproj`, `packages.lock.json`, `*.deps.json` |
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `<dir>` | `.` | Directory to scan |
+| `--output` | `text` | Output format: `text`, `json`, `sarif` |
+| `-o / --output-file` | — | Save results to a file |
+| `--fail-on <SEVERITY>` | — | Exit 1 if any finding ≥ severity |
+| `--min-severity` | `low` | Minimum severity to include |
+| `--skip-ai` | — | Skip AI reachability; report every CVE from OSV.dev |
+| `--timeout <SECS>` | `600` | Abort AI analysis after this many seconds |
+
+---
+
+### `strobes ci container` — Docker Image Scanning
+
+Pulls the image, creates a temporary container to extract the OS package
+database (dpkg/apk) and any app-level manifests, queries OSV.dev for CVEs,
+then uses AI reachability analysis. **Requires Docker.**
+
+```bash
+strobes ci container nginx:1.24
+strobes ci container python:3.9-slim --skip-ai
+strobes ci container myapp:latest --fail-on critical
+strobes ci container ubuntu:20.04 --output sarif -o container.sarif
+strobes ci container myapp:latest --platform linux/amd64
+```
+
+**Supported base images:** Debian/Ubuntu (dpkg), Alpine (apk), plus any
+app-level language manifests found on the image filesystem.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `<image>` | — | Docker image to scan (e.g. `nginx:1.24`, `myapp:latest`) |
+| `--output` | `text` | Output format: `text`, `json`, `sarif` |
+| `-o / --output-file` | — | Save results to a file |
+| `--fail-on <SEVERITY>` | — | Exit 1 if any finding ≥ severity |
+| `--min-severity` | `low` | Minimum severity to include |
+| `--skip-ai` | — | Skip AI analysis; report all CVEs directly |
+| `--platform <PLATFORM>` | — | Target platform for multi-arch images (e.g. `linux/amd64`) |
+| `--timeout <SECS>` | `600` | Abort AI analysis after this many seconds |
+
+---
+
+### `strobes ci iac` — Infrastructure-as-Code Scanning
+
+Auto-detects all IaC files in the directory tree (by filename, extension, and
+content sniffing), copies only those files into a sandbox, and uses AI to find
+real misconfigurations — privilege escalation, open ports, missing encryption,
+insecure defaults, and more.
+
+```bash
+strobes ci iac .
+strobes ci iac ./infra --output sarif -o iac.sarif
+strobes ci iac . --fail-on high
+strobes ci iac . --only terraform --only kubernetes
+```
+
+**Supported IaC types:**
+
+| Type | Files detected |
+|------|---------------|
+| Terraform | `*.tf`, `*.tfvars` |
+| CloudFormation | `template.yaml`, `cloudformation*.yml`, SAM templates |
+| Kubernetes | Pod, Deployment, Service, Ingress, Role, RBAC manifests |
+| Helm | `Chart.yaml`, `values.yaml` + `templates/*.yaml` |
+| Dockerfile | `Dockerfile`, `Dockerfile.*` |
+| Docker Compose | `docker-compose.yml`, `docker-compose.yaml`, `compose.yaml` |
+| GitHub Actions | `.github/workflows/*.yml` |
+| Ansible | `playbook.yml`, `site.yml`, role `tasks/main.yml` |
+| ARM Templates | `azuredeploy.json`, ARM JSON with `$schema` |
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `<dir>` | `.` | Directory to scan |
+| `--output` | `text` | Output format: `text`, `json`, `sarif` |
+| `-o / --output-file` | — | Save results to a file |
+| `--fail-on <SEVERITY>` | — | Exit 1 if any finding ≥ severity |
+| `--only <TYPE>` | — | Restrict to one IaC type (repeatable). Values: `terraform`, `cloudformation`, `kubernetes`, `helm`, `dockerfile`, `compose`, `github-actions`, `ansible`, `arm` |
+| `--timeout <SECS>` | `600` | Abort after this many seconds |
+
+---
+
+### `strobes ci dast` — Dynamic Application Security Testing
+
+Actively probes a live URL via HTTP requests, browser navigation, and fuzzing.
+No files are copied — the target must be reachable from this machine.
+
+```bash
+strobes ci dast http://localhost:5000
+strobes ci dast https://staging.myapp.com --output sarif -o dast.sarif
+strobes ci dast http://app.local --cookie "session=abc123" --fail-on high
+strobes ci dast http://app.local --scope /api --scope /admin
+strobes ci dast https://app.com --bearer "$TOKEN"
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `<url>` | — | Target base URL to scan (required) |
+| `--output` | `text` | Output format: `text`, `json`, `sarif` |
+| `-o / --output-file` | — | Save results to a file |
+| `--fail-on <SEVERITY>` | — | Exit 1 if any finding ≥ severity |
+| `--cookie <COOKIE>` | — | Cookie header value for all requests (e.g. `session=abc; csrf=xyz`) |
+| `--bearer <TOKEN>` | — | Bearer token for `Authorization` header |
+| `--scope <PATH>` | — | Restrict crawl + testing to this path prefix (repeatable) |
+| `--prompt <TEXT>` | — | Override the default DAST prompt |
+| `--timeout <SECS>` | `900` | Abort if the scan has not finished |
+
+---
+
+### CI Integration
+
+All scan types share a common set of CI-friendly features:
+
+- **SARIF 2.1.0** output (`--output sarif`) — upload to GitHub Code Scanning,
+  GitLab SAST, or any SARIF-aware platform
+- **Exit-code gating** (`--fail-on <SEVERITY>`) — exit 1 when findings meet or
+  exceed the threshold; exit 0 when clean
+- **File output** (`-o <FILE>`) — write results to disk for artifact upload
+
+```yaml
+# .github/workflows/security.yml
+name: Security scan
+on: [push, pull_request]
+jobs:
+  sca:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install strobes
+        run: curl -fsSL https://raw.githubusercontent.com/strobes-co/strobes-agents-cli/main/install.sh | bash
+      - name: SCA — dependency scan
+        env:
+          STROBES_AI_BASE_URL:   ${{ secrets.STROBES_BASE_URL }}
+          STROBES_AI_ORG_ID:     ${{ secrets.STROBES_ORG_ID }}
+          STROBES_AI_MASTER_KEY: ${{ secrets.STROBES_MASTER_KEY }}
+        run: strobes ci sca . --output sarif -o sca.sarif --fail-on critical
+      - uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: sca.sarif
+  iac:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install strobes
+        run: curl -fsSL https://raw.githubusercontent.com/strobes-co/strobes-agents-cli/main/install.sh | bash
+      - name: IaC scan
+        env:
+          STROBES_AI_BASE_URL:   ${{ secrets.STROBES_BASE_URL }}
+          STROBES_AI_ORG_ID:     ${{ secrets.STROBES_ORG_ID }}
+          STROBES_AI_MASTER_KEY: ${{ secrets.STROBES_MASTER_KEY }}
+        run: strobes ci iac . --output sarif -o iac.sarif --fail-on high
+      - uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: iac.sarif
+```
+
+---
+
+## Interactive Chat (`strobes chat`)
+
+Opens a full terminal UI that streams a remote agent run and executes
+its tools (shell, code, browser) on your local machine.
 
 ```bash
 strobes status                  # check connectivity
 strobes workspaces              # list remote workspaces
 strobes threads                 # list your threads
 strobes chat                    # interactive chat (thread picker)
-strobes chat --thread <UUID> --model 4    # resume a thread with a chosen model
+strobes chat --thread <UUID> --model 18    # resume a thread (Sonnet 4.6)
 strobes bind --download         # pick + download a workspace locally
-strobes pull --workspace <UUID> # download a workspace's files to a folder
-strobes export -w <UUID>        # export all thread transcripts to a folder (Markdown + index.md)
-strobes export -w <UUID> --format json --dir out/   # raw event JSON, custom folder
+strobes pull --workspace <UUID> # download workspace files to a folder
+strobes export -w <UUID>        # export thread transcripts (Markdown + index.md)
+strobes export -w <UUID> --format json --dir out/   # raw event JSON
 strobes update                  # self-update to the latest release
 strobes --version               # print the version
 ```
 
-### In-chat keys (shown in the bottom bar)
+### In-chat keys
 
 | Key | Action |
 |-----|--------|
-| `Enter` | send message |
-| `/` | slash-command autocomplete (Tab/Enter to complete) |
-| `^W` | workspaces browser → Enter binds, then pick a new / existing thread |
-| `^O` | threads browser (Enter switches) |
-| `^F` / `^A` | findings / approvals for the bound workspace (Enter → detail) |
-| `^L` | list the synced local workspace files (Enter → path/size detail) |
-| `^E` | open the local workspace folder in Finder / Explorer / file manager |
-| `^Y` | copy the whole transcript to the clipboard |
-| `^T` / `^R` | toggle thinking / markdown |
-| `^C` | cancel the running turn (or quit when idle) |
-| `Esc` | back (chat → threads → workspaces) · PgUp/PgDn / ↑↓ scroll |
+| `Enter` | Send message |
+| `/` | Slash-command autocomplete (Tab/Enter to complete) |
+| `^W` | Workspaces browser → Enter binds, then pick a thread |
+| `^O` | Threads browser (Enter switches) |
+| `^F` / `^A` | Findings / approvals for the bound workspace |
+| `^L` | List synced local workspace files |
+| `^E` | Open the local workspace folder in Finder / Explorer |
+| `^Y` | Copy the full transcript to the clipboard |
+| `^T` / `^R` | Toggle thinking / markdown |
+| `^C` | Cancel the running turn (or quit when idle) |
+| `Esc` | Back (chat → threads → workspaces) · PgUp/PgDn / ↑↓ scroll |
 
-The mouse isn't captured, so your terminal's native **click-drag selection +
-copy** works in the transcript; `^Y` copies the entire transcript. A small
-spinner appears in the status bar while a turn is running (incl. tool/HTTP
-waits). The CLI checks for newer releases on chat start and `strobes status`,
-and suggests the update one-liner if one is available.
+Mouse isn't captured, so terminal native **click-drag selection + copy** still
+works in the transcript. A spinner appears while a turn is running. The CLI
+checks for newer releases on chat start and suggests the update one-liner.
 
-The transcript renders cleanly: `◆ Agent` headers (only on agent change),
-`⏺ tool(args)` + `⎿ result`, dimmed `✻ thinking`, Markdown (incl. tables), and
-loads the **entire thread history** on open. When a workspace is bound it syncs
-that workspace's files into a local sandbox so the agent's `workspace_get_meta` /
-`execute_command` see the real files, and drives a local **Chrome** for the
-`browser_*` tools (`STROBES_AI_BROWSER_HEADLESS=1` for headless).
+**Browser setup:** `browser_*` tools need Google Chrome / Chromium — detected
+automatically. Point at a non-standard install with `STROBES_AI_CHROME=/path/to/chrome`,
+or set `STROBES_AI_BROWSER_AUTOINSTALL=1` to download Chrome for Testing on first use.
 
-**Browser setup:** the `browser_*` tools need Google Chrome / Chromium. The CLI
-auto-detects it in the usual places; if it's missing, the tool returns a
-platform-specific install hint. Point at a non-standard install with
-`STROBES_AI_CHROME=/path/to/chrome`, or set `STROBES_AI_BROWSER_AUTOINSTALL=1`
-to have the CLI download a self-contained **Chrome for Testing** build (cached
-under the config dir) on first use.
+**Browser isolation:** parallel agents each get their own CDP tab within a
+shared Chrome process per workspace.
 
-**Browser isolation:** parallel agents each get their own CDP tab (page) within
-a shared Chrome process per workspace, so their navigation state never bleeds
-into each other while still sharing cookies/auth.
-
-Model picker ids: `4` Haiku 4.5 · `18` Sonnet 4.6 · `21` Opus 4.7 (Bedrock), or
-your org's BYOM id.
+**Model picker ids:** `4` Haiku 4.5 · `18` Sonnet 4.6 · `21` Opus 4.7
+(Bedrock), or your org's BYOM id.
 
 ### Credits & tokens
 
-The status bar shows **AI credits + token usage**: the current run's usage while
-it streams (`◈ 0.036 cr · 1.8k tok`), and the **session total** (`◈ Σ …`) once
-idle — accumulated from the backend's `credit.update` events and the
-`run.completed` metrics.
+The status bar shows **AI credits + token usage**: the current run's usage
+while streaming (`◈ 0.036 cr · 1.8k tok`), and the session total (`◈ Σ …`)
+once idle.
 
 ---
 
-## Workflows
+## Workflows (`strobes workflow`)
 
-Workflows let you define multi-agent tasks in a YAML file and execute them
-offline — the CLI creates a dedicated workspace, spins up threads, and runs
-everything in a live Ratatui TUI with a task tree and streamed output.
+Workflows let you define multi-agent security tasks in a YAML file and execute
+them offline — the CLI creates a dedicated workspace, spins up threads, and runs
+everything in a live terminal TUI with a task tree and streamed output.
 
 ```
 ┌─ Bug Bounty Recon ──── ws:a1b2c3d4 ── 2m 14s ─────────────────────────────┐
@@ -191,7 +407,6 @@ everything in a live Ratatui TUI with a task tree and streamed output.
 ### Quick start
 
 ```bash
-# Use a built-in template
 strobes workflow init --output myflow.yaml
 strobes workflow run myflow.yaml
 
@@ -200,12 +415,9 @@ strobes workflow run workflows/bugbounty-recon.yaml \
   -v TARGET=example.com \
   -v PROGRAM="Example Bug Bounty"
 
-# Headless (no TUI) — useful for CI
+# Headless (no TUI) — for CI
 strobes workflow run myflow.yaml --no-tui -v TARGET=example.com
 ```
-
-If you omit `-v` flags, the CLI prompts interactively for each variable with
-its YAML default shown in brackets.
 
 ### Workflow YAML format
 
@@ -213,10 +425,8 @@ its YAML default shown in brackets.
 name: "Web App Pentest"
 description: "Automated security assessment"
 
-# workspace: { name: "Custom Name" }   # optional; auto-created from workflow name
-
 variables:
-  TARGET: "https://example.com"        # default — overridden by -v or prompt
+  TARGET: "https://example.com"
   CREDENTIALS: ""
 
 phases:
@@ -232,13 +442,11 @@ phases:
 
   - name: "Testing"
     tasks:
-      # Runs only after port-scan AND tech-stack complete.
       - name: vuln-scan
         depends_on: [port-scan, tech-stack]
         prompt: |
           Run a vulnerability scan on ${TARGET} using the recon results.
 
-      # Runs in parallel with vuln-scan (same depends_on satisfied).
       - name: auth-test
         depends_on: [port-scan, tech-stack]
         prompt: |
@@ -252,15 +460,11 @@ phases:
           Produce a final pentest report for ${TARGET}.
 ```
 
-**Variable interpolation:** use `${VAR}` or `$VAR` in any string field (`name`,
-`prompt`, workspace `name`). Required variables with no default must be supplied
-via `-v` or interactive prompt.
+**DAG scheduling:** tasks without `depends_on` start immediately in parallel.
+Tasks with `depends_on` block until all named tasks complete. A failed
+dependency causes its dependents to be skipped.
 
-**DAG scheduling within a phase:** tasks without `depends_on` start immediately
-in parallel. Tasks with `depends_on` block until all named tasks complete. Tasks
-whose dependency failed are skipped.
-
-### All workflow commands
+### Workflow commands
 
 | Command | Description |
 |---------|-------------|
@@ -271,32 +475,14 @@ whose dependency failed are skipped.
 | `strobes workflow history` | List past runs with status and progress |
 | `strobes workflow resume <run-id>` | Continue an interrupted run |
 
-### TUI keys (workflow)
-
-| Key | Action |
-|-----|--------|
-| `↑` / `↓` | Navigate task list |
-| `Enter` | Open selected task's full chat view |
-| `Tab` | Toggle between task output and combined log |
-| `PgUp` / `PgDn` | Scroll output pane manually |
-| `f` | Re-enable auto-follow (scroll to latest output) |
-| `q` / `Esc` | Quit (after workflow finishes) |
-
-Output is rendered as **Markdown** (headings, bold, code blocks, tables) with
-color-coded event lines: `▶ tool(args)` in cyan, `◀ result` in blue,
-`✗ error` in red, `💭 thinking` in magenta.
-
 ### History and resume
-
-Every workflow run is recorded locally. If a run is interrupted (crash, network
-drop, `Ctrl-C`), you can continue from where it left off:
 
 ```bash
 strobes workflow history
-# RUN ID                                  WORKFLOW                    STATUS      DONE    STARTED
-# ─────────────────────────────────────────────────────────────────────────────────────────────────
-# 20260624-143021-bug-bounty-recon        Bug Bounty Recon            partial     3/9     2026-06-24 14:30:21
-# 20260624-120015-webapp-pentest          WebApp Pentest              completed   8/8     2026-06-24 12:00:15
+# RUN ID                                  WORKFLOW                    STATUS      DONE
+# ─────────────────────────────────────────────────────────────────────────────────────
+# 20260624-143021-bug-bounty-recon        Bug Bounty Recon            partial     3/9
+# 20260624-120015-webapp-pentest          WebApp Pentest              completed   8/8
 
 strobes workflow resume 20260624-143021-bug-bounty-recon
 ```
@@ -330,7 +516,7 @@ The resumed run reuses the same workspace and skips already-completed tasks
 
 ```
 src/
-  main.rs           clap commands + async entry point
+  main.rs           clap commands + async entry point (ci scanning suite lives here)
   config.rs         profiles, secret storage, URL/path helpers
   api.rs            reqwest MasterKey REST client
   pulse.rs          pulse WebSocket client (flat StreamEvents, CLI_LOCAL tool dispatch)
@@ -346,6 +532,11 @@ src/
   workflow_state.rs RunRecord JSON persistence (~/.config/strobes-ai/workflow-runs/)
   workflow_tui.rs   Ratatui workflow TUI: task tree + markdown output pane + chat drill-down
 
+assets/
+  banner.svg        README header banner (hex logo + feature badges)
+  ws-arch.svg       WebSocket architecture diagram
+  ci-pipeline.svg   CI scanning pipeline diagram
+
 workflows/
   bugbounty-recon.yaml       Subdomain enum, port scan, tech fingerprint, dork search
   webapp-pentest.yaml        Auth, injection, access control, XSS, SSRF, file upload
@@ -355,8 +546,9 @@ workflows/
 ## Development
 
 ```bash
-cargo test       # protocol + render unit tests
+cargo test                      # unit tests
 cargo run -- chat
+cargo run -- ci sca .           # SCA scan of this repo
 cargo run -- workflow run workflows/bugbounty-recon.yaml --no-tui -v TARGET=example.com -v PROGRAM=test
 ```
 

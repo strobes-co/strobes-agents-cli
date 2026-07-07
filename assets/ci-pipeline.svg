@@ -1,0 +1,139 @@
+<svg width="800" height="280" viewBox="0 0 800 280" xmlns="http://www.w3.org/2000/svg">
+  <style>
+    @media (prefers-color-scheme: dark) {
+      .bg   { fill: #0d1117; }
+      .card { fill: #161b22; stroke: #30363d; }
+      .eng  { fill: #0e2045; stroke: #1d6ae5; }
+      .out  { fill: #161b22; stroke: #30363d; }
+      .ln   { stroke: #374151; }
+      .vln  { stroke: #374151; }
+      .t1   { fill: #e6edf3; }
+      .t2   { fill: #8b949e; }
+      .et   { fill: #93c5fd; }
+      .es   { fill: #6b7280; }
+      .arr  { fill: #4b5563; stroke: none; }
+      .ot   { fill: #d1d5db; }
+      .os   { fill: #6b7280; }
+      .cs   { fill: #a78bfa; } /* SAST - purple */
+      .cg   { fill: #3fb950; } /* SCA  - green  */
+      .cb   { fill: #58a6ff; } /* Cont - blue   */
+      .co   { fill: #d29922; } /* IaC  - orange */
+      .cp   { fill: #f778ba; } /* DAST - pink   */
+    }
+    @media (prefers-color-scheme: light) {
+      .bg   { fill: #f6f8fa; }
+      .card { fill: #ffffff; stroke: #d0d7de; }
+      .eng  { fill: #dbeafe; stroke: #2563eb; }
+      .out  { fill: #ffffff; stroke: #d0d7de; }
+      .ln   { stroke: #d0d7de; }
+      .vln  { stroke: #d0d7de; }
+      .t1   { fill: #1f2328; }
+      .t2   { fill: #57606a; }
+      .et   { fill: #1e40af; }
+      .es   { fill: #57606a; }
+      .arr  { fill: #6e7781; stroke: none; }
+      .ot   { fill: #1f2328; }
+      .os   { fill: #57606a; }
+      .cs   { fill: #8250df; }
+      .cg   { fill: #1a7f37; }
+      .cb   { fill: #0550ae; }
+      .co   { fill: #7d4e00; }
+      .cp   { fill: #bf3989; }
+    }
+    .m { font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Monaco, monospace; }
+    .s { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; }
+  </style>
+
+  <rect class="bg" width="800" height="280"/>
+
+  <!-- ── Left: 5 scan-type cards (x=16, w=168, right edge=184) ─────────────── -->
+  <!-- Each card h=42, gap=8. Start y=14. Centers at 35,85,135,185,235 -->
+
+  <!-- SAST y=14 cy=35 -->
+  <rect class="card" x="16" y="14" width="168" height="42" rx="5" stroke-width="1"/>
+  <rect class="cs"   x="16" y="14" width="4"   height="42" rx="2"/>
+  <text class="t1 m" x="30" y="31" font-size="11" font-weight="600">strobes ci sast</text>
+  <text class="t2 s" x="30" y="46" font-size="9.5">Source code analysis</text>
+
+  <!-- SCA y=64 cy=85 -->
+  <rect class="card" x="16" y="64" width="168" height="42" rx="5" stroke-width="1"/>
+  <rect class="cg"   x="16" y="64" width="4"   height="42" rx="2"/>
+  <text class="t1 m" x="30" y="81" font-size="11" font-weight="600">strobes ci sca</text>
+  <text class="t2 s" x="30" y="96" font-size="9.5">8 ecosystems · OSV.dev</text>
+
+  <!-- Container y=114 cy=135 -->
+  <rect class="card" x="16" y="114" width="168" height="42" rx="5" stroke-width="1"/>
+  <rect class="cb"   x="16" y="114" width="4"   height="42" rx="2"/>
+  <text class="t1 m" x="30" y="131" font-size="11" font-weight="600">strobes ci container</text>
+  <text class="t2 s" x="30" y="146" font-size="9.5">Docker image scanning</text>
+
+  <!-- IaC y=164 cy=185 -->
+  <rect class="card" x="16" y="164" width="168" height="42" rx="5" stroke-width="1"/>
+  <rect class="co"   x="16" y="164" width="4"   height="42" rx="2"/>
+  <text class="t1 m" x="30" y="181" font-size="11" font-weight="600">strobes ci iac</text>
+  <text class="t2 s" x="30" y="196" font-size="9.5">9 IaC types auto-detected</text>
+
+  <!-- DAST y=214 cy=235 -->
+  <rect class="card" x="16" y="214" width="168" height="42" rx="5" stroke-width="1"/>
+  <rect class="cp"   x="16" y="214" width="4"   height="42" rx="2"/>
+  <text class="t1 m" x="30" y="231" font-size="11" font-weight="600">strobes ci dast</text>
+  <text class="t2 s" x="30" y="246" font-size="9.5">Live web app testing</text>
+
+  <!-- ── Left-side comb: horizontal lines → vertical bar → single arrow ──────── -->
+  <!-- Horizontal stubs from right edge (184) to gutter (242) -->
+  <line class="ln" x1="184" y1="35"  x2="242" y2="35"  stroke-width="1.2"/>
+  <line class="ln" x1="184" y1="85"  x2="242" y2="85"  stroke-width="1.2"/>
+  <line class="ln" x1="184" y1="135" x2="242" y2="135" stroke-width="1.2"/>
+  <line class="ln" x1="184" y1="185" x2="242" y2="185" stroke-width="1.2"/>
+  <line class="ln" x1="184" y1="235" x2="242" y2="235" stroke-width="1.2"/>
+
+  <!-- Vertical bar at x=242 from y=35 to y=235 -->
+  <line class="vln" x1="242" y1="35" x2="242" y2="235" stroke-width="1.2"/>
+
+  <!-- Arrow from gutter (242, 135) to engine left (298, 135) -->
+  <line class="ln" x1="242" y1="135" x2="291" y2="135" stroke-width="1.5"/>
+  <polygon class="arr" points="299,135 291,131 291,139"/>
+
+  <!-- ── Center: AI Engine box (x=300, y=66, w=200, h=148) center=(400,140) ── -->
+  <rect class="eng" x="300" y="66" width="200" height="148" rx="8" stroke-width="2"/>
+  <text class="et m" x="400" y="104" text-anchor="middle" font-size="13" font-weight="700">Strobes AI Engine</text>
+  <line class="ln" x1="320" y1="112" x2="480" y2="112" stroke-width="1" stroke-dasharray="3 3"/>
+  <text class="es s" x="400" y="130" text-anchor="middle" font-size="11">● OSV.dev · CVE databases</text>
+  <text class="es s" x="400" y="148" text-anchor="middle" font-size="11">● Reachability analysis</text>
+  <text class="es s" x="400" y="166" text-anchor="middle" font-size="11">● AI-powered remediation</text>
+  <text class="es s" x="400" y="184" text-anchor="middle" font-size="11">● CVSS scoring · severity</text>
+
+  <!-- ── Right-side comb: arrow → vertical bar → horizontal stubs ─────────── -->
+  <!-- Arrow from engine right (500, 140) to gutter (556, 140) -->
+  <line class="ln" x1="500" y1="140" x2="555" y2="140" stroke-width="1.5"/>
+  <!-- No arrowhead on start, just line into the gutter -->
+
+  <!-- Vertical bar at x=558 from y=83 to y=197 -->
+  <line class="vln" x1="558" y1="83" x2="558" y2="197" stroke-width="1.2"/>
+
+  <!-- Horizontal lines from gutter (558) to output boxes left edge (616) -->
+  <line class="ln" x1="558" y1="83"  x2="609" y2="83"  stroke-width="1.2"/>
+  <polygon class="arr" points="616,83 608,79 608,87"/>
+
+  <line class="ln" x1="558" y1="140" x2="609" y2="140" stroke-width="1.2"/>
+  <polygon class="arr" points="616,140 608,136 608,144"/>
+
+  <line class="ln" x1="558" y1="197" x2="609" y2="197" stroke-width="1.2"/>
+  <polygon class="arr" points="616,197 608,193 608,201"/>
+
+  <!-- ── Right: Output boxes (x=616, w=168) ──────────────────────────────── -->
+  <!-- SARIF y=62 cy=83 -->
+  <rect class="out" x="616" y="62" width="168" height="42" rx="5" stroke-width="1"/>
+  <text class="ot m" x="700" y="79" text-anchor="middle" font-size="11" font-weight="600">SARIF 2.1.0</text>
+  <text class="os s" x="700" y="94" text-anchor="middle" font-size="9.5">GitHub Code Scanning</text>
+
+  <!-- Terminal y=119 cy=140 -->
+  <rect class="out" x="616" y="119" width="168" height="42" rx="5" stroke-width="1"/>
+  <text class="ot m" x="700" y="136" text-anchor="middle" font-size="11" font-weight="600">Terminal Report</text>
+  <text class="os s" x="700" y="151" text-anchor="middle" font-size="9.5">Color-coded findings table</text>
+
+  <!-- JSON y=176 cy=197 -->
+  <rect class="out" x="616" y="176" width="168" height="42" rx="5" stroke-width="1"/>
+  <text class="ot m" x="700" y="193" text-anchor="middle" font-size="11" font-weight="600">JSON Export</text>
+  <text class="os s" x="700" y="208" text-anchor="middle" font-size="9.5">Structured findings data</text>
+</svg>
