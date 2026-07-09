@@ -1684,15 +1684,18 @@ fn copy_dir_inner(
 }
 
 /// Build the default SAST prompt for a standalone scan.
-fn build_sast_prompt(dir: &std::path::Path) -> String {
+fn build_sast_prompt(dir: &std::path::Path, sandbox_path: &std::path::Path) -> String {
     let name = dir
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("codebase");
+    let sandbox_str = sandbox_path.to_string_lossy();
     format!(
         r#"You are a security engineer performing a comprehensive SAST (Static Application Security Testing) scan.
 
-The codebase "{name}" is available in your local sandbox. Use your tools to enumerate and read the source files.
+The codebase "{name}" has been copied to your local sandbox at `{sandbox_str}`.
+That directory is your working directory — use your tools to enumerate and read the source files from there.
+Start with `execute_command("find . -type f | head -100")` or `execute_command("ls -la")` to discover the file tree.
 
 ## Scan scope
 Analyse all source files for security vulnerabilities. Focus on:
@@ -2130,7 +2133,7 @@ async fn cmd_scan_sast(
     std::env::set_var("STROBES_AI_SANDBOX", &sandbox_path);
 
     // 5. Build the prompt.
-    let prompt = custom_prompt.unwrap_or_else(|| build_sast_prompt(&src));
+    let prompt = custom_prompt.unwrap_or_else(|| build_sast_prompt(&src, &sandbox_path));
 
     // 6. Create standalone thread (or workspace-bound if --workspace supplied).
     let client = api::ApiClient::new(p.clone())?;
@@ -4063,7 +4066,8 @@ fn sniff_json(content: &str) -> Option<IacType> {
 
 // ── Prompt builder ─────────────────────────────────────────────────────────
 
-fn build_iac_prompt(target: &str, files: &[IacFile]) -> String {
+fn build_iac_prompt(target: &str, files: &[IacFile], sandbox_path: &std::path::Path) -> String {
+    let sandbox_str = sandbox_path.to_string_lossy();
     // Group by type for the summary section.
     let mut by_type: std::collections::BTreeMap<String, Vec<&str>> = std::collections::BTreeMap::new();
     for f in files {
@@ -4078,7 +4082,8 @@ fn build_iac_prompt(target: &str, files: &[IacFile]) -> String {
         r#"You are a cloud security engineer performing an Infrastructure-as-Code (IaC) security audit.
 
 Target: {target}
-All IaC files listed below are available in your sandbox — use your file-reading tools to inspect each one.
+All IaC files listed below have been copied to your local sandbox at `{sandbox_str}`.
+That directory is your working directory — use your file-reading tools to inspect each file from there.
 
 ## Detected IaC Files
 
@@ -4326,7 +4331,7 @@ async fn cmd_ci_iac(
     std::env::set_var("STROBES_AI_SANDBOX", &sandbox_path);
 
     // 3. Build prompt and launch scan.
-    let prompt = build_iac_prompt(&target_name, &iac_files);
+    let prompt = build_iac_prompt(&target_name, &iac_files, &sandbox_path);
     let client = api::ApiClient::new(p.clone())?;
     let thread_id = client.create_thread(
         &format!("IaC scan: {target_name}"), workspace.as_deref(), None).await?;
