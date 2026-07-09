@@ -2132,20 +2132,11 @@ async fn cmd_scan_sast(
     // 5. Build the prompt.
     let prompt = custom_prompt.unwrap_or_else(|| build_sast_prompt(&src));
 
-    // 6. Create workspace + thread, then run the scan.
+    // 6. Create standalone thread (or workspace-bound if --workspace supplied).
     let client = api::ApiClient::new(p.clone())?;
-    let workspace_id: Option<String> = match workspace {
-        Some(ws) => Some(ws),
-        None => {
-            let (id, _) = client.create_workspace(&format!("SAST: {target_name}")).await?;
-            eprintln!("workspace: {id}");
-            Some(id)
-        }
-    };
-
     let thread_title = format!("SAST scan: {target_name}");
     let thread_id = client
-        .create_thread(&thread_title, workspace_id.as_deref(), None)
+        .create_thread(&thread_title, workspace.as_deref(), None)
         .await?;
     eprintln!("thread: {thread_id}");
 
@@ -2260,7 +2251,7 @@ async fn cmd_scan_sast(
         "json" => {
             serde_json::to_string_pretty(&serde_json::json!({
                 "scan_target": target_name,
-                "workspace_id": workspace_id,
+                "workspace_id": workspace,
                 "thread_id": thread_id,
                 "elapsed_secs": elapsed.as_secs(),
                 "findings": findings,
@@ -3311,16 +3302,8 @@ async fn cmd_scan_sca(
     // 6. Build AI prompt and launch scan.
     let prompt = build_sca_prompt(&target_name, &all_vulns);
     let client = api::ApiClient::new(p.clone())?;
-    let workspace_id: Option<String> = match workspace {
-        Some(ws) => Some(ws),
-        None => {
-            let (id, _) = client.create_workspace(&format!("SCA: {target_name}")).await?;
-            eprintln!("workspace: {id}");
-            Some(id)
-        }
-    };
     let thread_id = client.create_thread(
-        &format!("SCA reachability: {target_name}"), workspace_id.as_deref(), None).await?;
+        &format!("SCA reachability: {target_name}"), workspace.as_deref(), None).await?;
     eprintln!("thread: {thread_id}\n");
 
     let (tx, mut rx) = mpsc::unbounded_channel::<pulse::AppEvent>();
@@ -3820,16 +3803,8 @@ async fn cmd_scan_container(
     // 6. Launch AI reachability.
     let prompt = build_container_prompt(&image, &scan.os_label, &all_vulns);
     let client = api::ApiClient::new(p.clone())?;
-    let workspace_id: Option<String> = match workspace {
-        Some(ws) => Some(ws),
-        None => {
-            let (id, _) = client.create_workspace(&format!("Container: {image}")).await?;
-            eprintln!("workspace: {id}");
-            Some(id)
-        }
-    };
     let thread_id = client.create_thread(
-        &format!("Container scan: {image}"), workspace_id.as_deref(), None).await?;
+        &format!("Container scan: {image}"), workspace.as_deref(), None).await?;
     eprintln!("thread: {thread_id}\n");
 
     let (tx, mut rx) = mpsc::unbounded_channel::<pulse::AppEvent>();
@@ -4353,16 +4328,8 @@ async fn cmd_ci_iac(
     // 3. Build prompt and launch scan.
     let prompt = build_iac_prompt(&target_name, &iac_files);
     let client = api::ApiClient::new(p.clone())?;
-    let workspace_id: Option<String> = match workspace {
-        Some(ws) => Some(ws),
-        None => {
-            let (id, _) = client.create_workspace(&format!("IaC: {target_name}")).await?;
-            eprintln!("workspace: {id}");
-            Some(id)
-        }
-    };
     let thread_id = client.create_thread(
-        &format!("IaC scan: {target_name}"), workspace_id.as_deref(), None).await?;
+        &format!("IaC scan: {target_name}"), workspace.as_deref(), None).await?;
     eprintln!("thread: {thread_id}\n");
 
     let (tx, mut rx) = mpsc::unbounded_channel::<pulse::AppEvent>();
@@ -4762,20 +4729,11 @@ async fn cmd_scan_dast(
         )
     });
 
-    // 2. Create workspace + thread.
+    // 2. Create standalone thread (or workspace-bound if --workspace supplied).
     let client = api::ApiClient::new(p.clone())?;
-    let workspace_id: Option<String> = match workspace {
-        Some(ws) => Some(ws),
-        None => {
-            let (id, _) = client.create_workspace(&format!("DAST: {target_label}")).await?;
-            eprintln!("workspace: {id}");
-            Some(id)
-        }
-    };
-
     let thread_title = format!("DAST scan: {target_label}");
     let thread_id = client
-        .create_thread(&thread_title, workspace_id.as_deref(), None)
+        .create_thread(&thread_title, workspace.as_deref(), None)
         .await?;
     eprintln!("thread: {thread_id}");
 
@@ -4879,7 +4837,7 @@ async fn cmd_scan_dast(
     let output_content = match output_fmt.as_str() {
         "json" => serde_json::to_string_pretty(&serde_json::json!({
             "scan_target": target_url,
-            "workspace_id": workspace_id,
+            "workspace_id": workspace,
             "thread_id": thread_id,
             "elapsed_secs": elapsed.as_secs(),
             "findings": findings,
