@@ -27,6 +27,27 @@ Prebuilt binaries for every platform are published on
 curl -fsSL https://raw.githubusercontent.com/strobes-co/strobes-agents-cli/main/install.sh | bash
 ```
 
+This also installs the **sandbox pack**: bundled security tools (`nuclei`, `httpx`,
+`subfinder`, `dnsx`, `ffuf`, `gobuster`, `nmap`) and a standalone Python with the
+agent packages baked in. Agent commands run with these on PATH, so a fresh machine
+behaves like the cloud sandbox — no Docker, no root, no system Python.
+
+```bash
+strobes pack                 # where it is, and which interpreter the agent uses
+strobes pack --install       # (re)install it
+STROBES_SKIP_PACK=1 …| bash  # binary only
+```
+
+The pack is shared with the Strobes bridge — if you already run
+`strobes-shell-agent` on this machine, the CLI uses the pack that is already
+there rather than downloading a second copy. Without a pack everything still
+works; the agent just falls back to whatever tools the host has.
+
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/strobes-co/strobes-agents-cli/main/install.sh | bash
+```
+
 <details>
 <summary>or, without the install script (pure curl):</summary>
 
