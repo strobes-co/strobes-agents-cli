@@ -97,18 +97,43 @@ pub async fn run_tool(tool_name: &str, input: &serde_json::Value) -> LocalResult
     }
 }
 
+
+/// Single-quote a value for POSIX sh, so a pack path containing spaces or shell
+/// metacharacters cannot break (or reshape) the command it is prepended to.
+fn shell_quote(v: &str) -> String {
+    format!("'{}'", v.replace('\'', "'\\''"))
+}
+
 async fn run_shell(command: &str, sandbox: &std::path::Path) -> LocalResult {
     let _ = std::fs::create_dir_all(sandbox);
     // Use the native shell: cmd.exe on Windows, login bash elsewhere.
+    // Prepend the pack INSIDE the shell, not via `Command::env`.
+    //
+    // `bash -lc` is a LOGIN shell: it sources the user's profile, which re-sets
+    // PATH and discards anything the parent process exported. Measured — with the
+    // env-var approach `nmap` resolved to the pack (Homebrew has none) while
+    // `nuclei`, `httpx` and `python3` all came from /opt/homebrew and
+    // CommandLineTools. Exporting after profile load is what actually wins.
+    let effective = match crate::pack::pack_path_prefix() {
+        Some(path) if !cfg!(windows) => {
+            format!("export PATH={}:\"$PATH\"; {}", shell_quote(&path), command)
+        }
+        _ => command.to_string(),
+    };
     let mut cmd = if cfg!(windows) {
         let mut c = Command::new("cmd");
-        c.arg("/C").arg(command);
+        c.arg("/C").arg(&effective);
         c
     } else {
         let mut c = Command::new("/bin/bash");
-        c.arg("-lc").arg(command);
+        c.arg("-lc").arg(&effective);
         c
     };
+    // Put the sandbox pack's tools in front on PATH so nmap/nuclei/httpx/… resolve
+    // to the bundled copies, exactly as the bridge daemon does. No-op without a pack.
+    if let Some(path) = crate::pack::path_with_pack() {
+        cmd.env("PATH", path);
+    }
     let out = cmd
         .current_dir(sandbox)
         .stdout(Stdio::piped())
@@ -119,10 +144,12 @@ async fn run_shell(command: &str, sandbox: &std::path::Path) -> LocalResult {
 }
 
 async fn run_code(code: &str, lang: &str, sandbox: &std::path::Path) -> LocalResult {
-    // The Python launcher is `python` on Windows, `python3` elsewhere.
-    let python = if cfg!(windows) { "python" } else { "python3" };
+    // The pack's standalone interpreter when one is installed (it has boto3,
+    // curl_cffi, reportlab, strobes_pt … baked in); otherwise the host launcher,
+    // `python` on Windows and `python3` elsewhere.
+    let python = crate::pack::python_interpreter();
     let (program, args, suffix): (&str, Vec<&str>, &str) = match lang.to_lowercase().as_str() {
-        "python" | "python3" | "py" => (python, vec![], ".py"),
+        "python" | "python3" | "py" => (python.as_str(), vec![], ".py"),
         "bash" | "sh" | "shell" => ("bash", vec![], ".sh"),
         "javascript" | "js" | "node" => ("node", vec![], ".js"),
         "ruby" => ("ruby", vec![], ".rb"),
@@ -148,6 +175,11 @@ async fn run_code(code: &str, lang: &str, sandbox: &std::path::Path) -> LocalRes
     let out = Command::new(program)
         .args(&args)
         .arg(&file)
+        .envs(
+            crate::pack::path_with_pack()
+                .map(|p| vec![("PATH".to_string(), p)])
+                .unwrap_or_default(),
+        )
         .current_dir(sandbox)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

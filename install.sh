@@ -5,6 +5,8 @@
 # Env overrides:
 #   STROBES_INSTALL_DIR   install location (default: /usr/local/bin)
 #   STROBES_VERSION       release tag to install (default: latest)
+#   STROBES_SKIP_PACK     set to 1 to skip the sandbox pack (binary only)
+#   STROBES_PACK_URL      base URL to fetch the pack from (default: bridge release)
 set -euo pipefail
 
 REPO="strobes-co/strobes-agents-cli"
@@ -46,4 +48,24 @@ else
 fi
 
 echo "✔ installed: $("$INSTALL_DIR/strobes" --help 2>/dev/null | head -1)"
+
+# The sandbox pack — bundled scanners (nmap/nuclei/httpx/…) and a standalone
+# Python with the agent packages baked in. Without it the agent runs on whatever
+# happens to be on your PATH, which on a fresh machine is close to nothing.
+#
+# Best-effort and non-fatal: a failed or skipped pack must still leave you with a
+# working CLI, and the agent degrades to host tools exactly as it did before packs
+# existed. `strobes pack --install` retries later.
+if [ "${STROBES_SKIP_PACK:-0}" = "1" ]; then
+  echo "→ skipping sandbox pack (STROBES_SKIP_PACK=1)"
+elif "$INSTALL_DIR/strobes" pack 2>/dev/null | grep -q "^pack        /"; then
+  echo "✔ sandbox pack already present"
+else
+  echo "→ installing sandbox pack (scanners + bundled python)…"
+  if ! "$INSTALL_DIR/strobes" pack --install; then
+    echo "⚠ sandbox pack not installed — the agent will use this host's tools."
+    echo "  retry any time with: strobes pack --install"
+  fi
+fi
+
 echo "  run: strobes --help"

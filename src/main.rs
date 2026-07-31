@@ -10,6 +10,7 @@ mod app;
 mod browser;
 mod config;
 mod local;
+mod pack;
 mod markdown;
 mod picker;
 mod pulse;
@@ -138,6 +139,15 @@ enum Cmd {
     },
     /// Show the active profile and connectivity.
     Status,
+    /// Manage the sandbox pack — the bundled scanners + Python the agent runs with
+    Pack {
+        /// Download and install the pack for this platform
+        #[arg(long)]
+        install: bool,
+        /// Base URL to fetch from (default: the Strobes bridge's pack release)
+        #[arg(long)]
+        url: Option<String>,
+    },
     /// List remote workspaces.
     Workspaces,
     /// List your chat threads.
@@ -674,6 +684,23 @@ async fn main() -> Result<()> {
         Cmd::Tenants => cmd_tenants(&cfg),
         Cmd::Credits { workspace, thread } => cmd_credits(&profile, workspace, thread).await,
         Cmd::Status => cmd_status(&profile).await,
+        Cmd::Pack { install, url } => {
+            if let Some(u) = url {
+                std::env::set_var("STROBES_PACK_URL", u);
+            }
+            if install {
+                pack::install(None).await.map(|_| ())
+            } else {
+                // Default to reporting, so `strobes pack` is safe to run blind.
+                println!("{}", pack::status_line());
+                println!("triple      {}", pack::triple());
+                println!("python      {}", pack::python_interpreter());
+                if pack::find_pack().is_none() {
+                    println!("\nInstall with: strobes pack --install");
+                }
+                Ok(())
+            }
+        }
         Cmd::Workspaces => cmd_workspaces(&profile).await,
         Cmd::Threads => cmd_threads(&profile).await,
         Cmd::Bind { workspace, new, name, download, dir } => {
@@ -1293,6 +1320,16 @@ async fn cmd_probe(p: &config::Profile, thread_id: &str, send: Option<String>, s
     let (tx, mut rx) = mpsc::unbounded_channel::<pulse::AppEvent>();
     let handle = pulse::connect(p, thread_id, tx, model).await?;
     println!("[probe] connected to {}", p.pulse_ws_url(thread_id)?.split('?').next().unwrap_or(""));
+    // Say it once, up front, rather than downloading hundreds of MB unannounced
+    // mid-run. Without a pack the agent still works — it just runs on whatever
+    // this host happens to have, which is usually the difference between "scanned
+    // the target" and "nmap: command not found".
+    if pack::find_pack().is_none() {
+        println!(
+            "[probe] no sandbox pack — agent will use this host's tools. \
+             Install with: strobes pack --install"
+        );
+    }
     if let Some(text) = send {
         handle.send_user_message(&text);
         println!("[probe] sent: {text}");
@@ -5432,6 +5469,9 @@ async fn cmd_status(p: &config::Profile) -> Result<()> {
     }
     println!("workspace   {}", p.workspace_id.clone().unwrap_or_else(|| "(none)".into()));
     println!("thread      {}", p.thread_id.clone().unwrap_or_else(|| "(none)".into()));
+    // Whether the agent has the bundled toolset or is running on whatever the
+    // host happens to have — the difference decides half its capability.
+    println!("{}", crate::pack::status_line());
     if p.is_complete() {
         let client = api::ApiClient::new(p.clone())?;
         let (ping, latest) = tokio::join!(client.ping(), latest_release_version());
