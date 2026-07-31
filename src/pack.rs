@@ -343,6 +343,13 @@ pub async fn install(dest_root: Option<PathBuf>) -> anyhow::Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Env vars are PROCESS-global and cargo runs tests in parallel, so a test
+    /// that sets `STROBES_PACK_DISABLE` was changing what an unrelated test saw
+    /// mid-assertion. Measured 2 flaky runs in 6 before this. Every test that
+    /// touches the environment takes this lock.
+    static ENV: Mutex<()> = Mutex::new(());
 
     #[test]
     fn triple_is_os_dash_arch() {
@@ -359,6 +366,7 @@ mod tests {
 
     #[test]
     fn disable_env_wins_over_everything() {
+        let _guard = ENV.lock().unwrap_or_else(|e| e.into_inner());
         // Ordering matters more than the value: a user who sets DISABLE expects
         // the host's own environment, even with a perfectly good pack installed.
         std::env::set_var(PACK_DISABLE_ENV, "1");
@@ -385,6 +393,7 @@ mod tests {
 
     #[test]
     fn no_pack_means_host_python_and_untouched_path() {
+        let _guard = ENV.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var(PACK_DISABLE_ENV, "1");
         let interp = python_interpreter();
         let path = path_with_pack();

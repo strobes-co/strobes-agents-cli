@@ -668,8 +668,33 @@ enum CiCmd {
     },
 }
 
+/// Restore the default SIGPIPE disposition on Unix.
+///
+/// Rust sets SIGPIPE to SIG_IGN before `main`, so a write to a closed pipe returns
+/// EPIPE and the stdout machinery panics instead of the process dying quietly the
+/// way every other CLI does. That makes `strobes status | head -1` print a Rust
+/// panic and backtrace note — measured 8/8 runs, and 5/5 on v0.8.2, so it predates
+/// the pack work. It bites `status` in particular because its connectivity and
+/// update checks print asynchronously, after `head` has already gone away.
+///
+/// Restoring SIG_DFL is what tools meant to be piped do; the process is then
+/// terminated by the signal, which is the behaviour `head`/`grep -q` callers
+/// expect.
+#[cfg(unix)]
+fn restore_default_sigpipe() {
+    // SAFETY: setting a signal disposition to the default is async-signal-safe and
+    // is done once, before any threads are spawned.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
+#[cfg(not(unix))]
+fn restore_default_sigpipe() {}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    restore_default_sigpipe();
     let cli = Cli::parse();
     let mut cfg = Config::load();
     // Select the tenant for this run without mutating the stored default.
