@@ -413,7 +413,7 @@ async fn run_workspace_setup(
     );
 
     let (app_tx, mut app_rx) = mpsc::unbounded_channel::<AppEvent>();
-    let handle = pulse::connect(profile, thread_id, app_tx, None)
+    let handle = pulse::connect(profile, thread_id, app_tx, None, None)
         .await
         .map_err(|e| anyhow!("workspace setup connect: {e}"))?;
 
@@ -495,7 +495,7 @@ async fn run_task(
     });
 
     let (app_tx, mut app_rx) = mpsc::unbounded_channel::<AppEvent>();
-    let handle = pulse::connect(profile, &thread_id, app_tx, model)
+    let handle = pulse::connect(profile, &thread_id, app_tx, model, None)
         .await
         .map_err(|e| format!("connect: {e}"))?;
 

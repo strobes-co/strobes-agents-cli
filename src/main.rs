@@ -98,6 +98,10 @@ enum Cmd {
         workspace: Option<String>,
         #[arg(long, short)]
         model: Option<i64>,
+        /// Reasoning depth: low, medium, high, xhigh, max. Persists on the
+        /// thread like the model, so it only needs setting once.
+        #[arg(long, value_name = "LEVEL")]
+        reasoning: Option<String>,
         /// Force the thread picker / create a new thread instead of resuming.
         #[arg(long)]
         new: bool,
@@ -197,6 +201,10 @@ enum Cmd {
         /// LLM model picker id (e.g. 4 = Haiku, 18 = Sonnet 4.6).
         #[arg(long, short)]
         model: Option<i64>,
+        /// Reasoning depth: low, medium, high, xhigh, max. Persists on the
+        /// thread like the model, so it only needs setting once.
+        #[arg(long, value_name = "LEVEL")]
+        reasoning: Option<String>,
     },
     /// Run YAML-based offline workflows (sequence, parallel, DAG).
     Workflow {
@@ -220,6 +228,10 @@ enum Cmd {
         /// LLM model picker id.
         #[arg(long, short)]
         model: Option<i64>,
+        /// Reasoning depth: low, medium, high, xhigh, max. Persists on the
+        /// thread like the model, so it only needs setting once.
+        #[arg(long, value_name = "LEVEL")]
+        reasoning: Option<String>,
         /// Output format: text (default) or json.
         #[arg(long, default_value = "text", value_name = "FORMAT")]
         output: String,
@@ -475,6 +487,10 @@ enum CiCmd {
         /// LLM model picker id.
         #[arg(long, short)]
         model: Option<i64>,
+        /// Reasoning depth: low, medium, high, xhigh, max. Persists on the
+        /// thread like the model, so it only needs setting once.
+        #[arg(long, value_name = "LEVEL")]
+        reasoning: Option<String>,
         /// Abort after this many seconds if the scan has not finished (default: 600).
         #[arg(long, default_value = "600", value_name = "SECS")]
         timeout: u64,
@@ -522,6 +538,10 @@ enum CiCmd {
         /// LLM model picker id.
         #[arg(long, short)]
         model: Option<i64>,
+        /// Reasoning depth: low, medium, high, xhigh, max. Persists on the
+        /// thread like the model, so it only needs setting once.
+        #[arg(long, value_name = "LEVEL")]
+        reasoning: Option<String>,
         /// Abort AI analysis after this many seconds (default: 600).
         #[arg(long, default_value = "600", value_name = "SECS")]
         timeout: u64,
@@ -563,6 +583,10 @@ enum CiCmd {
         /// LLM model picker id.
         #[arg(long, short)]
         model: Option<i64>,
+        /// Reasoning depth: low, medium, high, xhigh, max. Persists on the
+        /// thread like the model, so it only needs setting once.
+        #[arg(long, value_name = "LEVEL")]
+        reasoning: Option<String>,
         /// Abort AI analysis after this many seconds (default: 600).
         #[arg(long, default_value = "600", value_name = "SECS")]
         timeout: u64,
@@ -607,6 +631,10 @@ enum CiCmd {
         /// LLM model picker id.
         #[arg(long, short)]
         model: Option<i64>,
+        /// Reasoning depth: low, medium, high, xhigh, max. Persists on the
+        /// thread like the model, so it only needs setting once.
+        #[arg(long, value_name = "LEVEL")]
+        reasoning: Option<String>,
         /// Abort after this many seconds (default: 600).
         #[arg(long, default_value = "600", value_name = "SECS")]
         timeout: u64,
@@ -658,6 +686,10 @@ enum CiCmd {
         /// LLM model picker id.
         #[arg(long, short)]
         model: Option<i64>,
+        /// Reasoning depth: low, medium, high, xhigh, max. Persists on the
+        /// thread like the model, so it only needs setting once.
+        #[arg(long, value_name = "LEVEL")]
+        reasoning: Option<String>,
         /// Abort after this many seconds if the scan has not finished (default: 900).
         #[arg(long, default_value = "900", value_name = "SECS")]
         timeout: u64,
@@ -701,7 +733,7 @@ async fn main() -> Result<()> {
     let tenant = cli.tenant.clone().unwrap_or_else(|| cfg.current_profile.clone());
     let profile = cfg.profile_for(&tenant);
 
-    match cli.cmd.unwrap_or(Cmd::Chat { thread: None, workspace: None, model: None, new: false }) {
+    match cli.cmd.unwrap_or(Cmd::Chat { thread: None, workspace: None, model: None, reasoning: None, new: false }) {
         Cmd::Login { base_url, org_id, master_key, deployment, no_verify } => {
             cmd_login(&mut cfg, &tenant, base_url, org_id, master_key, deployment, no_verify).await
         }
@@ -733,7 +765,8 @@ async fn main() -> Result<()> {
         }
         Cmd::Pull { workspace, dir } => cmd_pull(&mut cfg, &profile, workspace, dir).await,
         Cmd::Push { files, workspace, dir } => cmd_push(&cfg, &profile, files, workspace, dir).await,
-        Cmd::Chat { thread, workspace, model, new } => {
+        Cmd::Chat { thread, workspace, model, reasoning, new } => {
+            let reasoning = reasoning;
             // Enter the alternate screen ONCE for the whole interactive flow
             // (pickers + chat) and restore ONCE, so switching between workspace,
             // thread, and chat never flashes the normal terminal.
@@ -747,31 +780,31 @@ async fn main() -> Result<()> {
             // parsing and collides with SGR mouse reports — leaking raw scroll
             // sequences (e.g. `[<64;..M`) into the input. Newlines use Ctrl+J.
             enable_mouse();
-            let r = chat_flow(&mut terminal, &mut cfg, &tenant, profile, thread, workspace, new, model).await;
+            let r = chat_flow(&mut terminal, &mut cfg, &tenant, profile, thread, workspace, new, model, reasoning).await;
             disable_mouse();
             ratatui::restore();
             r
         }
-        Cmd::Probe { thread, send, secs, model } => cmd_probe(&profile, &thread, send, secs, model).await,
+        Cmd::Probe { thread, send, secs, model, reasoning } => cmd_probe(&profile, &thread, send, secs, model, reasoning).await,
         Cmd::Workflow { sub } => cmd_workflow(profile, sub, &tenant).await,
-        Cmd::Send { message, workspace, new_workspace, title, model, output, non_interactive, timeout, fail_on_findings, sandbox_id, agent } => {
-            cmd_send(&profile, message, workspace, new_workspace, title, model, &output, non_interactive, timeout, fail_on_findings, sandbox_id, agent).await
+        Cmd::Send { message, workspace, new_workspace, title, model, reasoning, output, non_interactive, timeout, fail_on_findings, sandbox_id, agent } => {
+            cmd_send(&profile, message, workspace, new_workspace, title, model, reasoning, &output, non_interactive, timeout, fail_on_findings, sandbox_id, agent).await
         }
         Cmd::Ci { sub } => match sub {
-            CiCmd::Sast { dir, output, output_file, prompt, workspace, model, timeout, fail_on, exclude, max_mb } => {
-                cmd_scan_sast(&profile, dir, output, output_file, prompt, workspace, model, timeout, fail_on, exclude, max_mb).await
+            CiCmd::Sast { dir, output, output_file, prompt, workspace, model, reasoning, timeout, fail_on, exclude, max_mb } => {
+                cmd_scan_sast(&profile, dir, output, output_file, prompt, workspace, model, reasoning, timeout, fail_on, exclude, max_mb).await
             }
-            CiCmd::Sca { dir, output, output_file, workspace, model, timeout, fail_on, skip_ai, min_severity } => {
-                cmd_scan_sca(&profile, dir, output, output_file, workspace, model, timeout, fail_on, skip_ai, min_severity).await
+            CiCmd::Sca { dir, output, output_file, workspace, model, reasoning, timeout, fail_on, skip_ai, min_severity } => {
+                cmd_scan_sca(&profile, dir, output, output_file, workspace, model, reasoning, timeout, fail_on, skip_ai, min_severity).await
             }
-            CiCmd::Container { image, output, output_file, workspace, model, timeout, fail_on, skip_ai, min_severity, platform } => {
-                cmd_scan_container(&profile, image, output, output_file, workspace, model, timeout, fail_on, skip_ai, min_severity, platform).await
+            CiCmd::Container { image, output, output_file, workspace, model, reasoning, timeout, fail_on, skip_ai, min_severity, platform } => {
+                cmd_scan_container(&profile, image, output, output_file, workspace, model, reasoning, timeout, fail_on, skip_ai, min_severity, platform).await
             }
-            CiCmd::Iac { dir, output, output_file, workspace, model, timeout, fail_on, only } => {
-                cmd_ci_iac(&profile, dir, output, output_file, workspace, model, timeout, fail_on, only).await
+            CiCmd::Iac { dir, output, output_file, workspace, model, reasoning, timeout, fail_on, only } => {
+                cmd_ci_iac(&profile, dir, output, output_file, workspace, model, reasoning, timeout, fail_on, only).await
             }
-            CiCmd::Dast { url, output, output_file, prompt, cookie, bearer, scope, workspace, model, timeout, fail_on } => {
-                cmd_scan_dast(&profile, url, output, output_file, prompt, cookie, bearer, scope, workspace, model, timeout, fail_on).await
+            CiCmd::Dast { url, output, output_file, prompt, cookie, bearer, scope, workspace, model, reasoning, timeout, fail_on } => {
+                cmd_scan_dast(&profile, url, output, output_file, prompt, cookie, bearer, scope, workspace, model, reasoning, timeout, fail_on).await
             }
         },
         Cmd::Findings { workspace, format, fail_on } => {
@@ -794,6 +827,7 @@ async fn chat_flow(
     workspace: Option<String>,
     new: bool,
     model: Option<i64>,
+    reasoning: Option<String>,
 ) -> Result<()> {
     if let Some(w) = &workspace {
         profile.workspace_id = Some(w.clone());
@@ -852,7 +886,7 @@ async fn chat_flow(
         }
         let _ = cfg.save();
     }
-    run_chat(terminal, tenant, profile, thread_id, model, initial_msg).await
+    run_chat(terminal, tenant, profile, thread_id, model, reasoning, initial_msg).await
 }
 
 /// Show a workspace picker over the available workspaces and return the chosen
@@ -1340,10 +1374,10 @@ fn spawn_workspace_sync(
     });
 }
 
-async fn cmd_probe(p: &config::Profile, thread_id: &str, send: Option<String>, secs: u64, model: Option<i64>) -> Result<()> {
+async fn cmd_probe(p: &config::Profile, thread_id: &str, send: Option<String>, secs: u64, model: Option<i64>, reasoning: Option<String>) -> Result<()> {
     require_complete(p)?;
     let (tx, mut rx) = mpsc::unbounded_channel::<pulse::AppEvent>();
-    let handle = pulse::connect(p, thread_id, tx, model).await?;
+    let handle = pulse::connect(p, thread_id, tx, model, reasoning.clone()).await?;
     println!("[probe] connected to {}", p.pulse_ws_url(thread_id)?.split('?').next().unwrap_or(""));
     // Say it once, up front, rather than downloading hundreds of MB unannounced
     // mid-run. Without a pack the agent still works — it just runs on whatever
@@ -1400,6 +1434,7 @@ async fn cmd_send(
     new_workspace: Option<String>,
     title: Option<String>,
     model: Option<i64>,
+    reasoning: Option<String>,
     output_fmt: &str,
     non_interactive: bool,
     timeout_secs: Option<u64>,
@@ -1448,7 +1483,7 @@ async fn cmd_send(
     eprintln!("thread: {thread_id}");
 
     let (tx, mut rx) = mpsc::unbounded_channel::<pulse::AppEvent>();
-    let handle = pulse::connect(p, &thread_id, tx, model).await?;
+    let handle = pulse::connect(p, &thread_id, tx, model, reasoning.clone()).await?;
     handle.send_user_message(&message);
 
     let json_mode = output_fmt == "json";
@@ -2147,6 +2182,7 @@ async fn cmd_scan_sast(
     custom_prompt: Option<String>,
     workspace: Option<String>,
     model: Option<i64>,
+    reasoning: Option<String>,
     timeout: u64,
     fail_on: Option<String>,
     exclude: Vec<String>,
@@ -2206,7 +2242,7 @@ async fn cmd_scan_sast(
     eprintln!("thread: {thread_id}");
 
     let (tx, mut rx) = mpsc::unbounded_channel::<pulse::AppEvent>();
-    let handle = pulse::connect(p, &thread_id, tx, model).await?;
+    let handle = pulse::connect(p, &thread_id, tx, model, reasoning.clone()).await?;
     handle.send_user_message(&prompt);
 
     // 7. Live display.
@@ -3285,6 +3321,7 @@ async fn cmd_scan_sca(
     output_file: Option<String>,
     workspace: Option<String>,
     model: Option<i64>,
+    reasoning: Option<String>,
     timeout: u64,
     fail_on: Option<String>,
     skip_ai: bool,
@@ -3372,7 +3409,7 @@ async fn cmd_scan_sca(
     eprintln!("thread: {thread_id}\n");
 
     let (tx, mut rx) = mpsc::unbounded_channel::<pulse::AppEvent>();
-    let handle = pulse::connect(p, &thread_id, tx, model).await?;
+    let handle = pulse::connect(p, &thread_id, tx, model, reasoning.clone()).await?;
     handle.send_user_message(&prompt);
 
     let mut display = ScanDisplay::new(&target_name, file_count, byte_count, timeout);
@@ -3778,6 +3815,7 @@ async fn cmd_scan_container(
     output_file: Option<String>,
     workspace: Option<String>,
     model: Option<i64>,
+    reasoning: Option<String>,
     timeout: u64,
     fail_on: Option<String>,
     skip_ai: bool,
@@ -3873,7 +3911,7 @@ async fn cmd_scan_container(
     eprintln!("thread: {thread_id}\n");
 
     let (tx, mut rx) = mpsc::unbounded_channel::<pulse::AppEvent>();
-    let handle = pulse::connect(p, &thread_id, tx, model).await?;
+    let handle = pulse::connect(p, &thread_id, tx, model, reasoning.clone()).await?;
     handle.send_user_message(&prompt);
 
     let mut display = ScanDisplay::new(&image, file_count, byte_count, timeout);
@@ -4342,6 +4380,7 @@ async fn cmd_ci_iac(
     output_file: Option<String>,
     workspace: Option<String>,
     model: Option<i64>,
+    reasoning: Option<String>,
     timeout: u64,
     fail_on: Option<String>,
     only: Vec<String>,
@@ -4400,7 +4439,7 @@ async fn cmd_ci_iac(
     eprintln!("thread: {thread_id}\n");
 
     let (tx, mut rx) = mpsc::unbounded_channel::<pulse::AppEvent>();
-    let handle = pulse::connect(p, &thread_id, tx, model).await?;
+    let handle = pulse::connect(p, &thread_id, tx, model, reasoning.clone()).await?;
     handle.send_user_message(&prompt);
 
     let mut display = ScanDisplay::new(&target_name, iac_files.len() as u64, total_bytes, timeout);
@@ -4774,6 +4813,7 @@ async fn cmd_scan_dast(
     scope: Vec<String>,
     workspace: Option<String>,
     model: Option<i64>,
+    reasoning: Option<String>,
     timeout: u64,
     fail_on: Option<String>,
 ) -> Result<()> {
@@ -4805,7 +4845,7 @@ async fn cmd_scan_dast(
     eprintln!("thread: {thread_id}");
 
     let (tx, mut rx) = mpsc::unbounded_channel::<pulse::AppEvent>();
-    let handle = pulse::connect(p, &thread_id, tx, model).await?;
+    let handle = pulse::connect(p, &thread_id, tx, model, reasoning.clone()).await?;
     handle.send_user_message(&prompt);
 
     // 3. Live display — reuse ScanDisplay with "0 files" (no copy step for DAST).
@@ -5742,6 +5782,7 @@ pub async fn run_chat(
     profile: config::Profile,
     thread_id: String,
     model: Option<i64>,
+    reasoning: Option<String>,
     initial_msg: Option<String>,
 ) -> Result<()> {
     require_complete(&profile)?;
@@ -5761,7 +5802,7 @@ pub async fn run_chat(
     let mut app_tx = tx.clone(); // for background tasks (workspace sync) to post UI events
     let ws_scope = profile.workspace_id.clone();
     let (conn, events_res, threads_res, cmds_res, run_res, ws_res, credits_res) = tokio::join!(
-        pulse::connect(&profile, &thread_id, tx, model),
+        pulse::connect(&profile, &thread_id, tx, model, reasoning.clone()),
         client.get_thread_events(&thread_id, 0, 2000),
         client.list_threads(ws_scope.as_deref()),
         client.list_slash_commands(),
@@ -6223,7 +6264,7 @@ pub async fn run_chat(
                                     // Switch the live connection to the setup thread.
                                     let (ntx, nrx) = mpsc::unbounded_channel::<pulse::AppEvent>();
                                     let nclone = ntx.clone();
-                                    match pulse::connect(&profile, &setup_tid, ntx, model).await {
+                                    match pulse::connect(&profile, &setup_tid, ntx, model, reasoning.clone()).await {
                                         Ok(nh) => {
                                             handle = nh;
                                             rx = nrx;
@@ -6294,7 +6335,7 @@ pub async fn run_chat(
                 if let Some(new_thread) = target {
                     let (ntx, nrx) = mpsc::unbounded_channel::<pulse::AppEvent>();
                     let nclone = ntx.clone();
-                    match pulse::connect(&profile, &new_thread, ntx, model).await {
+                    match pulse::connect(&profile, &new_thread, ntx, model, reasoning.clone()).await {
                         Ok(nh) => {
                             handle = nh;
                             rx = nrx;
@@ -7609,7 +7650,7 @@ mod tests {
             ..Default::default()
         };
         let (tx, mut rx) = mpsc::unbounded_channel::<pulse::AppEvent>();
-        let _handle = pulse::connect(&profile, "t", tx, None).await.unwrap();
+        let _handle = pulse::connect(&profile, "t", tx, None, None).await.unwrap();
 
         let v = tokio::time::timeout(Duration::from_secs(10), server)
             .await
@@ -7666,7 +7707,7 @@ mod tests {
             ..Default::default()
         };
         let (tx, mut rx) = mpsc::unbounded_channel::<pulse::AppEvent>();
-        let handle = pulse::connect(&profile, "t", tx, None).await.unwrap();
+        let handle = pulse::connect(&profile, "t", tx, None, None).await.unwrap();
 
         // Wait for the surfaced interrupt, then answer it.
         let mut answered = false;
