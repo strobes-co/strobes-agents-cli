@@ -489,7 +489,7 @@ async fn tui_loop(
         if let Some(tid) = open_thread.take() {
             let profile = app.profile.clone();
             let tenant = app.tenant.clone();
-            let _ = crate::run_chat(terminal, &tenant, profile, tid, None, None).await;
+            let _ = crate::run_chat(terminal, &tenant, profile, tid, None, None, None).await;
             terminal.clear()?;
         }
     }

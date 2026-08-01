@@ -68,6 +68,10 @@ pub struct PulseHandle {
     workspace_id: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     /// Mutable so the user can change the model mid-chat via the model picker.
     llm_model: std::sync::Arc<std::sync::Mutex<Option<i64>>>,
+    /// Canonical reasoning effort (low/medium/high/xhigh/max). Rides in the
+    /// message context beside `llm_model` — the backend already persists it via
+    /// THREAD_CONTEXT_PERSIST_KEYS, so a level set once sticks for the thread.
+    reasoning_effort: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     stop: Arc<AtomicBool>,
     stop_notify: Arc<Notify>,
 }
@@ -94,6 +98,13 @@ impl PulseHandle {
         }
     }
 
+    /// Change the reasoning effort for subsequent messages (live, like the model).
+    pub fn set_reasoning(&self, effort: Option<String>) {
+        if let Ok(mut e) = self.reasoning_effort.lock() {
+            *e = effort;
+        }
+    }
+
     pub fn send_user_message(&self, text: &str) {
         let mut ctx = json!({ "client_type": "cli" });
         if let Some(ws) = self.workspace_id.lock().ok().and_then(|w| w.clone()) {
@@ -101,6 +112,9 @@ impl PulseHandle {
         }
         if let Some(m) = self.llm_model.lock().ok().and_then(|m| *m) {
             ctx["llm_model"] = json!(m);
+        }
+        if let Some(e) = self.reasoning_effort.lock().ok().and_then(|e| e.clone()) {
+            ctx["reasoning_effort"] = json!(e);
         }
         let frame = json!({ "type": "send_message", "text": text, "context": ctx });
         let _ = self.out.send(frame.to_string());
@@ -154,6 +168,7 @@ pub async fn connect(
     thread_id: &str,
     app_tx: mpsc::UnboundedSender<AppEvent>,
     llm_model: Option<i64>,
+    reasoning_effort: Option<String>,
 ) -> Result<PulseHandle> {
     let url = profile.pulse_ws_url(thread_id)?;
     // The first connection must succeed so the caller gets a live handle.
@@ -222,6 +237,7 @@ pub async fn connect(
         out: out_tx,
         workspace_id: std::sync::Arc::new(std::sync::Mutex::new(profile.workspace_id.clone())),
         llm_model: std::sync::Arc::new(std::sync::Mutex::new(llm_model)),
+        reasoning_effort: std::sync::Arc::new(std::sync::Mutex::new(reasoning_effort)),
         stop,
         stop_notify,
     })
