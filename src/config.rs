@@ -26,6 +26,14 @@ pub struct Profile {
     pub browser_id: Option<String>,
     #[serde(default = "default_true")]
     pub verify_tls: bool,
+    /// Base URL of the analyzer-registry ("maze") service that mints
+    /// short-lived ECR pull credentials for `strobes cicd`. Separate from
+    /// `base_url` — in practice these are different hosts (e.g.
+    /// `test.in.strobes.test` for the main app vs `maze.in.strobes.co` for
+    /// the analyzer registry), with no reliable way to derive one from the
+    /// other, so this is its own explicit field rather than a guess.
+    #[serde(default)]
+    pub analyzer_registry_url: Option<String>,
 }
 
 fn default_deployment() -> String {
@@ -57,6 +65,23 @@ impl Profile {
         if base.is_empty() {
             return Err(anyhow!("base_url is empty — run `strobes login` first"));
         }
+        if !base.contains("://") {
+            base = format!("https://{base}");
+        }
+        Ok(base)
+    }
+
+    /// Normalized analyzer-registry ("maze") origin, for `strobes cicd`.
+    /// Separate host from `base_url` — see the field doc for why there's no
+    /// derivation between them.
+    pub fn analyzer_registry_base(&self) -> Result<String> {
+        let raw = self.analyzer_registry_url.as_deref().unwrap_or("").trim();
+        if raw.is_empty() {
+            return Err(anyhow!(
+                "analyzer_registry_url is not set — run `strobes login --analyzer-registry-url <url>` first"
+            ));
+        }
+        let mut base = raw.trim_end_matches('/').to_string();
         if !base.contains("://") {
             base = format!("https://{base}");
         }
@@ -259,6 +284,9 @@ impl Config {
         }
         if let Ok(v) = std::env::var("STROBES_AI_DEPLOYMENT") {
             p.deployment = v;
+        }
+        if let Ok(v) = std::env::var("STROBES_AI_ANALYZER_REGISTRY_URL") {
+            p.analyzer_registry_url = Some(v);
         }
         p
     }

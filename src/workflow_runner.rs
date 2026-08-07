@@ -195,6 +195,23 @@ pub async fn run(
     let mut ws_profile = profile.clone();
     ws_profile.workspace_id = Some(workspace_id.clone());
 
+    // Mirror the workspace's files locally and point the sandbox at them —
+    // same sync `strobes chat`/`strobes send` do. Without this, every task's
+    // execute_command/execute_code ran against an unrelated, empty
+    // thread-scoped scratch dir that had nothing to do with the workspace.
+    let _ = ev_tx.send(WfEvent::Log("syncing workspace files locally…".into()));
+    match crate::sync_workspace_sandbox(&ws_profile, &workspace_id).await {
+        Ok(crate::WorkspaceSyncOutcome::Synced(n)) => {
+            let _ = ev_tx.send(WfEvent::Log(format!("✔ synced {n} workspace file(s) locally")));
+        }
+        Ok(crate::WorkspaceSyncOutcome::Empty) => {
+            let _ = ev_tx.send(WfEvent::Log("workspace has no files yet — nothing to sync".into()));
+        }
+        Err(e) => {
+            let _ = ev_tx.send(WfEvent::Log(format!("⚠ workspace sync failed: {e} — tasks will use an empty sandbox")));
+        }
+    }
+
     // Run workspace setup only for fresh runs.
     if !is_resume {
         if let Some(thread_id) = setup_thread {

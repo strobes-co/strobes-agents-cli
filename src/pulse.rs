@@ -8,7 +8,7 @@
 //! events instead of running code in the cloud; we run them locally and reply
 //! with `tool.local_result`, making this machine the sandbox.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -140,6 +140,14 @@ impl PulseHandle {
 /// override active, dial the static IP directly (keeping the `Host` header from
 /// the URL) so we skip the slow `.local`/mDNS lookup. Otherwise use the normal
 /// resolver. `wss://` always uses the standard path.
+/// Bound on the WS handshake — without it a stalled connect (bad network,
+/// firewall silently dropping packets) hangs `dial_ws`'s caller forever,
+/// since neither `TcpStream::connect` nor `connect_async` have a timeout of
+/// their own. `connect`'s callers (chat startup, thread switch) run in the
+/// main render loop, so a hang here used to be indistinguishable from the
+/// whole app freezing — only Ctrl+C got you out.
+const DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
 async fn dial_ws(
     url: &str,
     profile: &Profile,
@@ -151,15 +159,22 @@ async fn dial_ws(
     if !is_tls {
         if let Some(ip) = profile.resolve_override() {
             let port = parsed.port().unwrap_or(80);
-            let tcp = tokio::net::TcpStream::connect((ip, port)).await?;
+            let tcp = tokio::time::timeout(DIAL_TIMEOUT, tokio::net::TcpStream::connect((ip, port)))
+                .await
+                .context("connecting to the server timed out")??;
             let req = url.into_client_request()?; // preserves Host + api_key query
-            let (ws, _resp) =
-                tokio_tungstenite::client_async(req, tokio_tungstenite::MaybeTlsStream::Plain(tcp))
-                    .await?;
+            let (ws, _resp) = tokio::time::timeout(
+                DIAL_TIMEOUT,
+                tokio_tungstenite::client_async(req, tokio_tungstenite::MaybeTlsStream::Plain(tcp)),
+            )
+            .await
+            .context("WebSocket handshake timed out")??;
             return Ok(ws);
         }
     }
-    let (ws, _resp) = tokio_tungstenite::connect_async(url).await?;
+    let (ws, _resp) = tokio::time::timeout(DIAL_TIMEOUT, tokio_tungstenite::connect_async(url))
+        .await
+        .context("WebSocket handshake timed out")??;
     Ok(ws)
 }
 
@@ -550,11 +565,26 @@ fn handle_frame(v: Value, app_tx: &mpsc::UnboundedSender<AppEvent>, out_tx: &mps
                         detail: Some(detail), status: Some("start".into()), local: false, task_id: None,
                     })
                 }
-                Some("output") => Some(StreamItem {
-                    kind: "tool_output".into(), agent, text: None, tool_name: name,
-                    detail: Some(compact(b.get("result").unwrap_or(&Value::Null), 600)),
-                    status: b.get("durationMs").map(|d| format!("{d}ms")), local: false, task_id: None,
-                }),
+                Some("output") => {
+                    // Todo-tool results (the sub-agent `todo` tool, and the
+                    // orchestrator's write_todos/add_todo/etc.) get parsed
+                    // as JSON by app.rs to render a checklist — the generic
+                    // 600-char `compact()` truncation would hand it broken
+                    // JSON for any list of more than a few items.
+                    let is_todo_tool = matches!(
+                        name.as_deref(),
+                        Some("todo") | Some("write_todos") | Some("add_todo")
+                            | Some("update_todo_status") | Some("list_todos")
+                            | Some("remove_todo") | Some("clear_todos")
+                    );
+                    let result = b.get("result").unwrap_or(&Value::Null);
+                    let detail = if is_todo_tool { result.to_string() } else { compact(result, 600) };
+                    Some(StreamItem {
+                        kind: "tool_output".into(), agent, text: None, tool_name: name,
+                        detail: Some(detail),
+                        status: b.get("durationMs").map(|d| format!("{d}ms")), local: false, task_id: None,
+                    })
+                }
                 Some("failed") => Some(StreamItem {
                     kind: "tool_failed".into(), agent, text: None, tool_name: name,
                     detail: sval(&b, "error"), status: Some("failed".into()), local: false, task_id: None,
