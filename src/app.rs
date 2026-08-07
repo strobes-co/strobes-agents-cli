@@ -15,6 +15,7 @@ use ratatui::{
 };
 
 use serde_json::{Map, Value};
+use std::collections::HashMap;
 
 use crate::pulse::{AppEvent, Field, StreamItem};
 
@@ -71,8 +72,85 @@ enum Block {
     Plain(Line<'static>),
     Rule(String),
     /// A tool call line ("⏺ name(args)") with a live status: the dot blinks
-    /// while Running, then turns green (Done) or red (Failed).
-    Tool { name: String, detail: String, status: ToolStatus },
+    /// while Running, then turns green (Done) or red (Failed). `agent` is
+    /// which agent made the call — needed because a supervisor dispatching
+    /// to a sub-agent means two tool calls can be in flight at once, and
+    /// only matching by tool NAME (as this used to) let one agent's
+    /// completion event settle a same-named call that actually belonged to
+    /// the other, leaving the real match stuck Running (blinking) forever.
+    Tool { name: String, detail: String, status: ToolStatus, agent: String },
+    /// The agent's self-managed to-do list, rendered as a checklist. Each
+    /// add/complete/delete finds and updates THIS agent's existing Todos
+    /// block in place rather than appending a fresh one — a checklist
+    /// filled in one item at a time used to leave one full-list snapshot
+    /// per item, so a 5-item list rendered as 5 growing, near-duplicate
+    /// checklists stacked on top of each other.
+    Todos { agent: String, items: Vec<TodoItem> },
+}
+
+#[derive(Clone)]
+struct TodoItem {
+    id: Option<String>,
+    content: String,
+    status: String, // "pending" | "in_progress" | "completed" | anything else
+}
+
+impl TodoItem {
+    fn icon_and_color(&self) -> (&'static str, Color) {
+        match self.status.as_str() {
+            "completed" => ("✓", Color::Green),
+            "in_progress" => ("⟳", Color::Cyan),
+            "pending" => ("○", Color::DarkGray),
+            _ => ("✗", Color::Red),
+        }
+    }
+
+    /// The sub-agent scratchpad tool (`todo`) shape: `{id, text, done}`.
+    fn from_text_done(v: &Value) -> Option<Self> {
+        let content = v.get("text").and_then(|t| t.as_str())?.to_string();
+        let done = v.get("done").and_then(|d| d.as_bool()).unwrap_or(false);
+        Some(TodoItem {
+            id: json_id_string(v.get("id")),
+            content,
+            status: if done { "completed".into() } else { "pending".into() },
+        })
+    }
+
+    /// The orchestrator's Agent-Tables-backed tools (write_todos, add_todo,
+    /// update_todo_status, list_todos) shape: `{id, content|title, status}`.
+    fn from_content_status(v: &Value) -> Option<Self> {
+        let content = v
+            .get("content")
+            .or_else(|| v.get("title"))
+            .and_then(|c| c.as_str())?
+            .to_string();
+        let status = v.get("status").and_then(|s| s.as_str()).unwrap_or("pending").to_string();
+        Some(TodoItem { id: json_id_string(v.get("id")), content, status })
+    }
+}
+
+/// A todo/item id may come back as a JSON string (`"todo_abc123"`) or a
+/// number (the sub-agent tool's `id`) — normalize either to a String so the
+/// two todo systems' ids can be compared uniformly.
+fn json_id_string(v: Option<&Value>) -> Option<String> {
+    match v {
+        Some(Value::String(s)) => Some(s.clone()),
+        Some(Value::Number(n)) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
+/// Tool names that manage a todo checklist — either the per-sub-agent
+/// scratchpad (`todo`, in subagent_session_tools.py) or the orchestrator's
+/// Agent-Tables-backed suite (todo_tools.py). `tool_start` suppresses these
+/// entirely (no generic "⏺ tool(...)" line); `tool_output` renders a
+/// checklist snapshot from the result instead — see `App::apply_todo_result`.
+fn is_todo_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "todo" | "write_todos" | "add_todo" | "update_todo_status" | "list_todos"
+            | "remove_todo" | "clear_todos"
+    )
 }
 
 struct Stream {
@@ -163,7 +241,24 @@ pub struct App {
     pub base: String,
     pending: Option<Pending>,
     last_task: Option<String>,
-    last_tool: Option<String>,
+    /// (agent, tool name) of the most recent tool_start seen, so a repeated
+    /// "empty start then detailed start" pair for the SAME call enriches in
+    /// place — scoped by agent so a different agent's call with the same
+    /// tool name never gets merged into it.
+    last_tool: Option<(String, String)>,
+    /// Current todo-checklist state per agent (each sub-agent's `todo`
+    /// scratchpad is independent, per subagent_session_tools.py's session
+    /// key) — updated incrementally as add/complete/delete/list results
+    /// stream in, so each one can render a fresh full-list snapshot without
+    /// re-deriving history from the transcript.
+    todo_state: HashMap<String, Vec<TodoItem>>,
+    /// Set while waiting on a network round-trip that isn't an agent turn
+    /// (opening the threads/workspaces overlay, switching threads, etc.) —
+    /// shown as a spinner + message in the status bar so a genuine slow
+    /// network request reads as "working", not "frozen". `running` covers
+    /// the agent-turn case already; this covers everything else that used
+    /// to give no feedback at all while it awaited a response.
+    busy: Option<String>,
     overlay: Option<Overlay>,
     pub has_workspace: bool,
     // Shown top-right in the transcript: where work is running.
@@ -193,6 +288,13 @@ pub struct App {
     tasks: Vec<Task>,
     /// When true, mouse capture is off so the terminal can do native text selection.
     pub select_mode: bool,
+    /// Memoized `build_lines()` output — rebuilding re-parses every block's
+    /// Markdown from scratch, which used to happen on EVERY draw (every
+    /// keystroke, every 120ms spinner tick, every streamed token) regardless
+    /// of whether the transcript actually changed. Invalidated by comparing
+    /// `lines_fingerprint` against a cheap content hash each frame instead.
+    lines_cache: Vec<Line<'static>>,
+    lines_fingerprint: u64,
 }
 
 /// ASCII banner shown at the top of a fresh chat transcript and the pickers.
@@ -231,6 +333,8 @@ impl App {
             pending: None,
             last_task: None,
             last_tool: None,
+            todo_state: HashMap::new(),
+            busy: None,
             overlay: None,
             has_workspace: false,
             workspace_name: None,
@@ -250,6 +354,11 @@ impl App {
             current_model: None,
             tasks: Vec::new(),
             select_mode: false,
+            lines_cache: Vec::new(),
+            // 0 never matches a real fingerprint's first computation in
+            // practice, but even if it did, an empty cache just means the
+            // first draw does one harmless extra rebuild.
+            lines_fingerprint: 0,
         };
         // Banner (cyan) + the authenticated tenant on top, indented to match
         // the picker pages.
@@ -291,12 +400,18 @@ impl App {
         }
     }
 
-    /// Mark the most recent still-running tool as finished (green on success,
-    /// red on failure), stopping its blink.
-    fn finish_last_tool(&mut self, ok: bool) {
+    /// Mark the most recent still-running tool call FROM THIS AGENT as
+    /// finished (green on success, red on failure), stopping its blink.
+    /// Scoped by agent: a supervisor dispatching to a sub-agent can have two
+    /// tool calls in flight at once, and a completion event only ever
+    /// belongs to its own agent's call — matching "most recent Running,
+    /// full stop" across all agents let one agent's completion wrongly
+    /// settle a different agent's still-running call, leaving the real
+    /// match's dot blinking forever with nothing left to ever settle it.
+    fn finish_last_tool(&mut self, agent: &str, ok: bool) {
         for b in self.blocks.iter_mut().rev() {
-            if let Block::Tool { status, .. } = b {
-                if *status == ToolStatus::Running {
+            if let Block::Tool { status, agent: a, .. } = b {
+                if *status == ToolStatus::Running && a == agent {
                     *status = if ok { ToolStatus::Done } else { ToolStatus::Failed };
                     return;
                 }
@@ -314,6 +429,61 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Fold a todo-tool's JSON result into `self.todo_state[agent]` and
+    /// return the agent's updated full list, for the caller to render as a
+    /// fresh `Block::Todos` snapshot. `None` if the call failed, or if it's
+    /// a tool/action this doesn't know how to apply (`remove_todo` doesn't
+    /// echo back the removed id, so it can't be applied locally — the next
+    /// `list_todos`/`write_todos` will resync) — the caller falls back to
+    /// the normal generic tool-output line in that case.
+    fn apply_todo_result(&mut self, agent: &str, tool: &str, result: &Value) -> Option<Vec<TodoItem>> {
+        if !result.get("success").and_then(|s| s.as_bool()).unwrap_or(false) {
+            return None;
+        }
+        let list = self.todo_state.entry(agent.to_string()).or_default();
+        match tool {
+            // Sub-agent scratchpad (subagent_session_tools.py): text/done,
+            // one action per call.
+            "todo" => match result.get("action").and_then(|a| a.as_str())? {
+                "add" => list.push(TodoItem::from_text_done(result.get("item")?)?),
+                "complete" => {
+                    let id = json_id_string(result.get("id"));
+                    if let Some(t) = list.iter_mut().find(|t| t.id == id) {
+                        t.status = "completed".into();
+                    }
+                }
+                "delete" => {
+                    let id = json_id_string(result.get("id"));
+                    list.retain(|t| t.id != id);
+                }
+                "list" => {
+                    *list = result.get("items")?.as_array()?.iter()
+                        .filter_map(TodoItem::from_text_done).collect();
+                }
+                _ => return None,
+            },
+            // Orchestrator suite (todo_tools.py): content/title + status.
+            // write_todos replaces the whole list; list_todos is a read but
+            // shares the same {todos: [...]} result shape, so a "peek" also
+            // resyncs local state for free.
+            "write_todos" | "list_todos" => {
+                *list = result.get("todos")?.as_array()?.iter()
+                    .filter_map(TodoItem::from_content_status).collect();
+            }
+            "add_todo" => list.push(TodoItem::from_content_status(result.get("todo")?)?),
+            "update_todo_status" => {
+                let updated = TodoItem::from_content_status(result.get("todo")?)?;
+                match list.iter_mut().find(|t| t.id == updated.id) {
+                    Some(t) => *t = updated,
+                    None => list.push(updated),
+                }
+            }
+            "clear_todos" => list.clear(),
+            _ => return None,
+        }
+        Some(list.clone())
     }
 
     /// Append an assistant message, merging into the previous assistant block
@@ -554,35 +724,69 @@ impl App {
                 }
             }
             "tool_start" => {
+                let name = item.tool_name.unwrap_or_default();
+                let detail = item.detail.unwrap_or_default();
+                let agent = item.agent.unwrap_or_else(|| "agent".into());
+                // Todo-tool calls render as a checklist snapshot from their
+                // RESULT (tool_output) instead of a generic call line here —
+                // the args alone (e.g. `todo(action='complete', id=3)`)
+                // don't carry enough to render the full list anyway.
+                if is_todo_tool(&name) {
+                    return;
+                }
                 // One compact line per tool call: "⏺ name(args)". A tool often
                 // emits an empty `start` then a detailed `local_execute` for the
                 // same call — collapse them by replacing the previous line.
-                let name = item.tool_name.unwrap_or_default();
-                let detail = item.detail.unwrap_or_default();
-                if self.last_tool.as_deref() == Some(&name) {
-                    // Same call: enrich the earlier (often empty) start in place.
+                if self.last_tool.as_ref() == Some(&(agent.clone(), name.clone())) {
+                    // Same call from the same agent: enrich the earlier
+                    // (often empty) start in place.
                     if let Some(Block::Tool { detail: d, .. }) = self.blocks.last_mut() {
                         if !detail.is_empty() {
                             *d = detail;
                         }
                     } else {
-                        self.blocks.push(Block::Tool { name: name.clone(), detail, status: ToolStatus::Running });
+                        self.blocks.push(Block::Tool { name: name.clone(), detail, status: ToolStatus::Running, agent: agent.clone() });
                     }
                 } else {
                     self.flush_stream();
-                    self.blocks.push(Block::Tool { name: name.clone(), detail, status: ToolStatus::Running });
+                    self.blocks.push(Block::Tool { name: name.clone(), detail, status: ToolStatus::Running, agent: agent.clone() });
                     self.last_task = None;
-                    self.last_tool = Some(name);
+                    self.last_tool = Some((agent, name));
                 }
                 self.follow = true;
             }
             "tool_output" => {
+                let name = item.tool_name.clone().unwrap_or_default();
+                let agent = item.agent.clone().unwrap_or_else(|| "agent".into());
+                // Todo tools never got a Block::Tool pushed at tool_start
+                // above — nothing to settle. Try to render a fresh checklist
+                // snapshot from the result; if that fails (call errored, or
+                // an action this doesn't know how to apply locally, e.g.
+                // remove_todo), fall through to the normal "⎿ ..." line so
+                // the failure/result is still visible somewhere.
+                if is_todo_tool(&name) {
+                    self.last_tool = None;
+                    let parsed = item.detail.as_deref().and_then(|d| serde_json::from_str::<Value>(d).ok());
+                    if let Some(items) = parsed.and_then(|v| self.apply_todo_result(&agent, &name, &v)) {
+                        self.flush_stream();
+                        let existing = self.blocks.iter_mut().rev().find_map(|b| match b {
+                            Block::Todos { agent: a, items: i } if a == &agent => Some(i),
+                            _ => None,
+                        });
+                        match existing {
+                            Some(i) => *i = items,
+                            None => self.blocks.push(Block::Todos { agent, items }),
+                        }
+                        self.follow = true;
+                        return;
+                    }
+                }
                 // Result rendered as a dim child line under the tool call.
                 let ms = item.status.map(|s| format!("  ·{s}")).unwrap_or_default();
                 let d = item.detail.unwrap_or_default();
                 let body = if d.is_empty() { "(ok)".to_string() } else { truncate(&d, 220) };
                 self.flush_stream();
-                self.finish_last_tool(true); // dot → green
+                self.finish_last_tool(&agent, true); // dot → green
                 self.blocks.push(Block::Plain(Line::from(Span::styled(
                     format!("  ⎿ {body}{ms}"),
                     Style::default().fg(Color::DarkGray),
@@ -591,8 +795,12 @@ impl App {
                 self.follow = true;
             }
             "tool_failed" => {
+                if is_todo_tool(item.tool_name.as_deref().unwrap_or_default()) {
+                    self.last_tool = None;
+                }
+                let agent = item.agent.unwrap_or_else(|| "agent".into());
                 self.flush_stream();
-                self.finish_last_tool(false); // dot → red
+                self.finish_last_tool(&agent, false); // dot → red
                 self.blocks.push(Block::Plain(Line::from(Span::styled(
                     format!("  ⎿ ✗ {}", truncate(&item.detail.unwrap_or_default(), 220)),
                     Style::default().fg(Color::Red),
@@ -669,6 +877,81 @@ impl App {
 
     // ---- line building (owned, re-rendered each frame) -----------------
 
+    /// Cheap stand-in for "has anything `build_lines()` would render changed"
+    /// — lengths and discriminants only, never re-walks or re-formats any
+    /// Markdown. Must stay defensive: anything `build_lines()`/`render_md`/
+    /// `render_thinking` read has to be reflected here, or the cache goes
+    /// stale and the transcript stops updating.
+    fn content_fingerprint(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        for b in &self.blocks {
+            match b {
+                Block::User(t) => {
+                    0u8.hash(&mut h);
+                    t.len().hash(&mut h);
+                }
+                Block::Assistant { agent, md } => {
+                    1u8.hash(&mut h);
+                    agent.len().hash(&mut h);
+                    md.len().hash(&mut h);
+                }
+                Block::Thinking(s) => {
+                    2u8.hash(&mut h);
+                    s.len().hash(&mut h);
+                }
+                Block::Plain(_) => 3u8.hash(&mut h),
+                Block::Tool { name, detail, status, agent } => {
+                    4u8.hash(&mut h);
+                    name.len().hash(&mut h);
+                    detail.len().hash(&mut h);
+                    agent.len().hash(&mut h);
+                    // Only a Running tool's dot animates, so its phase is
+                    // the only thing that can change frame-to-frame.
+                    match status {
+                        ToolStatus::Running => {
+                            5u8.hash(&mut h);
+                            (self.spinner / 3 % 2).hash(&mut h);
+                        }
+                        ToolStatus::Done => 6u8.hash(&mut h),
+                        ToolStatus::Failed => 7u8.hash(&mut h),
+                    }
+                }
+                Block::Rule(l) => {
+                    8u8.hash(&mut h);
+                    l.len().hash(&mut h);
+                }
+                Block::Todos { agent, items } => {
+                    9u8.hash(&mut h);
+                    agent.len().hash(&mut h);
+                    for t in items {
+                        t.content.len().hash(&mut h);
+                        t.status.hash(&mut h);
+                    }
+                }
+            }
+        }
+        match &self.stream {
+            Some(s) => {
+                1u8.hash(&mut h);
+                s.thinking.hash(&mut h);
+                s.agent.len().hash(&mut h);
+                s.buf.len().hash(&mut h);
+                if s.thinking && !self.show_thinking {
+                    // The collapsed "thinking…" line shows a live
+                    // elapsed timer + token count + blink phase.
+                    self.run_started.map(|t| t.elapsed().as_secs()).hash(&mut h);
+                    self.run_tokens.hash(&mut h);
+                    (self.spinner / 3 % 2).hash(&mut h);
+                }
+            }
+            None => 0u8.hash(&mut h),
+        }
+        self.show_thinking.hash(&mut h);
+        self.markdown.hash(&mut h);
+        h.finish()
+    }
+
     fn build_lines(&self) -> Vec<Line<'static>> {
         let mut out: Vec<Line<'static>> = Vec::new();
         // Track the agent currently "speaking" so we only print the agent
@@ -695,7 +978,7 @@ impl App {
                 }
                 Block::Thinking(s) => self.render_thinking(s, &mut out),
                 Block::Plain(l) => out.push(l.clone()),
-                Block::Tool { name, detail, status } => {
+                Block::Tool { name, detail, status, agent: _ } => {
                     // Dot: blinks while running, green when done, red on failure.
                     let dot_style = match status {
                         ToolStatus::Running => {
@@ -731,6 +1014,22 @@ impl App {
                     cur_agent = None;
                     blank(&mut out);
                     out.push(rule_line(label));
+                }
+                Block::Todos { agent: _, items } => {
+                    cur_agent = None;
+                    blank(&mut out);
+                    for t in items {
+                        let (icon, color) = t.icon_and_color();
+                        let text_style = if t.status == "completed" {
+                            Style::default().fg(Color::DarkGray).add_modifier(Modifier::CROSSED_OUT)
+                        } else {
+                            Style::default().fg(Color::White)
+                        };
+                        out.push(Line::from(vec![
+                            Span::styled(format!("{icon} "), Style::default().fg(color).add_modifier(Modifier::BOLD)),
+                            Span::styled(t.content.clone(), text_style),
+                        ]));
+                    }
                 }
             }
         }
@@ -769,7 +1068,6 @@ impl App {
                 self.render_md(&s.buf, &mut out);
             }
         }
-        #[cfg(windows)]
         out.iter_mut().for_each(win_safe_line);
         out
     }
@@ -999,7 +1297,12 @@ impl App {
         // 1-char left/right indent so messages don't run to the terminal edge.
         const PAD_X: u16 = 1;
         const PAD_Y: u16 = 1;
-        let lines = self.build_lines();
+        let fp = self.content_fingerprint();
+        if fp != self.lines_fingerprint || self.lines_cache.is_empty() {
+            self.lines_cache = self.build_lines();
+            self.lines_fingerprint = fp;
+        }
+        let lines = self.lines_cache.clone();
         // Only top + bottom bars (no left/right borders) for a cleaner, wider
         // transcript; horizontal padding keeps text off the edges.
         let mut block = TuiBlock::default()
@@ -1250,9 +1553,14 @@ impl App {
         }
         let credits = credit_parts.join("  ");
 
-        // Working spinner while a turn is running (covers tool/http waits).
+        // Working spinner while a turn is running (covers tool/http waits),
+        // or while waiting on a non-agent network round-trip (`busy`) — e.g.
+        // opening the threads/workspaces overlay, switching threads. Without
+        // this a slow-but-genuine request looked identical to a frozen app.
         const SPIN: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-        let status = if self.running {
+        let status = if let Some(msg) = &self.busy {
+            format!("{} {}", SPIN[self.spinner % SPIN.len()], msg)
+        } else if self.running {
             let el = self
                 .run_started
                 .map(|t| format!("  {}", fmt_elapsed(t.elapsed())))
@@ -1394,7 +1702,7 @@ impl App {
                     let name = pstr("toolName");
                     let args = compact_json(p.get("arguments"), 120);
                     self.flush_stream();
-                    self.blocks.push(Block::Tool { name, detail: args, status: ToolStatus::Done });
+                    self.blocks.push(Block::Tool { name, detail: args, status: ToolStatus::Done, agent: agent.clone() });
                 }
                 "tool.output" => {
                     let dur = p.get("durationMs").and_then(|d| d.as_i64())
@@ -1405,7 +1713,7 @@ impl App {
                         format!("  ⎿ {body}{dur}"), Style::default().fg(Color::DarkGray))));
                 }
                 "tool.failed" => {
-                    self.finish_last_tool(false);
+                    self.finish_last_tool(&agent, false);
                     self.push(Line::from(Span::styled(
                         format!("  ⎿ ✗ {}", pstr("error")),
                         Style::default().fg(Color::Red))));
@@ -1601,6 +1909,16 @@ impl App {
                     }
                 }
                 Block::Rule(t) => out.push_str(&format!("{t}\n")),
+                Block::Todos { agent: _, items } => {
+                    for t in items {
+                        let mark = match t.status.as_str() {
+                            "completed" => "x",
+                            "in_progress" => "~",
+                            _ => " ",
+                        };
+                        out.push_str(&format!("[{mark}] {}\n", t.content));
+                    }
+                }
             }
         }
         if let Some(s) = &self.stream {
@@ -1698,6 +2016,23 @@ impl App {
         f.render_widget(ratatui::widgets::Clear, area);
         let mut s = state;
         f.render_stateful_widget(list, area, &mut s);
+    }
+
+    /// Mark a non-agent network round-trip as in flight (opening an
+    /// overlay, switching threads, …) — shows a spinner + message in the
+    /// status bar. Call `clear_busy` when the result (success or error)
+    /// arrives; if a second `set_busy` call happens before the first
+    /// clears, the newer message just replaces the old one.
+    pub fn set_busy(&mut self, msg: impl Into<String>) {
+        self.busy = Some(msg.into());
+    }
+
+    pub fn clear_busy(&mut self) {
+        self.busy = None;
+    }
+
+    pub fn is_busy(&self) -> bool {
+        self.busy.is_some()
     }
 
     /// A non-error informational line (workspace bound, hints, etc.).
@@ -1858,10 +2193,13 @@ fn fmt_tokens(t: i64) -> String {
     }
 }
 
-/// Windows console renders many decorative glyphs as double-width while
-/// ratatui counts them as one cell — that desyncs the grid and leaves ghost
-/// text. Map the offenders to width-1 ASCII on Windows only.
-#[cfg(windows)]
+/// Some terminals/fonts render these decorative glyphs as double-width while
+/// ratatui (correctly, per Unicode's own width tables) counts them as one
+/// cell — that desyncs the grid and leaves ghost/leftover characters behind
+/// after a scroll or redraw shifts what's on screen. First noticed on
+/// Windows console, but the same font-dependent double-width rendering can
+/// happen in terminals on any OS, so this applies everywhere rather than
+/// gating on `cfg(windows)`.
 fn win_glyph(c: char) -> Option<&'static str> {
     Some(match c {
         '●' | '◆' | '⏺' | '◇' | '✻' | '◈' | '⛁' | '⊞' | '◐' | '★' => "*",
@@ -1879,26 +2217,21 @@ fn win_glyph(c: char) -> Option<&'static str> {
     })
 }
 
-/// Replace ambiguous-width glyphs with ASCII (Windows only; identity elsewhere).
-#[allow(unused_variables)]
+/// Replace ambiguous-width glyphs with guaranteed-width-1 ASCII.
 fn win_safe(s: &str) -> std::borrow::Cow<'_, str> {
-    #[cfg(windows)]
-    {
-        if s.chars().any(|c| win_glyph(c).is_some()) {
-            let mut out = String::with_capacity(s.len());
-            for c in s.chars() {
-                match win_glyph(c) {
-                    Some(rep) => out.push_str(rep),
-                    None => out.push(c),
-                }
+    if s.chars().any(|c| win_glyph(c).is_some()) {
+        let mut out = String::with_capacity(s.len());
+        for c in s.chars() {
+            match win_glyph(c) {
+                Some(rep) => out.push_str(rep),
+                None => out.push(c),
             }
-            return std::borrow::Cow::Owned(out);
         }
+        return std::borrow::Cow::Owned(out);
     }
     std::borrow::Cow::Borrowed(s)
 }
 
-#[cfg(windows)]
 fn win_safe_line(line: &mut Line<'static>) {
     for span in line.spans.iter_mut() {
         if span.content.chars().any(|c| win_glyph(c).is_some()) {

@@ -2,7 +2,7 @@
 //!
 //! `Authorization: token <key>` — matches strobes/app/authentication.py.
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 
 use crate::config::Profile;
@@ -215,8 +215,10 @@ impl ApiClient {
             .get(&url)
             .header("Authorization", format!("token {}", self.profile.master_key))
             .header("Accept", "application/json")
+            .timeout(std::time::Duration::from_secs(20))
             .send()
-            .await?;
+            .await
+            .with_context(|| format!("GET {path} timed out or failed to connect"))?;
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
         if !status.is_success() {
@@ -384,8 +386,10 @@ impl ApiClient {
             .header("Authorization", format!("token {}", self.profile.master_key))
             .header("Accept", "application/json")
             .json(&body)
+            .timeout(std::time::Duration::from_secs(20))
             .send()
-            .await?;
+            .await
+            .with_context(|| format!("POST {path} timed out or failed to connect"))?;
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
         if !status.is_success() {

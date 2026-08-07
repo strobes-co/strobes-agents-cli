@@ -5,6 +5,7 @@
 //! an interactive Ratatui session that streams a remote agent run and executes
 //! its tools locally (the user's machine is the sandbox).
 
+mod analyzer_registry;
 mod api;
 mod app;
 mod browser;
@@ -20,8 +21,8 @@ mod workflow_runner;
 mod workflow_state;
 mod workflow_tui;
 
-use anyhow::{anyhow, Result};
-use clap::{Parser, Subcommand};
+use anyhow::{anyhow, Context, Result};
+use clap::{Args, Parser, Subcommand};
 use crossterm::event::{
     Event, EventStream, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind,
 };
@@ -120,6 +121,10 @@ enum Cmd {
         /// Path style: blank/proxy = /api/v1, `direct` = bare /v1.
         #[arg(long)]
         deployment: Option<String>,
+        /// Analyzer-registry ("maze") base URL, for `strobes cicd` — a
+        /// separate host from base_url (e.g. https://maze.in.strobes.co).
+        #[arg(long)]
+        analyzer_registry_url: Option<String>,
         /// Skip the post-save connectivity check.
         #[arg(long)]
         no_verify: bool,
@@ -270,9 +275,20 @@ enum Cmd {
         fail_on: Option<String>,
     },
     /// CI security scanning — SAST, SCA, DAST, and container image scanning.
+    // Hidden from --help: superseded by `cicd` (direct containerized
+    // analyzers, no LLM call) for new usage. Still fully functional for any
+    // existing scripts/docs that already call `strobes ci`.
+    #[command(hide = true)]
     Ci {
         #[command(subcommand)]
         sub: CiCmd,
+    },
+    /// Direct containerized-analyzer CI/CD scanning — SAST, SCA, container,
+    /// IaC, and DAST via Strobes' own scanner images, no LLM call by
+    /// default (see `strobes ci` for the agent-driven equivalent).
+    Cicd {
+        #[command(subcommand)]
+        sub: CicdCmd,
     },
     /// Export thread transcripts from a workspace into a single folder.
     Export {
@@ -700,6 +716,155 @@ enum CiCmd {
     },
 }
 
+/// Flags shared by every `strobes cicd <type>` subcommand: output rendering,
+/// the fail-on gate, credential/image selection, and the opt-in AI-triage
+/// step. Kept as one flattened struct rather than repeated per-variant,
+/// since it's identical across all five scan types.
+#[derive(Args, Debug, Clone)]
+struct CicdCommon {
+    /// Output format: text (default), json, sarif, csv, or html.
+    #[arg(
+        long,
+        default_value = "text",
+        value_name = "FORMAT",
+        value_parser = ["text", "json", "sarif", "csv", "html"]
+    )]
+    output: String,
+    /// Save scan output to this file (in the chosen format).
+    #[arg(long, short = 'o', value_name = "FILE")]
+    output_file: Option<String>,
+    /// Exit 1 if any findings at or above this severity exist
+    /// (critical, high, medium, low).
+    #[arg(long, value_name = "SEVERITY")]
+    fail_on: Option<String>,
+    /// How long the minted ECR pull credentials should be valid for. Bumped
+    /// automatically if a step runs past this (e.g. a slow `docker pull`).
+    #[arg(long, default_value = "900", value_name = "SECS")]
+    cred_duration: u64,
+    /// Analyzer image tag to pull.
+    #[arg(long, default_value = "latest", value_name = "TAG")]
+    tag: String,
+    /// After the deterministic scan, send its findings to an AI agent for
+    /// reachability triage — same idea as `strobes ci <type>`, but as an
+    /// opt-in second pass rather than the only path.
+    #[arg(long)]
+    ai_triage: bool,
+    /// Attach the AI-triage step to an existing workspace by ID. Only used
+    /// with --ai-triage.
+    #[arg(long, short, value_name = "UUID")]
+    workspace: Option<String>,
+    /// LLM model picker id. Only used with --ai-triage.
+    #[arg(long, short)]
+    model: Option<i64>,
+    /// Reasoning depth for the AI-triage step: low, medium, high, xhigh, max.
+    #[arg(long, value_name = "LEVEL")]
+    reasoning: Option<String>,
+    /// Abort the AI-triage step after this many seconds (default: 600).
+    #[arg(long, default_value = "600", value_name = "SECS")]
+    ai_timeout: u64,
+}
+
+/// `strobes cicd <type>` — run Strobes' own containerized scanners directly
+/// (pulled on the fly from the tenant's analyzer registry), with no LLM call
+/// by default. The deterministic counterpart to `strobes ci <type>`, which
+/// is agent-driven. Requires Docker and `analyzer_registry_url` configured
+/// (`strobes login --analyzer-registry-url <url>`).
+#[derive(Subcommand)]
+enum CicdCmd {
+    /// SAST scan via the strobessastanalyzer container (opengrep-based).
+    ///
+    /// Examples:
+    ///   strobes cicd sast .
+    ///   strobes cicd sast ./src --output sarif -o results.sarif
+    ///   strobes cicd sast . --fail-on high
+    Sast {
+        /// Directory to scan (defaults to current directory).
+        #[arg(default_value = ".")]
+        dir: String,
+        #[command(flatten)]
+        common: CicdCommon,
+    },
+    /// Dependency/SCA scan via the `analyzers/dependency` container.
+    ///
+    /// The target must be a git repository — the analyzer checks out
+    /// branches and reads the `origin` remote for asset metadata. A
+    /// placeholder `origin` is added automatically if none exists.
+    ///
+    /// Examples:
+    ///   strobes cicd sca .
+    ///   strobes cicd sca ~/myapp --output json -o sca.json
+    Sca {
+        /// Git repository directory to scan (defaults to current directory).
+        #[arg(default_value = ".")]
+        dir: String,
+        #[command(flatten)]
+        common: CicdCommon,
+    },
+    /// Container image scan via the `analyzers/trivyanalyzer` container.
+    ///
+    /// The target image is scanned directly by Trivy inside the analyzer
+    /// container (pulled by Trivy itself, not mounted) — it must be publicly
+    /// reachable, or already present if scanning a local-only image.
+    ///
+    /// Examples:
+    ///   strobes cicd container nginx:1.24
+    ///   strobes cicd container myapp:latest --fail-on critical
+    Container {
+        /// Docker image to scan (e.g. nginx:1.24, myapp:latest).
+        image: String,
+        #[command(flatten)]
+        common: CicdCommon,
+    },
+    /// IaC scan via the `analyzers/checkovanalyzer` container.
+    ///
+    /// KNOWN ISSUE: Checkov's own CLI returns a single object instead of a
+    /// list when the target has only one IaC framework (e.g. pure
+    /// Terraform), which crashes the analyzer's own output parser — the
+    /// scan then silently reports zero findings. This command detects that
+    /// signature and prints an explicit warning rather than reporting a
+    /// clean scan.
+    ///
+    /// Examples:
+    ///   strobes cicd iac .
+    ///   strobes cicd iac ./infra --fail-on high
+    Iac {
+        /// Directory to scan (defaults to current directory).
+        #[arg(default_value = ".")]
+        dir: String,
+        #[command(flatten)]
+        common: CicdCommon,
+    },
+    /// DAST scan via the `analyzers/zapanalyzer` container (full OWASP ZAP).
+    ///
+    /// Runs ZAP's own bundled daemon inside the analyzer container — no
+    /// separate ZAP instance needed.
+    ///
+    /// Examples:
+    ///   strobes cicd dast http://localhost:5000
+    ///   strobes cicd dast https://staging.myapp.com --activescan
+    Dast {
+        /// Target base URL to scan (required).
+        url: String,
+        /// Cookie header value to include in all requests.
+        #[arg(long, value_name = "COOKIE")]
+        cookie: Option<String>,
+        /// Bearer token for the Authorization header.
+        #[arg(long, value_name = "TOKEN")]
+        bearer: Option<String>,
+        /// Minutes to let ZAP's spider crawl before scanning (default 1).
+        #[arg(short = 'm', long, default_value = "1", value_name = "MINS")]
+        minutes: String,
+        /// Perform an active scan (not just passive) — slower, more thorough.
+        #[arg(long)]
+        activescan: bool,
+        /// Crawl with ZAP's AJAX spider (for JS-heavy SPAs).
+        #[arg(long)]
+        ajaxspider: bool,
+        #[command(flatten)]
+        common: CicdCommon,
+    },
+}
+
 /// Restore the default SIGPIPE disposition on Unix.
 ///
 /// Rust sets SIGPIPE to SIG_IGN before `main`, so a write to a closed pipe returns
@@ -734,8 +899,8 @@ async fn main() -> Result<()> {
     let profile = cfg.profile_for(&tenant);
 
     match cli.cmd.unwrap_or(Cmd::Chat { thread: None, workspace: None, model: None, reasoning: None, new: false }) {
-        Cmd::Login { base_url, org_id, master_key, deployment, no_verify } => {
-            cmd_login(&mut cfg, &tenant, base_url, org_id, master_key, deployment, no_verify).await
+        Cmd::Login { base_url, org_id, master_key, deployment, analyzer_registry_url, no_verify } => {
+            cmd_login(&mut cfg, &tenant, base_url, org_id, master_key, deployment, analyzer_registry_url, no_verify).await
         }
         Cmd::Update { force } => cmd_update(force).await,
         Cmd::Tenants => cmd_tenants(&cfg),
@@ -805,6 +970,15 @@ async fn main() -> Result<()> {
             }
             CiCmd::Dast { url, output, output_file, prompt, cookie, bearer, scope, workspace, model, reasoning, timeout, fail_on } => {
                 cmd_scan_dast(&profile, url, output, output_file, prompt, cookie, bearer, scope, workspace, model, reasoning, timeout, fail_on).await
+            }
+        },
+        Cmd::Cicd { sub } => match sub {
+            CicdCmd::Sast { dir, common } => cmd_cicd_sast(&profile, dir, common).await,
+            CicdCmd::Sca { dir, common } => cmd_cicd_sca(&profile, dir, common).await,
+            CicdCmd::Container { image, common } => cmd_cicd_container(&profile, image, common).await,
+            CicdCmd::Iac { dir, common } => cmd_cicd_iac(&profile, dir, common).await,
+            CicdCmd::Dast { url, cookie, bearer, minutes, activescan, ajaxspider, common } => {
+                cmd_cicd_dast(&profile, url, cookie, bearer, minutes, activescan, ajaxspider, common).await
             }
         },
         Cmd::Findings { workspace, format, fail_on } => {
@@ -1193,7 +1367,7 @@ async fn upload_one(
 /// initial download. Deduplicated.
 fn workspace_sync_roots(cfg: &Config, ws: &str) -> Vec<std::path::PathBuf> {
     let mut roots: Vec<std::path::PathBuf> = Vec::new();
-    let sandbox = config::config_dir().join("workspaces").join(ws);
+    let sandbox = workspace_sandbox_path(ws);
     if sandbox.is_dir() {
         roots.push(sandbox);
     }
@@ -1264,19 +1438,50 @@ async fn download_workspace(
     let client = api::ApiClient::new(profile.clone())?;
     let target = dir
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| config::config_dir().join("workspaces").join(ws_id));
+        .unwrap_or_else(|| workspace_sandbox_path(ws_id));
     println!("• downloading workspace {ws_id} → {}", target.display());
     let count = extract_workspace_zip(&client, ws_id, &target).await?;
+    // If this landed at the same default path `chat`/`send`/`workflow` sync
+    // to, mark it so they see this download rather than redundantly
+    // re-fetching everything on the next open.
+    if target == workspace_sandbox_path(ws_id) {
+        let _ = mark_workspace_synced(&target);
+    }
     cfg.workspace_dirs.insert(ws_id.to_string(), target.to_string_lossy().to_string());
     cfg.save()?;
     println!("✔ {count} files extracted to {} (folder bound to workspace)", target.display());
     Ok(())
 }
 
-/// Sync the bound workspace's files into a local folder and point the agent's
-/// local sandbox there, so its (locally-proxied) workspace_get_meta /
-/// execute_command see the real workspace files. Mirrors the cloud's S3→sandbox
-/// sync. Re-downloads only if the folder is missing/empty.
+/// Where a workspace's files get mirrored locally by default (chat, send,
+/// workflow — anything that doesn't have an explicit `--dir`/`--sandbox-id`
+/// override). The single source of truth for this path: `spawn_workspace_sync`,
+/// `workspace_sync_roots`, `download_workspace`, and `ensure_workspace_sandbox_synced`
+/// all defer to it, so "where did the workspace mirror go" only has one answer.
+fn workspace_sandbox_path(ws_id: &str) -> std::path::PathBuf {
+    config::config_dir().join("workspaces").join(ws_id)
+}
+
+/// Marks `dir` as fully synced from the workspace, so future opens can skip
+/// re-downloading. Deliberately a dedicated sentinel file rather than "does
+/// the dir have anything in it" — the sandbox also accumulates incidental
+/// local files (todos.json, execute_code's temp snippets, an interrupted
+/// prior download) that aren't evidence of a completed sync, and trusting
+/// them meant a workspace that failed its first sync — or whose remote files
+/// changed after the sentinel-less "already" check first saw *anything*
+/// local — silently never synced again.
+const WORKSPACE_SYNC_MARKER: &str = ".strobes-sync-complete";
+
+fn workspace_is_synced(dir: &std::path::Path) -> bool {
+    dir.join(WORKSPACE_SYNC_MARKER).is_file()
+}
+
+fn mark_workspace_synced(dir: &std::path::Path) -> Result<()> {
+    std::fs::create_dir_all(dir)?;
+    std::fs::write(dir.join(WORKSPACE_SYNC_MARKER), b"")?;
+    Ok(())
+}
+
 /// Extract zip bytes into `target`, returning the file count (blocking).
 fn extract_zip_bytes(bytes: Vec<u8>, target: &std::path::Path) -> Result<usize> {
     std::fs::create_dir_all(target)?;
@@ -1319,19 +1524,70 @@ async fn fetch_workspace_stats(client: &api::ApiClient, ws_id: &str) -> (f64, us
     )
 }
 
+enum WorkspaceSyncOutcome {
+    Synced(usize),
+    Empty,
+}
+
+/// Core of the workspace↔local-sandbox sync, shared by every entry point that
+/// binds a workspace and lets the agent run local tools (`chat`, `send`,
+/// `workflow`) — one implementation, so "does this command's sandbox match
+/// the workspace" has a single, consistent answer instead of each command
+/// re-deriving it (or, as `send`/`workflow` did, never deriving it at all and
+/// leaving local tool calls pointed at an unrelated, empty scratch dir).
+///
+/// Sets `STROBES_AI_SANDBOX`/`STROBES_AI_WORKSPACE_ID` unconditionally (even
+/// on the cached fast path, since a fresh process has neither set yet), then
+/// downloads+extracts only if `dir` isn't already marked synced.
+pub(crate) async fn sync_workspace_sandbox(
+    profile: &config::Profile,
+    ws_id: &str,
+) -> Result<WorkspaceSyncOutcome> {
+    let dir = workspace_sandbox_path(ws_id);
+    std::env::set_var("STROBES_AI_SANDBOX", &dir);
+    std::env::set_var("STROBES_AI_WORKSPACE_ID", ws_id);
+    if workspace_is_synced(&dir) {
+        let n = std::fs::read_dir(&dir).map(|d| d.count()).unwrap_or(0);
+        return Ok(WorkspaceSyncOutcome::Synced(n));
+    }
+    let client = api::ApiClient::new(profile.clone())?;
+    match client.download_workspace_bytes(ws_id).await {
+        Ok(bytes) => {
+            let d = dir.clone();
+            let count = tokio::task::spawn_blocking(move || extract_zip_bytes(bytes, &d))
+                .await
+                .map_err(|e| anyhow!("extract task failed: {e}"))??;
+            mark_workspace_synced(&dir)?;
+            Ok(WorkspaceSyncOutcome::Synced(count))
+        }
+        Err(e) => {
+            // An empty workspace (nothing to zip) is benign, not a failure —
+            // mark it synced too, so we don't hit the same 404 every run.
+            let msg = e.to_string();
+            if msg.contains("No files found to download") || msg.contains("HTTP 404") {
+                mark_workspace_synced(&dir)?;
+                Ok(WorkspaceSyncOutcome::Empty)
+            } else {
+                Err(e)
+            }
+        }
+    }
+}
+
+/// Chat-TUI entry point: point the sandbox at the workspace folder
+/// IMMEDIATELY (so the very next tool call already uses it), then run the
+/// actual sync (see `sync_workspace_sandbox`) in the BACKGROUND so opening a
+/// chat never blocks on a download. Progress is reported as Notice events.
 fn spawn_workspace_sync(
     profile: config::Profile,
     ws_id: String,
     tx: mpsc::UnboundedSender<pulse::AppEvent>,
 ) {
-    let dir = config::config_dir().join("workspaces").join(&ws_id);
-    // Set the sandbox path right away (instant, non-blocking).
+    let dir = workspace_sandbox_path(&ws_id);
     std::env::set_var("STROBES_AI_SANDBOX", &dir);
     std::env::set_var("STROBES_AI_WORKSPACE_ID", &ws_id);
 
-    let already = dir.is_dir()
-        && std::fs::read_dir(&dir).map(|mut d| d.next().is_some()).unwrap_or(false);
-    if already {
+    if workspace_is_synced(&dir) {
         let _ = tx.send(pulse::AppEvent::Notice(format!(
             "workspace files at {} (cached)", dir.display()
         )));
@@ -1340,36 +1596,18 @@ fn spawn_workspace_sync(
 
     tokio::spawn(async move {
         let _ = tx.send(pulse::AppEvent::Notice("syncing workspace files locally…".into()));
-        let client = match api::ApiClient::new(profile) {
-            Ok(c) => c,
-            Err(e) => { let _ = tx.send(pulse::AppEvent::Error(e.to_string())); return; }
-        };
-        match client.download_workspace_bytes(&ws_id).await {
-            Ok(bytes) => {
-                let d = dir.clone();
-                let res = tokio::task::spawn_blocking(move || extract_zip_bytes(bytes, &d)).await;
-                match res {
-                    Ok(Ok(n)) => {
-                        let _ = tx.send(pulse::AppEvent::Notice(format!(
-                            "✔ synced {n} workspace files → {}", dir.display()
-                        )));
-                    }
-                    Ok(Err(e)) => { let _ = tx.send(pulse::AppEvent::Error(format!("workspace extract failed: {e}"))); }
-                    Err(e) => { let _ = tx.send(pulse::AppEvent::Error(format!("extract task failed: {e}"))); }
-                }
+        match sync_workspace_sandbox(&profile, &ws_id).await {
+            Ok(WorkspaceSyncOutcome::Synced(n)) => {
+                let _ = tx.send(pulse::AppEvent::Notice(format!(
+                    "✔ synced {n} workspace files → {}", dir.display()
+                )));
             }
-            Err(e) => {
-                // An empty workspace (nothing to zip) is benign — show a notice,
-                // not a red error. Detect the backend's "no files" case / 404.
-                let msg = e.to_string();
-                if msg.contains("No files found to download") || msg.contains("HTTP 404") {
-                    let _ = tx.send(pulse::AppEvent::Notice(
-                        "workspace has no files yet — nothing to sync".into(),
-                    ));
-                } else {
-                    let _ = tx.send(pulse::AppEvent::Error(format!("workspace download failed: {e}")));
-                }
+            Ok(WorkspaceSyncOutcome::Empty) => {
+                let _ = tx.send(pulse::AppEvent::Notice(
+                    "workspace has no files yet — nothing to sync".into(),
+                ));
             }
+            Err(e) => { let _ = tx.send(pulse::AppEvent::Error(format!("workspace sync failed: {e}"))); }
         }
     });
 }
@@ -1473,6 +1711,27 @@ async fn cmd_send(
         }
         (None, None) => None,
     };
+
+    // Mirror the workspace's files locally and point the sandbox at them —
+    // same sync `strobes chat` does — unless an explicit --sandbox-id above
+    // already chose a different local dir on purpose. Without this, every
+    // local tool call (execute_command/execute_code) the agent makes here
+    // was landing in an unrelated, empty `~/.strobes-ai/sandboxes/<thread>`
+    // directory that had nothing to do with the bound workspace's files.
+    if sandbox_id.is_none() {
+        if let Some(ws) = &workspace_id {
+            eprintln!("syncing workspace files locally…");
+            match sync_workspace_sandbox(p, ws).await {
+                Ok(WorkspaceSyncOutcome::Synced(n)) => {
+                    eprintln!("sandbox: {} ({n} file(s))", workspace_sandbox_path(ws).display());
+                }
+                Ok(WorkspaceSyncOutcome::Empty) => {
+                    eprintln!("sandbox: {} (workspace has no files yet)", workspace_sandbox_path(ws).display());
+                }
+                Err(e) => eprintln!("warning: workspace sync failed ({e}) — local tools will use an empty sandbox"),
+            }
+        }
+    }
 
     let thread_title = title.unwrap_or_else(|| {
         let truncated: String = message.chars().take(60).collect();
@@ -2038,6 +2297,435 @@ fn sast_to_sarif(findings: &[SastFinding], target: &str) -> serde_json::Value {
             "automationDetails": { "id": format!("strobes/sast/{target}") },
         }]
     })
+}
+
+// ── `strobes cicd` — direct containerized-analyzer output ────────────────────
+//
+// A different JSON schema from SastFinding/ScaFinding above: this is the
+// analyzer containers' OWN native output (scanMeta/bugsList), not an agent's
+// free-text JSON block. Severity is an int (5=critical..1=info), and the
+// per-finding detail block's shape varies by analyzer (sast/container/asset),
+// so those stay as raw serde_json::Value rather than fully-typed fields.
+
+#[derive(serde::Deserialize, serde::Serialize, Debug, Clone, Default)]
+struct AnalyzerScanMeta {
+    #[serde(default)]
+    critical: u32,
+    #[serde(default)]
+    high: u32,
+    #[serde(default)]
+    medium: u32,
+    #[serde(default)]
+    low: u32,
+    #[serde(default)]
+    info: u32,
+    #[serde(rename = "totalBugs", default)]
+    total: u32,
+}
+
+#[derive(serde::Deserialize, serde::Serialize, Debug, Clone, Default)]
+struct AnalyzerBug {
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    severity: u8,
+    #[serde(rename = "CVSS", default)]
+    cvss: Option<f64>,
+    #[serde(rename = "CVE", default)]
+    cve: Option<Vec<String>>,
+    #[serde(rename = "CWE", default)]
+    cwe: Option<Vec<String>>,
+    #[serde(default)]
+    container: Option<serde_json::Value>,
+    #[serde(default)]
+    sast: Option<serde_json::Value>,
+}
+
+#[derive(serde::Deserialize, serde::Serialize, Debug, Clone, Default)]
+struct AnalyzerScanResult {
+    #[serde(default)]
+    success: bool,
+    #[serde(default)]
+    analyzer: String,
+    #[serde(rename = "scanMeta", default)]
+    scan_meta: AnalyzerScanMeta,
+    #[serde(rename = "bugsList", default)]
+    bugs: Vec<AnalyzerBug>,
+}
+
+/// Analyzer severities are ints 5..1 — matches every scan we ran by hand
+/// this session (trivy, the dependency analyzer, strobessastanalyzer, and
+/// checkov once its wrapper bug was worked around).
+/// One-shot startup banner for `strobes cicd <type>` — reuses the same
+/// block-letter STROBES wordmark `strobes ci sast`'s live display uses, so
+/// the two command families look like one product. Printed once to stderr
+/// (never stdout, so `--output json|sarif` stays pipeable) right as a scan
+/// kicks off.
+fn print_cicd_banner(scan_type: analyzer_registry::ScanType) {
+    for (i, line) in SAST_LOGO.iter().enumerate() {
+        if i == SAST_LOGO.len() - 1 {
+            eprintln!(
+                "\x1b[1;32m{line}\x1b[0m  \x1b[2mCI/CD · {} scan\x1b[0m",
+                scan_type.label().to_uppercase()
+            );
+        } else {
+            eprintln!("\x1b[1;32m{line}\x1b[0m");
+        }
+    }
+    eprintln!();
+}
+
+fn analyzer_severity_label(sev: u8) -> &'static str {
+    match sev {
+        5 => "critical",
+        4 => "high",
+        3 => "medium",
+        2 => "low",
+        1 => "info",
+        _ => "unknown",
+    }
+}
+
+fn print_analyzer_summary(
+    result: &AnalyzerScanResult,
+    scan_type: analyzer_registry::ScanType,
+    target: &str,
+    elapsed: std::time::Duration,
+) {
+    let total = result.bugs.len();
+    let secs = elapsed.as_secs();
+    let label = format!(" Strobes {} Scan Results ", scan_type.label().to_uppercase());
+    // Fixed interior width for the top/divider/bottom borders — the top
+    // border embeds `label` in place of leading dashes, so it must add up
+    // to exactly `bar_width` chars too, or the right-hand corner drifts
+    // (this used to be off-by-one and dropped the closing ┐ entirely).
+    let bar_width = 64usize;
+    let bar = "─".repeat(bar_width);
+    let label_dashes = "─".repeat(bar_width.saturating_sub(1 + label.chars().count()));
+
+    println!();
+    println!("{BOLD}┌─{label}{label_dashes}┐{RESET}");
+    println!("{BOLD}│{RESET}  Target   : {target}");
+    println!("{BOLD}│{RESET}  Analyzer : {}", if result.analyzer.is_empty() { "?" } else { &result.analyzer });
+    println!("{BOLD}│{RESET}  Version  : strobes-cli v{}", env!("CARGO_PKG_VERSION"));
+    println!("{BOLD}│{RESET}  Duration : {secs}s");
+    println!("{BOLD}│{RESET}  Total    : {BOLD}{total}{RESET} finding(s)");
+    println!("{BOLD}├{bar}┤{RESET}");
+    for sev in ["critical", "high", "medium", "low", "info"] {
+        let n = result.bugs.iter().filter(|b| analyzer_severity_label(b.severity) == sev).count();
+        if n > 0 {
+            let color = sast_severity_color(sev);
+            println!("{BOLD}│{RESET}  {color}{:<10}{RESET}{BOLD}{n:>4}{RESET}", sev.to_uppercase());
+        }
+    }
+    println!("{BOLD}└{bar}┘{RESET}");
+
+    if total == 0 {
+        println!("\n{GREEN}✓ No vulnerabilities identified — clean scan.{RESET}");
+        return;
+    }
+
+    println!("\n{BOLD}Vulnerabilities identified:{RESET}");
+    let mut sorted = result.bugs.clone();
+    sorted.sort_by(|a, b| b.severity.cmp(&a.severity));
+    for (i, b) in sorted.iter().enumerate() {
+        let sev = analyzer_severity_label(b.severity);
+        let color = sast_severity_color(sev);
+        println!(
+            "\n{BOLD}#{}{RESET}  {color}[{}]{RESET}  {BOLD}{}{RESET}",
+            i + 1,
+            sev.to_uppercase(),
+            b.title
+        );
+        if let Some(loc) = analyzer_bug_location(b) {
+            println!("    {DIM}{loc}{RESET}");
+        }
+        if !b.description.trim().is_empty() {
+            for line in wrap_text(&b.description, 76) {
+                println!("    {line}");
+            }
+        }
+        let mut tags = Vec::new();
+        if let Some(cvss) = b.cvss {
+            tags.push(format!("CVSS {cvss}"));
+        }
+        if let Some(cve) = &b.cve {
+            if !cve.is_empty() {
+                tags.push(format!("CVE: {}", cve.join(", ")));
+            }
+        }
+        if let Some(cwe) = &b.cwe {
+            if !cwe.is_empty() {
+                tags.push(format!("CWE: {}", cwe.join(", ")));
+            }
+        }
+        if !tags.is_empty() {
+            println!("    {DIM}{}{RESET}", tags.join("  ·  "));
+        }
+    }
+    println!();
+}
+
+/// Convert an analyzer's native findings to SARIF 2.1.0 JSON. Same shape as
+/// `sast_to_sarif` above, adapted for int severities and the analyzer's own
+/// nested detail blocks (file/line only present for sast-type findings —
+/// container/dependency findings have no source location).
+fn analyzer_to_sarif(result: &AnalyzerScanResult, scan_type: analyzer_registry::ScanType, target: &str) -> serde_json::Value {
+    let rules: Vec<serde_json::Value> = result.bugs.iter().enumerate().map(|(i, b)| {
+        serde_json::json!({
+            "id": format!("STROBES-{}-{:03}", scan_type.label().to_uppercase(), i + 1),
+            "shortDescription": { "text": b.title },
+            "properties": { "severity": analyzer_severity_label(b.severity) },
+        })
+    }).collect();
+
+    let results: Vec<serde_json::Value> = result.bugs.iter().enumerate().map(|(i, b)| {
+        let level = match analyzer_severity_label(b.severity) {
+            "critical" | "high" => "error",
+            "medium" => "warning",
+            "low" | "info" => "note",
+            _ => "none",
+        };
+        let mut entry = serde_json::json!({
+            "ruleId": format!("STROBES-{}-{:03}", scan_type.label().to_uppercase(), i + 1),
+            "level": level,
+            "message": { "text": format!("{}\n\n{}", b.title, b.description) },
+        });
+        if let Some(sast) = &b.sast {
+            let file = sast.get("fileName").and_then(|v| v.as_str());
+            let line = sast.get("startLineNo").and_then(|v| v.as_str()).and_then(|s| s.parse::<u64>().ok());
+            if let Some(f) = file {
+                let mut loc = serde_json::json!({
+                    "physicalLocation": { "artifactLocation": { "uri": f, "uriBaseId": "%SRCROOT%" } }
+                });
+                if let Some(l) = line {
+                    loc["physicalLocation"]["region"] = serde_json::json!({ "startLine": l });
+                }
+                entry["locations"] = serde_json::json!([loc]);
+            }
+        }
+        entry
+    }).collect();
+
+    serde_json::json!({
+        "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
+        "version": "2.1.0",
+        "runs": [{
+            "tool": {
+                "driver": {
+                    "name": format!("Strobes {}", result.analyzer),
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "informationUri": "https://strobes.co",
+                    "rules": rules,
+                }
+            },
+            "results": results,
+            "automationDetails": { "id": format!("strobes/cicd/{}/{target}", scan_type.label()) },
+        }]
+    })
+}
+
+/// Pull the file:line location (SAST) or package/installed/fixed-version
+/// (container/SCA) out of a bug's analyzer-specific nested block, if any.
+/// Shared by the CSV and HTML renderers so they agree with the text summary
+/// on where this data lives.
+fn analyzer_bug_location(b: &AnalyzerBug) -> Option<String> {
+    if let Some(sast) = &b.sast {
+        let file = sast.get("fileName").and_then(|v| v.as_str());
+        let line = sast.get("startLineNo").and_then(|v| v.as_str());
+        if let (Some(f), Some(l)) = (file, line) {
+            return Some(format!("{f}:{l}"));
+        }
+    }
+    if let Some(c) = &b.container {
+        if let Some(pkg) = c.get("packageName").and_then(|v| v.as_str()) {
+            let installed = c.get("installedVersion").and_then(|v| v.as_str()).unwrap_or("?");
+            let fixed = c.get("fixedVersion").and_then(|v| v.as_str()).unwrap_or("?");
+            return Some(format!("{pkg} {installed} → fix {fixed}"));
+        }
+    }
+    None
+}
+
+fn csv_field(s: &str) -> String {
+    if s.contains(['"', ',', '\n', '\r']) {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s.to_string()
+    }
+}
+
+/// RFC 4180 CSV export — one row per finding, spreadsheet-friendly for
+/// import into Excel/Sheets or bulk triage tools.
+fn analyzer_to_csv(result: &AnalyzerScanResult, target: &str) -> String {
+    let mut out = String::from("severity,title,location,cvss,cve,cwe,description\n");
+    let mut sorted = result.bugs.clone();
+    sorted.sort_by(|a, b| b.severity.cmp(&a.severity));
+    for b in &sorted {
+        let sev = analyzer_severity_label(b.severity);
+        let location = analyzer_bug_location(b).unwrap_or_default();
+        let cvss = b.cvss.map(|v| v.to_string()).unwrap_or_default();
+        let cve = b.cve.clone().unwrap_or_default().join("; ");
+        let cwe = b.cwe.clone().unwrap_or_default().join("; ");
+        out.push_str(&format!(
+            "{},{},{},{},{},{},{}\n",
+            csv_field(sev),
+            csv_field(&b.title),
+            csv_field(&location),
+            csv_field(&cvss),
+            csv_field(&cve),
+            csv_field(&cwe),
+            csv_field(&b.description),
+        ));
+    }
+    let _ = target; // kept for signature symmetry with the other renderers
+    out
+}
+
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// Self-contained (no external assets) HTML report — safe to open directly
+/// or publish as a CI build artifact.
+fn analyzer_to_html(
+    result: &AnalyzerScanResult,
+    scan_type: analyzer_registry::ScanType,
+    target: &str,
+    elapsed: std::time::Duration,
+) -> String {
+    let sev_color = |sev: &str| match sev {
+        "critical" => "#b91c1c",
+        "high" => "#dc2626",
+        "medium" => "#d97706",
+        "low" => "#0891b2",
+        _ => "#6b7280",
+    };
+    let mut sorted = result.bugs.clone();
+    sorted.sort_by(|a, b| b.severity.cmp(&a.severity));
+
+    let mut counts_html = String::new();
+    for sev in ["critical", "high", "medium", "low", "info"] {
+        let n = result.bugs.iter().filter(|b| analyzer_severity_label(b.severity) == sev).count();
+        if n > 0 {
+            counts_html.push_str(&format!(
+                "<span class=\"badge\" style=\"background:{}\">{} {}</span>",
+                sev_color(sev),
+                n,
+                sev.to_uppercase(),
+            ));
+        }
+    }
+
+    let mut rows = String::new();
+    for (i, b) in sorted.iter().enumerate() {
+        let sev = analyzer_severity_label(b.severity);
+        let location = analyzer_bug_location(b).unwrap_or_default();
+        let mut tags = Vec::new();
+        if let Some(cvss) = b.cvss {
+            tags.push(format!("CVSS {cvss}"));
+        }
+        if let Some(cve) = &b.cve {
+            if !cve.is_empty() {
+                tags.push(format!("CVE: {}", cve.join(", ")));
+            }
+        }
+        if let Some(cwe) = &b.cwe {
+            if !cwe.is_empty() {
+                tags.push(format!("CWE: {}", cwe.join(", ")));
+            }
+        }
+        rows.push_str(&format!(
+            r#"<tr>
+                <td class="idx">#{}</td>
+                <td><span class="sevpill" style="background:{}">{}</span></td>
+                <td>
+                    <div class="title">{}</div>
+                    {}
+                    <div class="desc">{}</div>
+                    {}
+                </td>
+            </tr>"#,
+            i + 1,
+            sev_color(sev),
+            sev.to_uppercase(),
+            html_escape(&b.title),
+            if location.is_empty() { String::new() } else { format!("<div class=\"loc\">{}</div>", html_escape(&location)) },
+            html_escape(&b.description),
+            if tags.is_empty() { String::new() } else { format!("<div class=\"tags\">{}</div>", html_escape(&tags.join("  ·  "))) },
+        ));
+    }
+
+    format!(
+        r#"<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Strobes {scan_label} Scan Report</title>
+<style>
+  body {{ font-family: -apple-system, Segoe UI, Helvetica, Arial, sans-serif; background: #0f1420; color: #e2e8f0; margin: 0; padding: 32px; }}
+  .card {{ max-width: 900px; margin: 0 auto; background: #161c2c; border: 1px solid #2a3348; border-radius: 10px; padding: 24px 28px; }}
+  h1 {{ font-size: 20px; margin: 0 0 4px; }}
+  .meta {{ color: #94a3b8; font-size: 13px; margin-bottom: 16px; }}
+  .meta b {{ color: #e2e8f0; }}
+  .badge {{ display: inline-block; color: #fff; font-size: 12px; font-weight: 600; padding: 3px 10px; border-radius: 999px; margin: 0 6px 6px 0; }}
+  table {{ width: 100%; border-collapse: collapse; margin-top: 16px; }}
+  td {{ padding: 12px 10px; border-top: 1px solid #2a3348; vertical-align: top; }}
+  td.idx {{ color: #64748b; font-size: 12px; white-space: nowrap; }}
+  .sevpill {{ display: inline-block; color: #fff; font-size: 11px; font-weight: 700; padding: 2px 8px; border-radius: 6px; white-space: nowrap; }}
+  .title {{ font-weight: 600; margin-bottom: 4px; }}
+  .loc {{ font-family: SF Mono, Menlo, monospace; font-size: 12px; color: #64d9c9; margin-bottom: 6px; }}
+  .desc {{ font-size: 13px; color: #cbd5e1; line-height: 1.5; }}
+  .tags {{ font-size: 12px; color: #94a3b8; margin-top: 6px; }}
+  .clean {{ color: #34d399; font-weight: 600; }}
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1>Strobes {scan_label} Scan Report</h1>
+    <div class="meta">
+      <b>Target:</b> {target_esc} &nbsp; <b>Analyzer:</b> {analyzer_esc} &nbsp;
+      <b>Duration:</b> {secs}s &nbsp; <b>Total:</b> {total} finding(s)
+    </div>
+    <div>{counts_html}</div>
+    {body}
+  </div>
+</body>
+</html>
+"#,
+        scan_label = scan_type.label().to_uppercase(),
+        target_esc = html_escape(target),
+        analyzer_esc = html_escape(if result.analyzer.is_empty() { "?" } else { &result.analyzer }),
+        secs = elapsed.as_secs(),
+        total = result.bugs.len(),
+        counts_html = counts_html,
+        body = if rows.is_empty() {
+            r#"<p class="clean">✓ No vulnerabilities identified — clean scan.</p>"#.to_string()
+        } else {
+            format!("<table>{rows}</table>")
+        },
+    )
+}
+
+/// `--fail-on SEVERITY` gate for `strobes cicd` — errors (causing a non-zero
+/// exit) if any finding is at or above the threshold.
+fn check_analyzer_gate(fail_on: &Option<String>, result: &AnalyzerScanResult) -> Result<()> {
+    let Some(threshold) = fail_on else { return Ok(()) };
+    let threshold_level = sast_severity_level(threshold);
+    let matching = result
+        .bugs
+        .iter()
+        .filter(|b| sast_severity_level(analyzer_severity_label(b.severity)) >= threshold_level)
+        .count();
+    if matching > 0 {
+        return Err(anyhow!("{matching} finding(s) at or above '{threshold}' severity — failing build"));
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4801,6 +5489,370 @@ fn dast_to_sarif(findings: &[DastFinding], target: &str) -> serde_json::Value {
     })
 }
 
+// ── `strobes cicd` — direct containerized-analyzer scans ────────────────────
+
+/// Mint credentials, log docker into the registry, and pull the analyzer
+/// image for `scan_type`. Shared by every `cmd_cicd_*` handler below.
+async fn cicd_prepare(profile: &config::Profile, scan_type: analyzer_registry::ScanType, common: &CicdCommon) -> Result<String> {
+    print_cicd_banner(scan_type);
+    if !docker_available() {
+        return Err(anyhow!(
+            "Docker is required for `strobes cicd` but is not available. Install Docker and ensure the daemon is running."
+        ));
+    }
+    eprintln!("preparing scanner...");
+    let creds = analyzer_registry::mint_credentials(profile, common.cred_duration)
+        .await
+        .context("could not get analyzer-registry credentials — is analyzer_registry_url configured? (run `strobes login --analyzer-registry-url <url>`)")?;
+    analyzer_registry::ecr_login(&creds).await?;
+    let image_ref = analyzer_registry::pull_image(&creds, scan_type, &common.tag).await?;
+    Ok(image_ref)
+}
+
+/// If `-o/--output-file` was given without an extension, append the right
+/// one for `--output <format>` — someone typing `-o results` almost always
+/// means `results.csv`, not a literal extensionless file. An explicit
+/// extension (even a "wrong" one) is left alone; the user meant that.
+fn ensure_extension(path: &str, format: &str) -> String {
+    if std::path::Path::new(path).extension().is_some() {
+        return path.to_string();
+    }
+    format!("{path}.{format}")
+}
+
+/// Parse the analyzer's output, render/save it per `--output`, run the
+/// opt-in AI-triage step, and apply `--fail-on`. Shared tail of every
+/// `cmd_cicd_*` handler.
+async fn cicd_finish(
+    profile: &config::Profile,
+    scan_type: analyzer_registry::ScanType,
+    run: analyzer_registry::AnalyzerRun,
+    target: &str,
+    elapsed: std::time::Duration,
+    common: &CicdCommon,
+) -> Result<()> {
+    let Some(json) = run.output_json else {
+        return Err(anyhow!(
+            "analyzer produced no output file.\nstdout: {}\nstderr: {}",
+            run.stdout.chars().take(500).collect::<String>(),
+            run.stderr.chars().take(500).collect::<String>(),
+        ));
+    };
+    let result: AnalyzerScanResult = serde_json::from_value(json).context("parsing analyzer output")?;
+
+    // Known bug (confirmed by hand): checkov's own CLI returns a single
+    // object instead of a list when the target has only one IaC framework,
+    // which crashes the analyzer wrapper's parser — the crash is caught and
+    // swallowed, and the scan reports `success: true` with zero findings.
+    // Surface this rather than let a 0-finding IaC scan read as "clean".
+    if scan_type == analyzer_registry::ScanType::Iac
+        && result.bugs.is_empty()
+        && run.stderr.contains("string indices must be integers")
+    {
+        eprintln!(
+            "⚠ checkov reported 0 findings, but its logs show the known single-framework \
+             parser bug: the scan target likely has only ONE IaC framework type (e.g. \
+             Terraform alone), which the analyzer wrapper cannot parse correctly. This is \
+             NOT necessarily a clean scan — verify manually, or add a second framework type \
+             (e.g. a Dockerfile) to the scan target to work around it."
+        );
+    }
+
+    if common.output == "text" {
+        print_analyzer_summary(&result, scan_type, target, elapsed);
+    }
+    let content = match common.output.as_str() {
+        "text" => String::new(), // already printed above
+        "json" => serde_json::to_string_pretty(&serde_json::json!({
+            "scan_target": target,
+            "analyzer": result.analyzer,
+            "elapsed_secs": elapsed.as_secs(),
+            "scan_meta": result.scan_meta,
+            "bugs": result.bugs,
+        }))?,
+        "sarif" => serde_json::to_string_pretty(&analyzer_to_sarif(&result, scan_type, target))?,
+        "csv" => analyzer_to_csv(&result, target),
+        "html" => analyzer_to_html(&result, scan_type, target, elapsed),
+        other => {
+            return Err(anyhow!(
+                "unknown --output format '{other}' — expected one of: text, json, sarif, csv, html"
+            ))
+        }
+    };
+    if !content.is_empty() {
+        if let Some(path) = &common.output_file {
+            let path = ensure_extension(path, &common.output);
+            std::fs::write(&path, &content)?;
+            eprintln!("results saved → {path}");
+        } else {
+            println!("{content}");
+        }
+    }
+
+    if common.ai_triage {
+        run_ai_triage(profile, scan_type, &result, target, common).await?;
+    }
+
+    check_analyzer_gate(&common.fail_on, &result)
+}
+
+/// Opt-in second pass: hand the deterministic findings to an AI agent for
+/// reachability triage, the same idea `strobes ci <type>` builds in as the
+/// only path. Self-contained streaming loop (create/attach a thread, send
+/// one message, stream the response) — the same shape as `cmd_send`'s core
+/// loop, simplified since we only need to show the agent's text output here.
+async fn run_ai_triage(
+    profile: &config::Profile,
+    scan_type: analyzer_registry::ScanType,
+    result: &AnalyzerScanResult,
+    target: &str,
+    common: &CicdCommon,
+) -> Result<()> {
+    println!("\n{BOLD}── AI triage ──{RESET}");
+    let client = api::ApiClient::new(profile.clone())?;
+    let workspace_id = match &common.workspace {
+        Some(ws) => Some(ws.clone()),
+        None => {
+            let (id, _) = client.create_workspace(&format!("cicd-{}-triage", scan_type.label())).await?;
+            eprintln!("workspace: {id}");
+            Some(id)
+        }
+    };
+    let title = format!("AI triage: {} scan of {target}", scan_type.label());
+    let thread_id = client.create_thread(&title, workspace_id.as_deref(), None).await?;
+    eprintln!("thread: {thread_id}");
+
+    let findings_json = serde_json::to_string_pretty(&result.bugs).unwrap_or_default();
+    let prompt = format!(
+        "The following are raw {} findings from a direct (non-AI) container scan of `{target}`, \
+         produced by Strobes' {} analyzer. For each finding, assess whether it is genuinely \
+         reachable/exploitable in context (not just theoretically present), note any that look \
+         like false positives, and give a short prioritized summary. Do not call create_finding — \
+         just report your triage analysis in this chat.\n\n```json\n{findings_json}\n```",
+        scan_type.label(),
+        result.analyzer,
+    );
+
+    let (tx, mut rx) = mpsc::unbounded_channel::<pulse::AppEvent>();
+    let handle = pulse::connect(profile, &thread_id, tx, None, None).await?;
+    handle.send_user_message(&prompt);
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(common.ai_timeout);
+    loop {
+        let ev = tokio::select! {
+            _ = tokio::time::sleep_until(deadline) => {
+                eprintln!("\nerror: AI triage timed out after {}s", common.ai_timeout);
+                break;
+            }
+            ev = rx.recv() => ev,
+        };
+        match ev {
+            None => break,
+            Some(pulse::AppEvent::RunFinished(_)) => {
+                println!();
+                break;
+            }
+            Some(pulse::AppEvent::Stream(item)) if item.kind == "token" => {
+                if let Some(text) = &item.text {
+                    print!("{text}");
+                    let _ = std::io::Write::flush(&mut std::io::stdout());
+                }
+            }
+            Some(pulse::AppEvent::Error(e)) => {
+                eprintln!("\nerror: {e}");
+                break;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+async fn cmd_cicd_sast(profile: &config::Profile, dir: String, common: CicdCommon) -> Result<()> {
+    let scan_type = analyzer_registry::ScanType::Sast;
+    let start = std::time::Instant::now();
+    let image_ref = cicd_prepare(profile, scan_type, &common).await?;
+    let target_dir = std::fs::canonicalize(&dir).with_context(|| format!("cannot resolve directory: {dir}"))?;
+    let out_dir = tempdir_for_cicd()?;
+    let docker_args = vec![
+        "-v".to_string(), format!("{}:/scan:ro", target_dir.display()),
+        "-v".to_string(), format!("{}:/out", out_dir.display()),
+        image_ref,
+        "-t".into(), "/scan".into(),
+        "-o".into(), "/out/result.json".into(),
+        "-log".into(), "ERROR".into(),
+    ];
+    eprintln!("scanning...");
+    let run = analyzer_registry::run_container(&docker_args, &out_dir, "result.json").await;
+    // The analyzer's JSON is already read into `run.output_json` by this
+    // point, so the temp dir backing the container's `/out` mount can go
+    // now — clean it up unconditionally (even on error) rather than
+    // leaking a strobes-cicd-<uuid> dir into /tmp on every single run.
+    let _ = std::fs::remove_dir_all(&out_dir);
+    let run = run?;
+    cicd_finish(profile, scan_type, run, &dir, start.elapsed(), &common).await
+}
+
+async fn cmd_cicd_sca(profile: &config::Profile, dir: String, common: CicdCommon) -> Result<()> {
+    let scan_type = analyzer_registry::ScanType::Sca;
+    let start = std::time::Instant::now();
+    let image_ref = cicd_prepare(profile, scan_type, &common).await?;
+    let target_dir = std::fs::canonicalize(&dir).with_context(|| format!("cannot resolve directory: {dir}"))?;
+    analyzer_registry::ensure_origin_remote(&target_dir)?;
+    let out_dir = tempdir_for_cicd()?;
+    let docker_args = vec![
+        // Read-write: the analyzer does a real `git checkout` on the target.
+        "-v".to_string(), format!("{}:/scan", target_dir.display()),
+        "-v".to_string(), format!("{}:/out", out_dir.display()),
+        image_ref,
+        "-t".into(), "/scan".into(),
+        "-o".into(), "/out/result.json".into(),
+        "-log".into(), "ERROR".into(),
+    ];
+    eprintln!("scanning...");
+    let run = analyzer_registry::run_container(&docker_args, &out_dir, "result.json").await;
+    // The analyzer's JSON is already read into `run.output_json` by this
+    // point, so the temp dir backing the container's `/out` mount can go
+    // now — clean it up unconditionally (even on error) rather than
+    // leaking a strobes-cicd-<uuid> dir into /tmp on every single run.
+    let _ = std::fs::remove_dir_all(&out_dir);
+    let run = run?;
+    cicd_finish(profile, scan_type, run, &dir, start.elapsed(), &common).await
+}
+
+async fn cmd_cicd_container(profile: &config::Profile, image: String, common: CicdCommon) -> Result<()> {
+    let scan_type = analyzer_registry::ScanType::Container;
+    let start = std::time::Instant::now();
+    let image_ref = cicd_prepare(profile, scan_type, &common).await?;
+    let out_dir = tempdir_for_cicd()?;
+    let docker_args = vec![
+        "-v".to_string(), format!("{}:/out", out_dir.display()),
+        image_ref,
+        "-t".into(), image.clone(),
+        "-o".into(), "/out/result.json".into(),
+        "-log".into(), "ERROR".into(),
+    ];
+    eprintln!("scanning...");
+    let run = analyzer_registry::run_container(&docker_args, &out_dir, "result.json").await;
+    // The analyzer's JSON is already read into `run.output_json` by this
+    // point, so the temp dir backing the container's `/out` mount can go
+    // now — clean it up unconditionally (even on error) rather than
+    // leaking a strobes-cicd-<uuid> dir into /tmp on every single run.
+    let _ = std::fs::remove_dir_all(&out_dir);
+    let run = run?;
+    cicd_finish(profile, scan_type, run, &image, start.elapsed(), &common).await
+}
+
+async fn cmd_cicd_iac(profile: &config::Profile, dir: String, common: CicdCommon) -> Result<()> {
+    let scan_type = analyzer_registry::ScanType::Iac;
+    let start = std::time::Instant::now();
+    let image_ref = cicd_prepare(profile, scan_type, &common).await?;
+    let target_dir = std::fs::canonicalize(&dir).with_context(|| format!("cannot resolve directory: {dir}"))?;
+    let out_dir = tempdir_for_cicd()?;
+    let docker_args = vec![
+        "-v".to_string(), format!("{}:/scan:ro", target_dir.display()),
+        "-v".to_string(), format!("{}:/out", out_dir.display()),
+        image_ref,
+        // Different flag spelling from sast/sca/container/dast — confirmed
+        // by hand: checkov_analyzer uses `-target`/`-output`, not `-t`/`-o`.
+        "-target".into(), "/scan".into(),
+        "-output".into(), "/out/result.json".into(),
+        "-log".into(), "ERROR".into(),
+    ];
+    eprintln!("scanning...");
+    let run = analyzer_registry::run_container(&docker_args, &out_dir, "result.json").await;
+    // The analyzer's JSON is already read into `run.output_json` by this
+    // point, so the temp dir backing the container's `/out` mount can go
+    // now — clean it up unconditionally (even on error) rather than
+    // leaking a strobes-cicd-<uuid> dir into /tmp on every single run.
+    let _ = std::fs::remove_dir_all(&out_dir);
+    let run = run?;
+    cicd_finish(profile, scan_type, run, &dir, start.elapsed(), &common).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn cmd_cicd_dast(
+    profile: &config::Profile,
+    url: String,
+    cookie: Option<String>,
+    bearer: Option<String>,
+    minutes: String,
+    activescan: bool,
+    ajaxspider: bool,
+    common: CicdCommon,
+) -> Result<()> {
+    let scan_type = analyzer_registry::ScanType::Dast;
+    let start = std::time::Instant::now();
+    let image_ref = cicd_prepare(profile, scan_type, &common).await?;
+    let out_dir = tempdir_for_cicd()?;
+    // `--apikey` has no default in the analyzer's own arg parser (dest
+    // "apiKey" defaults to None), but analyzer.py reuses the SAME value to
+    // both configure the ZAP daemon it launches (`-config api.key=<value>`)
+    // and to authenticate its own client requests. Leaving it unset means
+    // the daemon gets literal string "api.key=None" while the client sends
+    // null — a permanent mismatch that makes every ZAP API call get rejected
+    // in an infinite retry loop (confirmed by hand this session). Passing
+    // any explicit, consistent value fixes it since both sides then agree.
+    let api_key = uuid::Uuid::new_v4().simple().to_string();
+    let mut docker_args = vec![
+        "-v".to_string(), format!("{}:/out", out_dir.display()),
+        image_ref,
+        // "normal_instruction" drives ZAP directly off these flags; the
+        // other valid value, "yaml_instruction", needs a separate ZAP
+        // Automation Framework config file — out of scope for a one-shot CLI
+        // scan. ZAP bundles and launches its own daemon internally since we
+        // pass no --host/--port/--remote.
+        "-st".into(), "normal_instruction".into(),
+        "-t".into(), url.clone(),
+        "-o".into(), "/out/result.json".into(),
+        "-m".into(), minutes,
+        "--apikey".into(), api_key,
+        "-log".into(), "ERROR".into(),
+    ];
+    if activescan {
+        docker_args.push("--activescan".into());
+    }
+    if ajaxspider {
+        docker_args.push("--ajaxspider".into());
+    }
+    // `-z` takes ONE combined options string (per --help: `-z "-config aaa=bbb
+    // -config ccc=ddd"`), not a repeatable flag — merge cookie+bearer into a
+    // single value rather than passing `-z` twice (the second would just
+    // clobber the first in argparse).
+    let mut zap_replacers = Vec::new();
+    if let Some(c) = cookie {
+        zap_replacers.push(format!(
+            "-config replacer.full_list(0).matchtype=REQ_HEADER -config replacer.full_list(0).matchstr=Cookie -config replacer.full_list(0).regex=false -config replacer.full_list(0).replacement=\"{c}\""
+        ));
+    }
+    if let Some(b) = bearer {
+        let idx = zap_replacers.len();
+        zap_replacers.push(format!(
+            "-config replacer.full_list({idx}).matchtype=REQ_HEADER -config replacer.full_list({idx}).matchstr=Authorization -config replacer.full_list({idx}).regex=false -config replacer.full_list({idx}).replacement=\"Bearer {b}\""
+        ));
+    }
+    if !zap_replacers.is_empty() {
+        docker_args.push("-z".into());
+        docker_args.push(zap_replacers.join(" "));
+    }
+    eprintln!("scanning...");
+    let run = analyzer_registry::run_container(&docker_args, &out_dir, "result.json").await;
+    // The analyzer's JSON is already read into `run.output_json` by this
+    // point, so the temp dir backing the container's `/out` mount can go
+    // now — clean it up unconditionally (even on error) rather than
+    // leaking a strobes-cicd-<uuid> dir into /tmp on every single run.
+    let _ = std::fs::remove_dir_all(&out_dir);
+    let run = run?;
+    cicd_finish(profile, scan_type, run, &url, start.elapsed(), &common).await
+}
+
+/// A fresh, per-run temp dir for an analyzer container's `/out` mount.
+fn tempdir_for_cicd() -> Result<std::path::PathBuf> {
+    let dir = std::env::temp_dir().join(format!("strobes-cicd-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn cmd_scan_dast(
     p: &config::Profile,
@@ -5432,6 +6484,7 @@ async fn cmd_login(
     org_id: Option<String>,
     master_key: Option<String>,
     deployment: Option<String>,
+    analyzer_registry_url: Option<String>,
     no_verify: bool,
 ) -> Result<()> {
     let pname = tenant.to_string();
@@ -5468,6 +6521,11 @@ async fn cmd_login(
         p.org_id = org_id.trim().to_string();
         p.master_key = master_key.trim().to_string();
         p.deployment = deployment.trim().to_string();
+        // Advanced/optional — flag-only, never prompted interactively, and
+        // left untouched when not passed (unlike the core three fields).
+        if let Some(v) = analyzer_registry_url {
+            p.analyzer_registry_url = Some(v.trim().to_string());
+        }
     }
     cfg.save()?;
     let path = config::config_dir().join("config.json");
@@ -5678,6 +6736,15 @@ enum Defer {
     Models,
 }
 
+/// Result of a `Defer::{Workspaces,Threads,Findings,Approvals}` list fetch,
+/// posted back from a spawned task (see the comment at their handling below
+/// for why these run in the background instead of inline `.await`s).
+enum DeferResult {
+    OpenOverlay(app::OverlayKind, String, Vec<app::OverlayItem>),
+    Notice(String),
+    Error(String),
+}
+
 /// If the input is one or more existing local file paths (e.g. a file dragged
 /// onto the terminal, which inserts its path), return them — so a plain run can
 /// upload instead of sending the path as a chat message. Returns None for
@@ -5800,6 +6867,14 @@ pub async fn run_chat(
     // ~one round-trip instead of four-plus sequential ones.
     let (tx, mut rx) = mpsc::unbounded_channel::<pulse::AppEvent>();
     let mut app_tx = tx.clone(); // for background tasks (workspace sync) to post UI events
+    // Workspaces/Threads/Findings/Approvals overlay opens used to `.await`
+    // their list fetch directly in the render loop — freezing the whole UI
+    // (no redraw, no keystroke handling, no spinner) for the round-trip.
+    // That's the concrete cause of "Esc takes a bit of time": at the bottom
+    // of the transcript Esc opens the Threads overlay, which was one of
+    // these blocking fetches. They now run as background tasks that post
+    // their result back here instead.
+    let (defer_tx, mut defer_rx) = mpsc::unbounded_channel::<DeferResult>();
     let ws_scope = profile.workspace_id.clone();
     let (conn, events_res, threads_res, cmds_res, run_res, ws_res, credits_res) = tokio::join!(
         pulse::connect(&profile, &thread_id, tx, model, reasoning.clone()),
@@ -6089,10 +7164,20 @@ pub async fn run_chat(
                     None => quit = true,
                 }
             }
+            maybe_defer = defer_rx.recv() => {
+                app.clear_busy();
+                match maybe_defer {
+                    Some(DeferResult::OpenOverlay(kind, title, items)) => app.open_overlay(kind, title, items),
+                    Some(DeferResult::Notice(s)) => app.notice(&s),
+                    Some(DeferResult::Error(e)) => app.on_app_event(pulse::AppEvent::Error(e)),
+                    None => {}
+                }
+            }
             _ = ticker.tick() => {
-                // Advance the spinner only while running; ratatui's diff means
-                // an idle redraw writes nothing.
-                if app.running {
+                // Advance the spinner while running OR waiting on a
+                // non-agent request (busy) — idle otherwise, since
+                // ratatui's diff means an idle redraw writes nothing.
+                if app.running || app.is_busy() {
                     app.tick();
                 }
             }
@@ -6102,49 +7187,102 @@ pub async fn run_chat(
             break Ok(());
         }
 
+        // Instant feedback the moment a nav key is pressed — cleared once the
+        // corresponding result arrives (background ones: in the defer_rx
+        // handler above; synchronous ones: at the end of their match arm
+        // below). Without this, a genuinely slow-but-working request looked
+        // identical to a frozen app — nothing changed on screen until it
+        // either finished or (before the timeout fixes above) never did.
+        match &defer {
+            Some(Defer::Workspaces) => app.set_busy("loading workspaces…"),
+            Some(Defer::Threads) => app.set_busy("loading threads…"),
+            Some(Defer::Findings) => app.set_busy("loading findings…"),
+            Some(Defer::Approvals) => app.set_busy("loading approvals…"),
+            Some(Defer::SwitchThread(_)) => app.set_busy("switching thread…"),
+            Some(Defer::BindWorkspace(_)) => app.set_busy("binding workspace…"),
+            Some(Defer::UploadFiles(_)) => app.set_busy("uploading…"),
+            _ => {}
+        }
+
         // Deferred (awaiting / reconnecting) actions happen here, after the
         // select block has released its borrow on `rx`.
         match defer {
-            Some(Defer::Workspaces) => match workspace_overlay_items(&client, &profile).await {
-                Ok(items) => app.open_overlay(app::OverlayKind::Workspaces, "Workspaces".into(), items),
-                Err(e) => app.on_app_event(pulse::AppEvent::Error(e.to_string())),
-            },
-            Some(Defer::Threads) => {
-                let in_ws = profile.workspace_id.is_some();
-                match client.list_threads(profile.workspace_id.as_deref()).await {
-                    Ok(ts) => {
-                        let title = if in_ws { "Threads (this workspace)" } else { "Threads" };
-                        app.open_overlay(app::OverlayKind::Threads, title.into(), thread_items(ts, &thread_id, in_ws));
-                    }
-                    Err(e) => app.on_app_event(pulse::AppEvent::Error(e.to_string())),
-                }
+            // Workspaces/Threads/Findings/Approvals: spawned so the list
+            // fetch's round-trip can't freeze the render loop (see the
+            // comment where `defer_tx` is created).
+            Some(Defer::Workspaces) => {
+                let profile = profile.clone();
+                let dtx = defer_tx.clone();
+                tokio::spawn(async move {
+                    dtx.send(fetch_workspaces_overlay(&profile).await).ok();
+                });
             }
-            Some(Defer::Findings) => match profile.workspace_id.clone() {
-                Some(ws) => match client.list_workspace_findings(&ws).await {
-                    Ok(fs) => app.open_overlay(app::OverlayKind::Findings, "Findings".into(), finding_items(fs)),
-                    Err(e) => app.on_app_event(pulse::AppEvent::Error(e.to_string())),
-                },
-                None => match workspace_overlay_items(&client, &profile).await {
-                    Ok(items) => {
-                        app.notice("pick a workspace, then press ^F for its findings");
-                        app.open_overlay(app::OverlayKind::Workspaces, "Workspaces".into(), items);
+            Some(Defer::Threads) => {
+                let profile = profile.clone();
+                let thread_id = thread_id.clone();
+                let dtx = defer_tx.clone();
+                tokio::spawn(async move {
+                    let in_ws = profile.workspace_id.is_some();
+                    let client = match api::ApiClient::new(profile.clone()) {
+                        Ok(c) => c,
+                        Err(e) => { dtx.send(DeferResult::Error(e.to_string())).ok(); return; }
+                    };
+                    let result = match client.list_threads(profile.workspace_id.as_deref()).await {
+                        Ok(ts) => {
+                            let title = if in_ws { "Threads (this workspace)" } else { "Threads" };
+                            DeferResult::OpenOverlay(app::OverlayKind::Threads, title.into(), thread_items(ts, &thread_id, in_ws))
+                        }
+                        Err(e) => DeferResult::Error(e.to_string()),
+                    };
+                    dtx.send(result).ok();
+                });
+            }
+            Some(Defer::Findings) => {
+                let profile = profile.clone();
+                let dtx = defer_tx.clone();
+                tokio::spawn(async move {
+                    match profile.workspace_id.clone() {
+                        Some(ws) => {
+                            let client = match api::ApiClient::new(profile.clone()) {
+                                Ok(c) => c,
+                                Err(e) => { dtx.send(DeferResult::Error(e.to_string())).ok(); return; }
+                            };
+                            let result = match client.list_workspace_findings(&ws).await {
+                                Ok(fs) => DeferResult::OpenOverlay(app::OverlayKind::Findings, "Findings".into(), finding_items(fs)),
+                                Err(e) => DeferResult::Error(e.to_string()),
+                            };
+                            dtx.send(result).ok();
+                        }
+                        None => {
+                            dtx.send(DeferResult::Notice("pick a workspace, then press ^F for its findings".into())).ok();
+                            dtx.send(fetch_workspaces_overlay(&profile).await).ok();
+                        }
                     }
-                    Err(e) => app.on_app_event(pulse::AppEvent::Error(e.to_string())),
-                },
-            },
-            Some(Defer::Approvals) => match profile.workspace_id.clone() {
-                Some(ws) => match client.list_workspace_approvals(&ws).await {
-                    Ok(aps) => app.open_overlay(app::OverlayKind::Approvals, "Approvals".into(), approval_items(aps)),
-                    Err(e) => app.on_app_event(pulse::AppEvent::Error(e.to_string())),
-                },
-                None => match workspace_overlay_items(&client, &profile).await {
-                    Ok(items) => {
-                        app.notice("pick a workspace, then press ^A for its approvals");
-                        app.open_overlay(app::OverlayKind::Workspaces, "Workspaces".into(), items);
+                });
+            }
+            Some(Defer::Approvals) => {
+                let profile = profile.clone();
+                let dtx = defer_tx.clone();
+                tokio::spawn(async move {
+                    match profile.workspace_id.clone() {
+                        Some(ws) => {
+                            let client = match api::ApiClient::new(profile.clone()) {
+                                Ok(c) => c,
+                                Err(e) => { dtx.send(DeferResult::Error(e.to_string())).ok(); return; }
+                            };
+                            let result = match client.list_workspace_approvals(&ws).await {
+                                Ok(aps) => DeferResult::OpenOverlay(app::OverlayKind::Approvals, "Approvals".into(), approval_items(aps)),
+                                Err(e) => DeferResult::Error(e.to_string()),
+                            };
+                            dtx.send(result).ok();
+                        }
+                        None => {
+                            dtx.send(DeferResult::Notice("pick a workspace, then press ^A for its approvals".into())).ok();
+                            dtx.send(fetch_workspaces_overlay(&profile).await).ok();
+                        }
                     }
-                    Err(e) => app.on_app_event(pulse::AppEvent::Error(e.to_string())),
-                },
-            },
+                });
+            }
             Some(Defer::Files) => {
                 let dir = local::sandbox_dir();
                 let items = file_items(&dir);
@@ -6192,7 +7330,9 @@ pub async fn run_chat(
                     Err(e) => app.on_app_event(pulse::AppEvent::Error(format!("open failed: {e}"))),
                 }
             }
-            Some(Defer::UploadFiles(paths)) => match profile.workspace_id.clone() {
+            Some(Defer::UploadFiles(paths)) => {
+                app.clear_busy();
+                match profile.workspace_id.clone() {
                 Some(ws) => {
                     // Mirror dropped files into the live workspace sandbox (what
                     // the agent reads) and any bound folder, so local + remote
@@ -6218,10 +7358,15 @@ pub async fn run_chat(
                     }
                 }
                 None => app.notice("bind a workspace first, then drop files to upload"),
-            },
+                }
+            }
             Some(Defer::BindWorkspace(sel)) if sel == "__new_ws__" => {
                 // Create a workspace: ask for a name + optional setup prompt,
-                // then jump into its setup chat (sending the prompt).
+                // then jump into its setup chat (sending the prompt). Clear
+                // the generic "binding workspace…" busy message set above —
+                // the prompt dialogs below are their own interactive step,
+                // not a network wait.
+                app.clear_busy();
                 let auth = auth_line(&profile, tenant);
                 let name = match picker::prompt_text(terminal, "New workspace — name", "", &auth).await {
                     Ok(Some(n)) => {
@@ -6310,7 +7455,9 @@ pub async fn run_chat(
                 spawn_workspace_sync(profile.clone(), id.clone(), app_tx.clone());
                 // Lead straight into choosing a new chat or an existing thread
                 // for this workspace.
-                match client.list_threads(Some(&id)).await {
+                let threads_res = client.list_threads(Some(&id)).await;
+                app.clear_busy();
+                match threads_res {
                     Ok(ts) => app.open_overlay(
                         app::OverlayKind::Threads,
                         "New chat or existing thread".into(),
@@ -6346,6 +7493,7 @@ pub async fn run_chat(
                         Err(e) => app.on_app_event(pulse::AppEvent::Error(format!("switch failed: {e}"))),
                     }
                 }
+                app.clear_busy();
             }
             None => {}
         }
@@ -6749,6 +7897,21 @@ async fn workspace_overlay_items(
     let (counts, credits) =
         tokio::join!(workspace_thread_counts(client, &ws), workspace_credits_map(client));
     Ok(workspace_items(ws, &counts, &credits, profile, &cfg))
+}
+
+/// `workspace_overlay_items` wrapped as a `DeferResult`, for the background
+/// tasks in the chat loop's `Defer::{Workspaces,Findings,Approvals}` handling
+/// — builds its own `ApiClient` since spawned tasks own their `profile`
+/// rather than borrowing the loop's.
+async fn fetch_workspaces_overlay(profile: &config::Profile) -> DeferResult {
+    let client = match api::ApiClient::new(profile.clone()) {
+        Ok(c) => c,
+        Err(e) => return DeferResult::Error(e.to_string()),
+    };
+    match workspace_overlay_items(&client, profile).await {
+        Ok(items) => DeferResult::OpenOverlay(app::OverlayKind::Workspaces, "Workspaces".into(), items),
+        Err(e) => DeferResult::Error(e.to_string()),
+    }
 }
 
 async fn cmd_workflow(profile: config::Profile, sub: WorkflowCmd, tenant: &str) -> Result<()> {
