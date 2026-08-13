@@ -236,9 +236,26 @@ impl ApiClient {
         )
     }
 
+    /// Fetch all workspaces, paging through the backend's limit/offset
+    /// cursor so orgs with more than one page's worth aren't truncated.
     pub async fn list_workspaces(&self) -> Result<Vec<Workspace>> {
-        let v = self.get_json(&self.org_path("/cli/workspaces/")).await?;
-        Ok(serde_json::from_value(v).unwrap_or_default())
+        const PAGE_SIZE: usize = 200;
+        let mut all = Vec::new();
+        let mut offset = 0usize;
+        loop {
+            let path = self.org_path(&format!(
+                "/cli/workspaces/?limit={PAGE_SIZE}&offset={offset}"
+            ));
+            let v = self.get_json(&path).await?;
+            let page: Vec<Workspace> = serde_json::from_value(v).unwrap_or_default();
+            let got = page.len();
+            all.extend(page);
+            if got < PAGE_SIZE {
+                break;
+            }
+            offset += PAGE_SIZE;
+        }
+        Ok(all)
     }
 
     pub async fn list_threads(&self, workspace_id: Option<&str>) -> Result<Vec<Thread>> {
