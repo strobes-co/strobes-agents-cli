@@ -334,6 +334,16 @@ fn concise_args(tool: &str, v: &Value) -> String {
         }
         t if t.starts_with("browser_") => pick("url").or_else(|| pick("selector")).or_else(|| pick("script")),
         "spawn_subagent" => pick("agent_id").or_else(|| pick("task")),
+        // The raw args are a full DAG (a `nodes` array whose `agent_task`
+        // entries carry a free-form `directive` string with no length cap) —
+        // dumping it via the generic `v.to_string()` fallback below produces
+        // an unreadable, sometimes very long, line. Summarize instead: the
+        // objective plus a node count.
+        "create_dynamic_harness" | "run_dynamic_harness" => {
+            let objective = pick("objective").unwrap_or_default();
+            let nodes = v.get("nodes").and_then(|n| n.as_array()).map(|a| a.len()).unwrap_or(0);
+            Some(format!("objective={objective:?}, {nodes} node(s)"))
+        }
         _ => None,
     };
     let s = chosen.unwrap_or_else(|| {
@@ -635,5 +645,37 @@ fn handle_frame(v: Value, app_tx: &mpsc::UnboundedSender<AppEvent>, out_tx: &mps
             "completed".into()
         };
         let _ = app_tx.send(AppEvent::RunFinished(label));
+    }
+}
+
+#[cfg(test)]
+mod concise_args_tests {
+    use super::concise_args;
+    use serde_json::json;
+
+    #[test]
+    fn summarizes_dynamic_harness_instead_of_dumping_raw_dag() {
+        let args = json!({
+            "agents": [],
+            "nodes": [{
+                "agent": "planning_explore_agent",
+                "depends_on": [],
+                "directive": "Objective: Complete enumeration of ".repeat(50),
+            }],
+            "objective": "Map the Tosca microservices architecture",
+        });
+        let out = concise_args("create_dynamic_harness", &args);
+        assert_eq!(out, "objective=\"Map the Tosca microservices architecture\", 1 node(s)");
+        // The whole point: never fall through to a raw dump of the (possibly
+        // very long) directive text.
+        assert!(!out.contains("planning_explore_agent"));
+        assert!(!out.contains("Complete enumeration"));
+    }
+
+    #[test]
+    fn falls_back_cleanly_with_no_nodes() {
+        let args = json!({ "objective": "quick check" });
+        let out = concise_args("run_dynamic_harness", &args);
+        assert_eq!(out, "objective=\"quick check\", 0 node(s)");
     }
 }
