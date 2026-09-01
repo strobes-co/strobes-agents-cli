@@ -209,16 +209,37 @@ impl ApiClient {
     }
 
     async fn get_json(&self, path: &str) -> Result<serde_json::Value> {
+        self.get_json_timeout(
+            path,
+            std::time::Duration::from_secs(20),
+            &format!("GET {path} timed out or failed to connect"),
+        )
+        .await
+    }
+
+    /// Same as `get_json`, but with a caller-supplied timeout and connect/timeout
+    /// error message instead of the default 20s — for endpoints known to run
+    /// long server-side work (e.g. the workspace zip download, which builds
+    /// the archive inline before responding) so they aren't cut off by the
+    /// generic short timeout. Only the connect/timeout failure gets the custom
+    /// message — a non-2xx HTTP response (e.g. 404 "no files") still surfaces
+    /// as-is, since callers pattern-match on that text.
+    async fn get_json_timeout(
+        &self,
+        path: &str,
+        timeout: std::time::Duration,
+        timeout_context: &str,
+    ) -> Result<serde_json::Value> {
         let url = self.url(path)?;
         let resp = self
             .http
             .get(&url)
             .header("Authorization", format!("token {}", self.profile.master_key))
             .header("Accept", "application/json")
-            .timeout(std::time::Duration::from_secs(20))
+            .timeout(timeout)
             .send()
             .await
-            .with_context(|| format!("GET {path} timed out or failed to connect"))?;
+            .with_context(|| timeout_context.to_string())?;
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
         if !status.is_success() {
@@ -337,9 +358,21 @@ impl ApiClient {
     }
 
     /// Presigned S3 URL to a zip of the workspace (for local download).
+    ///
+    /// The backend builds this zip synchronously (fetching every file, then
+    /// uploading the archive) before responding, so large workspaces can take
+    /// well over the generic 20s request timeout — use a longer one here
+    /// rather than the shared default.
     pub async fn workspace_download_url(&self, workspace_id: &str) -> Result<String> {
         let path = self.org_path(&format!("/cli/workspaces/{workspace_id}/download/"));
-        let v = self.get_json(&path).await?;
+        let v = self
+            .get_json_timeout(
+                &path,
+                std::time::Duration::from_secs(180),
+                "workspace download is taking longer than 3 minutes to prepare — \
+                 it may still be generating server-side; try again shortly",
+            )
+            .await?;
         v.get("url")
             .and_then(|u| u.as_str())
             .map(|s| s.to_string())
