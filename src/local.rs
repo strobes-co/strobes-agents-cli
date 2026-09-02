@@ -134,6 +134,9 @@ async fn run_shell(command: &str, sandbox: &std::path::Path) -> LocalResult {
     if let Some(path) = crate::pack::path_with_pack() {
         cmd.env("PATH", path);
     }
+    // See the matching comment in run_code — unlike PATH, a login shell doesn't
+    // reset arbitrary env vars, so this one does survive `bash -lc`.
+    cmd.env("STROBES_SURFACE", "cli_local");
     let out = cmd
         .current_dir(sandbox)
         .stdout(Stdio::piped())
@@ -180,6 +183,12 @@ async fn run_code(code: &str, lang: &str, sandbox: &std::path::Path) -> LocalRes
                 .map(|p| vec![("PATH".to_string(), p)])
                 .unwrap_or_default(),
         )
+        // strobes_pt._surface.is_local_host() is designed to read an explicit
+        // answer rather than infer one (see its docstring) — without this, it
+        // only resolves correctly for the CLI by falling through a "no marker
+        // present, assume local" safety net, which a stray inherited
+        // STROBES_SANDBOX=1 could silently defeat.
+        .env("STROBES_SURFACE", "cli_local")
         .current_dir(sandbox)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -285,4 +294,42 @@ fn meta_json(sandbox: &std::path::Path) -> String {
         meta["workspace_id"] = serde_json::Value::from(ws);
     }
     meta.to_string()
+}
+
+#[cfg(test)]
+mod surface_marker_tests {
+    use super::*;
+
+    fn sandbox() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("strobes-cli-surface-test-{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    }
+
+    /// strobes_pt._surface.is_local_host() is documented to read an explicit
+    /// STROBES_SURFACE answer rather than infer one — without this, a local
+    /// tool call only resolves correctly by falling through a "no marker
+    /// present, assume local" default, which a stray inherited
+    /// STROBES_SANDBOX=1 could silently defeat.
+    #[tokio::test]
+    async fn run_code_sets_the_cli_local_surface_marker() {
+        let result = run_code("echo \"$STROBES_SURFACE\"", "bash", &sandbox()).await;
+        assert_eq!(result.error, None, "unexpected error: {:?}", result.error);
+        assert_eq!(result.output.trim(), "cli_local");
+    }
+
+    #[tokio::test]
+    async fn run_shell_sets_the_cli_local_surface_marker() {
+        // run_shell uses a LOGIN shell (`bash -lc`), which sources the user's
+        // own profile and may add its own output — assert containment, not an
+        // exact match, so this doesn't depend on the test environment's shell
+        // profile being silent.
+        let result = run_shell("echo \"STROBES_SURFACE=$STROBES_SURFACE\"", &sandbox()).await;
+        assert_eq!(result.error, None, "unexpected error: {:?}", result.error);
+        assert!(
+            result.output.contains("STROBES_SURFACE=cli_local"),
+            "expected STROBES_SURFACE=cli_local in output, got: {:?}",
+            result.output
+        );
+    }
 }
