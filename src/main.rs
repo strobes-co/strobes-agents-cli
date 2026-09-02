@@ -386,6 +386,10 @@ enum RemoteWorkflowCmd {
     Detach {
         #[arg(long, short)]
         workspace: Option<String>,
+        /// Skip the confirmation prompt (required for non-interactive/scripted use —
+        /// without it, no stdin input reads as "no" and silently does nothing).
+        #[arg(long, short = 'y')]
+        yes: bool,
     },
     /// Create a new remote workflow from a local YAML file.
     Create {
@@ -8562,22 +8566,24 @@ async fn cmd_workflow_remote(
             println!("  workflow {} [{}]", wf.workflow_id, wf.status);
         }
 
-        RemoteWorkflowCmd::Detach { workspace } => {
+        RemoteWorkflowCmd::Detach { workspace, yes } => {
             let ws = match resolve_workspace_or_pick(workspace, &profile, &client).await? {
                 Some(w) => w,
                 None => return Ok(()),
             };
-            print!(
-                "detach workflow from workspace {}…? [y/N] ",
-                &ws[..8.min(ws.len())]
-            );
-            use std::io::Write;
-            std::io::stdout().flush()?;
-            let mut line = String::new();
-            std::io::stdin().read_line(&mut line)?;
-            if !line.trim().eq_ignore_ascii_case("y") {
-                println!("cancelled.");
-                return Ok(());
+            if !yes {
+                print!(
+                    "detach workflow from workspace {}…? [y/N] ",
+                    &ws[..8.min(ws.len())]
+                );
+                use std::io::Write;
+                std::io::stdout().flush()?;
+                let mut line = String::new();
+                std::io::stdin().read_line(&mut line)?;
+                if !line.trim().eq_ignore_ascii_case("y") {
+                    println!("cancelled.");
+                    return Ok(());
+                }
             }
             client.detach_workflow(&ws).await?;
             println!("✔ workflow detached");
