@@ -7966,14 +7966,7 @@ async fn cmd_workflow(profile: config::Profile, sub: WorkflowCmd, tenant: &str) 
                 let mut keys: Vec<&String> = def.variables.keys().collect();
                 keys.sort();
                 let all_provided = keys.iter().all(|k| extra_vars.contains_key(*k));
-                if !all_provided && non_interactive {
-                    let missing: Vec<&String> = keys.iter().filter(|k| !extra_vars.contains_key(k.as_str())).copied().collect();
-                    return Err(anyhow!(
-                        "missing required workflow variable(s): {} — pass with -v KEY=VALUE or --var-file",
-                        missing.iter().map(|k| k.as_str()).collect::<Vec<_>>().join(", ")
-                    ));
-                }
-                if !all_provided {
+                if !all_provided && !non_interactive {
                     println!("\n  Variables (Enter to keep default):");
                 }
                 for k in keys {
@@ -7982,6 +7975,16 @@ async fn cmd_workflow(profile: config::Profile, sub: WorkflowCmd, tenant: &str) 
                         continue;
                     }
                     let default = &def.variables[k];
+                    if non_interactive {
+                        // Every variable declared under `variables:` already carries a
+                        // default in the YAML itself — there is no schema for a
+                        // variable with no fallback at all. --non-interactive uses that
+                        // default silently, exactly as pressing Enter would
+                        // interactively, instead of demanding it be re-supplied via -v.
+                        println!("  {k} = {default} (default)");
+                        extra_vars.insert(k.clone(), default.clone());
+                        continue;
+                    }
                     let secret = ["key", "secret", "token", "password", "pass", "credential"]
                         .iter()
                         .any(|s| k.to_lowercase().contains(s));
@@ -8053,10 +8056,21 @@ async fn cmd_workflow(profile: config::Profile, sub: WorkflowCmd, tenant: &str) 
                             any_tasks_failed = true;
                         }
                         TaskSkipped { task } => println!("↷ {task} (skipped)"),
-                        WorkflowDone => println!("✔ workflow complete"),
+                        // WorkflowDone/WorkflowFailed are terminal — nothing else will
+                        // ever arrive on this channel. Without breaking here, the loop
+                        // falls back into rx.recv() waiting for a channel that never
+                        // naturally closes (the outer `ev_tx` handle this fn holds
+                        // keeps it open), so a run with no --timeout would hang
+                        // forever after completing, and one WITH --timeout would
+                        // eventually report a successful run as a false timeout.
+                        WorkflowDone => {
+                            println!("✔ workflow complete");
+                            break;
+                        }
                         WorkflowFailed { reason } => {
                             println!("✗ workflow failed: {reason}");
                             failed = true;
+                            break;
                         }
                     }
                 }
@@ -8239,10 +8253,17 @@ async fn cmd_workflow(profile: config::Profile, sub: WorkflowCmd, tenant: &str) 
                         TaskDone { task } => println!("✔ {task}"),
                         TaskFailed { task, reason } => println!("✗ {task}: {reason}"),
                         TaskSkipped { task } => println!("↷ {task} (skipped)"),
-                        WorkflowDone => println!("✔ workflow complete"),
+                        // See the matching comment in `workflow run`'s --no-tui loop —
+                        // without breaking here this hangs forever after completion,
+                        // since nothing else ever closes the channel.
+                        WorkflowDone => {
+                            println!("✔ workflow complete");
+                            break;
+                        }
                         WorkflowFailed { reason } => {
                             println!("✗ workflow failed: {reason}");
                             failed = true;
+                            break;
                         }
                     }
                 }
