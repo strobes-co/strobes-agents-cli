@@ -23,6 +23,53 @@ const SKIP_EXTS: &[&str] = &[
     ".ico", ".woff", ".woff2", ".ttf", ".eot", ".map",
 ];
 const BODY_MAX: usize = 32 * 1024;
+
+/// Truncate `s` to at most `max_bytes` bytes without splitting a multi-byte
+/// UTF-8 character. A plain `&s[..max_bytes]` panics whenever the cut lands
+/// mid-character — routine on any captured response body with non-ASCII
+/// content (unicode text, emoji, …) once it crosses `BODY_MAX`.
+fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+#[cfg(test)]
+mod truncate_utf8_tests {
+    use super::truncate_utf8;
+
+    #[test]
+    fn leaves_short_bodies_untouched() {
+        assert_eq!(truncate_utf8("hello", 10), "hello");
+    }
+
+    #[test]
+    fn does_not_panic_when_the_cut_lands_mid_character() {
+        // A response body full of multi-byte chars, the way a real captured
+        // network body with non-ASCII content (unicode text, emoji, a
+        // non-English page) would be. Every offset near BODY_MAX must be
+        // handled without panicking — this used to crash with "byte index N
+        // is not a char boundary" on any body crossing the 32KB cutoff.
+        let s = "€".repeat(20_000); // 3 bytes each, 60,000 bytes total
+        for max in 32_760..32_775 {
+            let out = truncate_utf8(&s, max);
+            assert!(out.len() <= max);
+        }
+    }
+
+    #[test]
+    fn never_splits_a_multi_byte_character() {
+        let s = "€".repeat(20_000);
+        let out = truncate_utf8(&s, 32 * 1024);
+        assert!(out.len() % 3 == 0, "must cut on a whole '€' (3 bytes)");
+        assert!(std::str::from_utf8(out.as_bytes()).is_ok());
+    }
+}
 const BODY_MIMES: &[&str] = &[
     "application/json",
     "application/xml",
@@ -122,7 +169,11 @@ async fn start_capture(page: &Page) -> Option<CaptureGuard> {
                                     raw
                                 };
                                 let truncated = decoded.len() > BODY_MAX;
-                                let body_out = if truncated { decoded[..BODY_MAX].to_string() } else { decoded };
+                                let body_out = if truncated {
+                                    truncate_utf8(&decoded, BODY_MAX).to_string()
+                                } else {
+                                    decoded
+                                };
                                 let mut entries = cap.lock().unwrap();
                                 for entry in entries.iter_mut() {
                                     if entry["requestId"].as_str() == Some(&rid) {

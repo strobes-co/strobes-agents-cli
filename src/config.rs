@@ -24,6 +24,12 @@ pub struct Profile {
     pub shell_bridge_id: Option<String>,
     #[serde(default)]
     pub browser_id: Option<String>,
+    /// Cached BridgeAPIKey — the narrowly-scoped credential a CLI-launched
+    /// bridge daemon authenticates with (separate from `master_key`). Minted
+    /// once via `create_bridge_key()` and reused, rather than minting a new
+    /// one on every `ensure_local_bridge()` call.
+    #[serde(default)]
+    pub bridge_api_key: Option<String>,
     #[serde(default = "default_true")]
     pub verify_tls: bool,
     /// Base URL of the analyzer-registry ("maze") service that mints
@@ -237,6 +243,14 @@ impl Config {
         let path = config_path();
         let json = serde_json::to_string_pretty(self)?;
         std::fs::write(&path, json)?;
+        // config.json holds a plaintext master_key per tenant — restrict it to the
+        // owner rather than leaving it at the process umask's default (often
+        // world-readable).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
         Ok(())
     }
 
@@ -361,5 +375,39 @@ mod usage_tests {
                 .then(c.workspace_last_opened(b).cmp(&c.workspace_last_opened(a)))
         });
         assert_eq!(ids, vec!["high", "mid", "low", "never"]);
+    }
+}
+
+#[cfg(test)]
+mod save_permissions_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// STROBES_AI_HOME is process-global and cargo runs tests in parallel — see
+    /// pack.rs's ENV mutex for the flaky-test history that pattern exists to
+    /// avoid. Every test touching it takes this lock.
+    static ENV: Mutex<()> = Mutex::new(());
+
+    #[test]
+    #[cfg(unix)]
+    fn save_restricts_config_file_to_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("strobes-cli-config-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::set_var("STROBES_AI_HOME", &tmp);
+
+        let cfg = Config::default();
+        let result = cfg.save();
+
+        let path = config_path();
+        let mode = std::fs::metadata(&path).map(|m| m.permissions().mode() & 0o777);
+
+        std::env::remove_var("STROBES_AI_HOME");
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        result.expect("save should succeed");
+        assert_eq!(mode.expect("config.json should exist"), 0o600);
     }
 }
