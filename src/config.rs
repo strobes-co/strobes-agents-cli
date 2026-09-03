@@ -24,6 +24,12 @@ pub struct Profile {
     pub shell_bridge_id: Option<String>,
     #[serde(default)]
     pub browser_id: Option<String>,
+    /// Cached BridgeAPIKey — the narrowly-scoped credential a CLI-launched
+    /// bridge daemon authenticates with (separate from `master_key`). Minted
+    /// once via `create_bridge_key()` and reused, rather than minting a new
+    /// one on every `ensure_local_bridge()` call.
+    #[serde(default)]
+    pub bridge_api_key: Option<String>,
     #[serde(default = "default_true")]
     pub verify_tls: bool,
     /// Base URL of the analyzer-registry ("maze") service that mints

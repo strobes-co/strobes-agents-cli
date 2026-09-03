@@ -8,6 +8,7 @@
 mod analyzer_registry;
 mod api;
 mod app;
+mod bridge;
 mod browser;
 mod config;
 mod local;
@@ -15,6 +16,7 @@ mod pack;
 mod markdown;
 mod picker;
 mod pulse;
+mod remote_history;
 mod workflow;
 mod remote_wf_tui;
 mod workflow_runner;
@@ -156,6 +158,17 @@ enum Cmd {
         /// Base URL to fetch from (default: the Strobes bridge's pack release)
         #[arg(long)]
         url: Option<String>,
+    },
+    /// Check or set up a local Strobes Bridge for a workspace — install,
+    /// launch, and verify it connects, without necessarily starting a
+    /// workflow (the same check `workflow remote attach/create` runs
+    /// automatically before they'll proceed).
+    Bridge {
+        #[arg(long, short)]
+        workspace: Option<String>,
+        /// Only report current status — never install/launch anything.
+        #[arg(long)]
+        status_only: bool,
     },
     /// List remote workspaces.
     Workspaces,
@@ -469,7 +482,9 @@ enum RemoteWorkflowCmd {
         #[arg(long, short)]
         workspace: Option<String>,
     },
-    /// Open a live TUI showing workflow phase status with pause/resume/detach controls.
+    /// Open a live TUI showing workflow phase/task status with pause/resume/detach
+    /// controls. Without --workspace: jumps straight in if exactly one workspace
+    /// has an active workflow, otherwise shows a picker across all of them.
     Watch {
         #[arg(long, short)]
         workspace: Option<String>,
@@ -927,6 +942,28 @@ async fn main() -> Result<()> {
                 Ok(())
             }
         }
+        Cmd::Bridge { workspace, status_only } => {
+            require_complete(&profile)?;
+            let client = api::ApiClient::new(profile.clone())?;
+            let ws = match resolve_workspace_or_pick(workspace, &profile, &client).await? {
+                Some(w) => w,
+                None => return Ok(()),
+            };
+            if status_only {
+                let (_bridge_client, _key, shells) = bridge::scoped_client(&client, &profile, &tenant).await?;
+                if shells.is_empty() {
+                    println!("(no shells registered for this org)");
+                } else {
+                    for s in &shells {
+                        let mark = if s.bridge_connected == Some(true) { "✔ connected" } else { "✗ not connected" };
+                        println!("{}  {}  [{}]  {mark}", &s.id[..8.min(s.id.len())], s.name, s.shell_type);
+                    }
+                }
+                Ok(())
+            } else {
+                bridge::ensure_local_bridge(&client, &profile, &tenant, &ws).await
+            }
+        }
         Cmd::Workspaces => cmd_workspaces(&profile).await,
         Cmd::Threads => cmd_threads(&profile).await,
         Cmd::Bind { workspace, new, name, download, dir } => {
@@ -1099,24 +1136,31 @@ async fn resolve_workspace_interactive(
     require_complete(profile)?;
     let auth = auth_line(profile, tenant);
     let client = api::ApiClient::new(profile.clone())?;
-    let mut workspaces = client.list_workspaces().await.unwrap_or_default();
-    // Surface frequently-opened workspaces first (most opens, then most recent).
-    // Stable sort keeps never-opened ones in the server's order below.
-    workspaces.sort_by(|a, b| {
-        cfg.workspace_open_count(&b.id)
-            .cmp(&cfg.workspace_open_count(&a.id))
-            .then(cfg.workspace_last_opened(&b.id).cmp(&cfg.workspace_last_opened(&a.id)))
-    });
-
-    // Fetch workflow state for every workspace concurrently so we can badge rows.
-    let wf_states: Vec<Option<api::WorkflowState>> = {
-        let futs: Vec<_> = workspaces.iter().map(|w| client.workspace_workflow(&w.id)).collect();
-        futures_util::future::join_all(futs)
-            .await
-            .into_iter()
-            .map(|r| r.ok().flatten())
-            .collect()
-    };
+    // Fetch the workspace list, sort it, then fetch every workspace's
+    // workflow state (to badge rows) concurrently — all behind a loading
+    // overlay instead of leaving the alternate screen blank while it waits.
+    // The sort must happen before the workflow-state fetch so that vector
+    // stays index-aligned with `workspaces` for the zip below.
+    let (workspaces, wf_states) = picker::with_loading(terminal, "loading workspaces…", async {
+        let mut workspaces = client.list_workspaces().await.unwrap_or_default();
+        // Surface frequently-opened workspaces first (most opens, then most
+        // recent). Stable sort keeps never-opened ones in the server's order.
+        workspaces.sort_by(|a, b| {
+            cfg.workspace_open_count(&b.id)
+                .cmp(&cfg.workspace_open_count(&a.id))
+                .then(cfg.workspace_last_opened(&b.id).cmp(&cfg.workspace_last_opened(&a.id)))
+        });
+        let wf_states: Vec<Option<api::WorkflowState>> = {
+            let futs: Vec<_> = workspaces.iter().map(|w| client.workspace_workflow(&w.id)).collect();
+            futures_util::future::join_all(futs)
+                .await
+                .into_iter()
+                .map(|r| r.ok().flatten())
+                .collect()
+        };
+        (workspaces, wf_states)
+    })
+    .await;
 
     let cur = profile.workspace_id.as_deref();
     // Item 0 = create new, item 1 = no workspace, then existing workspaces (offset 2).
@@ -1171,7 +1215,7 @@ async fn resolve_workspace_interactive(
             picker::Nav::Shortcut(i) if i >= 2 => {
                 let ws = &workspaces[i - 2];
                 if wf_states[i - 2].is_some() {
-                    let _ = remote_wf_tui::run(terminal, &client, ws.id.clone(), profile.clone(), tenant.to_string()).await;
+                    let _ = remote_wf_tui::run(terminal, &client, ws.id.clone(), ws.name.clone(), profile.clone(), tenant.to_string()).await;
                     terminal.clear()?;
                 }
                 // Fall through to re-show the workspace picker.
@@ -8328,17 +8372,294 @@ async fn resolve_workspace_or_pick(
     if let Some(w) = workspace.or_else(|| profile.workspace_id.clone()) {
         return Ok(Some(w));
     }
-    let workspaces = client.list_workspaces().await?;
+    let mut terminal = ratatui::init();
+    let fetched = picker::with_loading(&mut terminal, "loading workspaces…", client.list_workspaces()).await;
+    let workspaces = match fetched {
+        Ok(w) => w,
+        Err(e) => {
+            ratatui::restore();
+            return Err(e);
+        }
+    };
     if workspaces.is_empty() {
+        ratatui::restore();
         return Err(anyhow!("no workspaces found — create one with `strobes bind`"));
     }
     let labels: Vec<String> = workspaces
         .iter()
         .map(|w| format!("{}…  {}", &w.id[..8.min(w.id.len())], w.name))
         .collect();
-    match picker::select("Select workspace", &labels).await? {
+    let nav = picker::select_with(&mut terminal, "Select workspace", &labels, "").await;
+    ratatui::restore();
+    match nav? {
         picker::Nav::Item(i) => Ok(Some(workspaces[i].id.clone())),
         _ => Ok(None),
+    }
+}
+
+/// `wf.status` → a short badge string for a workflow list row.
+fn workflow_status_badge(status: &str) -> &'static str {
+    match status {
+        "running" => "⚙ running",
+        "paused" => "⏸ paused",
+        "pending" => "◌ pending",
+        "failed" => "✗ failed",
+        "completed" => "✓ done",
+        "cancelled" => "↷ cancelled",
+        _ => "? unknown",
+    }
+}
+
+/// `HH:MM` on `YYYY-MM-DD` from an RFC3339-ish timestamp, for compact rows.
+fn fmt_short_time(s: &str) -> String {
+    let date = s.split('T').next().unwrap_or(s);
+    let time = s.split('T').nth(1).and_then(|t| t.split(['.', '+']).next()).unwrap_or("");
+    if time.is_empty() { date.to_string() } else { format!("{date} {time}") }
+}
+
+/// What selecting a row in the workflow picker resolves to: a workflow still
+/// live on the backend (poll it normally), or one the CLI only knows about
+/// from its own local history because the backend has since deleted it
+/// (render its last-known state read-only, no polling).
+#[derive(Clone)]
+enum WatchTarget {
+    Live { workspace_id: String, workspace_name: String },
+    Archived(remote_history::HistoryRecord),
+}
+
+/// Resolve which remote workflow to visualize, across every workspace:
+/// - `--workspace` explicitly given → use its live workflow as-is (scripted use unaffected).
+/// - otherwise, gather every workspace's live workflow (if any) plus any
+///   locally-recorded ones the backend has since replaced/deleted, grouped by
+///   workspace, and:
+///   - none found → tell the user and return `Ok(None)`.
+///   - exactly one entry total → jump straight to it, no picker needed.
+///   - multiple → show a grouped picker (workspace name headers, workflow rows
+///     with status/phase/progress); `None` if the user cancels.
+/// Returns `(target, showed_picker)` — `showed_picker` tells the caller
+/// whether backing out of `target`'s detail screen has somewhere to go back
+/// *to* (a list screen), so it knows whether ←/q/Esc there should re-loop
+/// into this picker or just exit the command outright.
+async fn resolve_workflow_target_or_pick(
+    workspace: Option<String>,
+    client: &api::ApiClient,
+) -> Result<Option<(WatchTarget, bool)>> {
+    if let Some(w) = workspace {
+        return Ok(Some((WatchTarget::Live { workspace_id: w, workspace_name: String::new() }, false)));
+    }
+
+    let mut terminal = ratatui::init();
+    let fetch = async {
+        let workspaces = client.list_workspaces().await?;
+        let wf_states: Vec<Option<api::WorkflowState>> = {
+            let futs: Vec<_> = workspaces.iter().map(|w| client.workspace_workflow(&w.id)).collect();
+            futures_util::future::join_all(futs)
+                .await
+                .into_iter()
+                .map(|r| r.ok().flatten())
+                .collect()
+        };
+        Ok::<_, anyhow::Error>((workspaces, wf_states))
+    };
+    let fetched = picker::with_loading(&mut terminal, "loading workspaces & workflows…", fetch).await;
+    let (workspaces, wf_states) = match fetched {
+        Ok(v) => v,
+        Err(e) => {
+            ratatui::restore();
+            return Err(e);
+        }
+    };
+    // Remember every live observation locally — this is the only way a
+    // workflow's final (completed/failed/cancelled) state survives the
+    // backend deleting it once a new one is attached to the same workspace.
+    for (w, wf) in workspaces.iter().zip(wf_states.iter()) {
+        if let Some(state) = wf {
+            remote_history::record(&w.id, &w.name, state);
+        }
+    }
+
+    struct Group {
+        workspace_id: String,
+        workspace_name: String,
+        live: Option<api::WorkflowState>,
+        archived: Vec<remote_history::HistoryRecord>,
+    }
+    let mut groups: Vec<Group> = Vec::new();
+    let mut seen_ws: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (w, wf) in workspaces.into_iter().zip(wf_states.into_iter()) {
+        let archived = remote_history::archived_for_workspace(
+            &w.id,
+            wf.as_ref().map(|s| s.workflow_id.as_str()),
+        );
+        if wf.is_none() && archived.is_empty() {
+            continue;
+        }
+        seen_ws.insert(w.id.clone());
+        groups.push(Group { workspace_id: w.id.clone(), workspace_name: w.name.clone(), live: wf, archived });
+    }
+    // Workspaces that no longer exist at all but still have local history.
+    let all_history = remote_history::list_all();
+    for rec in &all_history {
+        if seen_ws.contains(&rec.workspace_id) {
+            continue;
+        }
+        seen_ws.insert(rec.workspace_id.clone());
+        let archived: Vec<_> = all_history
+            .iter()
+            .filter(|r| r.workspace_id == rec.workspace_id)
+            .cloned()
+            .collect();
+        groups.push(Group {
+            workspace_id: rec.workspace_id.clone(),
+            workspace_name: rec.workspace_name.clone(),
+            live: None,
+            archived,
+        });
+    }
+
+    let total_entries: usize = groups.iter().map(|g| g.live.is_some() as usize + g.archived.len()).sum();
+    if total_entries == 0 {
+        ratatui::restore();
+        println!("no active or previously recorded remote workflows found");
+        return Ok(None);
+    }
+    if total_entries == 1 {
+        ratatui::restore();
+        let g = &groups[0];
+        if let Some(_wf) = &g.live {
+            return Ok(Some((WatchTarget::Live { workspace_id: g.workspace_id.clone(), workspace_name: g.workspace_name.clone() }, false)));
+        }
+        return Ok(Some((WatchTarget::Archived(g.archived[0].clone()), false)));
+    }
+
+    groups.sort_by(|a, b| a.workspace_name.to_lowercase().cmp(&b.workspace_name.to_lowercase()));
+
+    let mut labels: Vec<String> = Vec::new();
+    let mut selectable: Vec<bool> = Vec::new();
+    let mut targets: Vec<Option<WatchTarget>> = Vec::new();
+    for g in &groups {
+        let name = if g.workspace_name.is_empty() { "(unnamed)" } else { &g.workspace_name };
+        labels.push(format!("── {name} ──"));
+        selectable.push(false);
+        targets.push(None);
+
+        if let Some(wf) = &g.live {
+            let badge = workflow_status_badge(&wf.status);
+            let phase = wf.current_phase_key.as_deref().unwrap_or("—");
+            labels.push(format!(
+                "  ● live      {badge}   phase:{phase}   {}/{} tasks",
+                wf.completed_tasks, wf.total_tasks
+            ));
+            selectable.push(true);
+            targets.push(Some(WatchTarget::Live { workspace_id: g.workspace_id.clone(), workspace_name: g.workspace_name.clone() }));
+        }
+        for rec in &g.archived {
+            let badge = workflow_status_badge(&rec.state.status);
+            let when = rec.state.completed_at.as_deref().unwrap_or(&rec.last_seen_at);
+            labels.push(format!(
+                "  ○ executed  {badge}   {}/{} tasks   {}",
+                rec.state.completed_tasks, rec.state.total_tasks, fmt_short_time(when)
+            ));
+            selectable.push(true);
+            targets.push(Some(WatchTarget::Archived(rec.clone())));
+        }
+    }
+
+    enable_mouse();
+    let nav = picker::select_with_mask(&mut terminal, "Select a workflow", &labels, Some(&selectable), "").await;
+    disable_mouse();
+    ratatui::restore();
+    match nav? {
+        picker::Nav::Item(i) => Ok(targets[i].take().map(|t| (t, true))),
+        _ => Ok(None),
+    }
+}
+
+/// Render a locally-recorded ("archived") workflow's last-known state,
+/// read-only — no polling, no lifecycle controls, since the backend no
+/// longer has this workflow instance at all.
+/// Returns `Ok(true)` if the user backed out (any key, since this screen only
+/// supports going back) or `Ok(false)` if they quit outright (^C).
+async fn show_archived_workflow(
+    terminal: &mut ratatui::DefaultTerminal,
+    rec: &remote_history::HistoryRecord,
+) -> Result<bool> {
+    use ratatui::{
+        layout::{Constraint, Direction, Layout},
+        style::{Color, Modifier, Style},
+        text::{Line, Span},
+        widgets::{Block, Borders, Paragraph, Wrap},
+    };
+    let wf = &rec.state;
+    let mut events = EventStream::new();
+    loop {
+        terminal.draw(|f| {
+            let area = f.area();
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(3), Constraint::Min(1), Constraint::Length(1)])
+                .split(area);
+            let ws_short = &rec.workspace_id[..8.min(rec.workspace_id.len())];
+            let title = wf.template_slug.as_deref().unwrap_or("workflow");
+            f.render_widget(
+                Paragraph::new(format!("  ARCHIVED  {title}  ws:{ws_short}…  {}", rec.workspace_name))
+                    .style(Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD))
+                    .block(Block::default().borders(Borders::ALL)),
+                chunks[0],
+            );
+
+            let mut lines: Vec<Line> = vec![
+                Line::from(format!("  status:     {}", wf.status)),
+                Line::from(format!("  tasks:      {}/{}", wf.completed_tasks, wf.total_tasks)),
+            ];
+            if let Some(s) = &wf.started_at {
+                lines.push(Line::from(format!("  started:    {}", fmt_short_time(s))));
+            }
+            if let Some(c) = &wf.completed_at {
+                lines.push(Line::from(format!("  finished:   {}", fmt_short_time(c))));
+            }
+            lines.push(Line::from(format!(
+                "  last seen:  {}  (local CLI record — this workflow no longer exists on the server)",
+                fmt_short_time(&rec.last_seen_at)
+            )));
+            lines.push(Line::from(""));
+            if !wf.phases.is_empty() {
+                lines.push(Line::from(Span::styled("  phases:", Style::default().add_modifier(Modifier::BOLD))));
+                for p in &wf.phases {
+                    let (icon, color) = match p.status.as_str() {
+                        "completed" => ("✓", Color::Green),
+                        "failed" => ("✗", Color::Red),
+                        "skipped" => ("↷", Color::DarkGray),
+                        _ => ("○", Color::DarkGray),
+                    };
+                    lines.push(Line::from(Span::styled(
+                        format!("    {icon} {}", p.phase_name),
+                        Style::default().fg(color),
+                    )));
+                }
+            }
+            f.render_widget(
+                Paragraph::new(lines)
+                    .block(Block::default().borders(Borders::ALL).title(" Archived workflow (read-only) "))
+                    .wrap(Wrap { trim: false }),
+                chunks[1],
+            );
+            f.render_widget(
+                Paragraph::new("  ←/any key: back to list  ·  ^C: quit").style(Style::default().fg(Color::DarkGray)),
+                chunks[2],
+            );
+        })?;
+        match events.next().await {
+            Some(Ok(Event::Key(k))) if k.kind == KeyEventKind::Press => {
+                let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+                if matches!(k.code, KeyCode::Char('c')) && ctrl {
+                    return Ok(false);
+                }
+                return Ok(true);
+            }
+            None => return Ok(false),
+            _ => {}
+        }
     }
 }
 
@@ -8561,6 +8882,11 @@ async fn cmd_workflow_remote(
                 .collect::<serde_json::Map<_, _>>()
                 .into();
 
+            // Hard gate: never attach/start a remote workflow unless a local
+            // bridge is confirmed connected — otherwise browser/command tasks
+            // silently run in the cloud sandbox instead of the user's machine.
+            bridge::ensure_local_bridge(&client, &profile, &tenant, &ws).await?;
+
             let wf = client.attach_workflow_template(&ws, &slug, &variables).await?;
             println!("✔ attached '{slug}' to workspace {}…", &ws[..8.min(ws.len())]);
             println!("  workflow {} [{}]", wf.workflow_id, wf.status);
@@ -8608,6 +8934,12 @@ async fn cmd_workflow_remote(
                 }
             }
             let vars_json = serde_json::Value::Object(vars);
+
+            // Hard gate: never create/start a remote workflow unless a local
+            // bridge is confirmed connected — see the matching comment in
+            // RemoteWorkflowCmd::Attach.
+            bridge::ensure_local_bridge(&client, &profile, &tenant, &ws).await?;
+
             let wf = client
                 .create_custom_workflow(&ws, &def.name, &phases_json, &vars_json)
                 .await?;
@@ -8764,16 +9096,35 @@ async fn cmd_workflow_remote(
             println!("✔ phase advanced");
         }
         RemoteWorkflowCmd::Watch { workspace } => {
-            let ws = match resolve_workspace_or_pick(workspace, &profile, &client).await? {
-                Some(w) => w,
-                None => return Ok(()),
-            };
-            let mut terminal = ratatui::init();
-            enable_mouse();
-            let r = remote_wf_tui::run(&mut terminal, &client, ws, profile.clone(), tenant.to_string()).await;
-            disable_mouse();
-            ratatui::restore();
-            r?;
+            // ← from a detail screen re-loops into the picker (when there was
+            // one to go back to); an explicit --workspace never shows one, so
+            // its first (only) pass always exits after the detail screen.
+            let mut ws_arg = workspace;
+            loop {
+                let (target, showed_picker) = match resolve_workflow_target_or_pick(ws_arg.take(), &client).await? {
+                    Some(t) => t,
+                    None => return Ok(()),
+                };
+                let went_back = match target {
+                    WatchTarget::Live { workspace_id, workspace_name } => {
+                        let mut terminal = ratatui::init();
+                        enable_mouse();
+                        let r = remote_wf_tui::run(&mut terminal, &client, workspace_id, workspace_name, profile.clone(), tenant.to_string()).await;
+                        disable_mouse();
+                        ratatui::restore();
+                        r?
+                    }
+                    WatchTarget::Archived(rec) => {
+                        let mut terminal = ratatui::init();
+                        let r = show_archived_workflow(&mut terminal, &rec).await;
+                        ratatui::restore();
+                        r?
+                    }
+                };
+                if !went_back || !showed_picker {
+                    break;
+                }
+            }
         }
     }
     Ok(())

@@ -3,7 +3,7 @@
 //! `Authorization: token <key>` — matches strobes/app/authentication.py.
 
 use anyhow::{anyhow, Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::config::Profile;
 
@@ -654,9 +654,62 @@ impl ApiClient {
         self.delete_req(&path).await?;
         Ok(())
     }
+
+    // ── Bridge management ─────────────────────────────────────────────────────
+    // Not under /cli/ — these mirror the web UI's own shell/bridge REST surface
+    // (organizations/<org>/shells/, .../workspaces/<ws>/attach-shell/), gated
+    // on the CLI side by a narrowly-scoped BridgeAPIKey rather than the general
+    // MasterKey. See `bridge.rs` for the orchestration that uses these.
+
+    pub async fn list_shells(&self) -> Result<Vec<Shell>> {
+        let v = self.get_json(&self.org_path("/shells/")).await?;
+        Ok(v.get("results")
+            .and_then(|r| serde_json::from_value(r.clone()).ok())
+            .unwrap_or_default())
+    }
+
+    pub async fn create_bridge_shell(&self, name: &str) -> Result<Shell> {
+        let body = serde_json::json!({ "name": name, "shell_type": "bridge" });
+        let v = self.post_json(&self.org_path("/shells/"), body).await?;
+        Ok(serde_json::from_value(v).unwrap_or_default())
+    }
+
+    pub async fn attach_shell_to_workspace(&self, workspace_id: &str, shell_id: &str) -> Result<()> {
+        let path = self.org_path(&format!("/workspaces/{workspace_id}/attach-shell/"));
+        self.post_json(&path, serde_json::json!({ "shellId": shell_id })).await?;
+        Ok(())
+    }
+
+    /// Mint a new, narrowly-scoped BridgeAPIKey (separate from the profile's
+    /// MasterKey) — the credential a CLI-launched bridge daemon authenticates
+    /// its own connection with. Uses the existing MasterKey to provision it
+    /// (an established credential minting a narrower one), per
+    /// `CLIBridgeKeyListCreateView`.
+    pub async fn create_bridge_key(&self, name: &str) -> Result<String> {
+        let body = serde_json::json!({ "name": name });
+        let v = self.post_json(&self.org_path("/cli/bridge-keys/"), body).await?;
+        v.get("key")
+            .and_then(|k| k.as_str())
+            .map(|s| s.to_string())
+            .ok_or_else(|| anyhow!("bridge key creation did not return a key: {v}"))
+    }
 }
 
 // ── GraphQL type structs ──────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct Shell {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default, rename = "shell_type")]
+    pub shell_type: String,
+    #[serde(default, rename = "bridge_id")]
+    pub bridge_id: Option<String>,
+    #[serde(default, rename = "bridge_connected")]
+    pub bridge_connected: Option<bool>,
+}
 
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct WorkflowTemplate {
@@ -690,7 +743,7 @@ pub struct WorkflowTemplatePhase {
     pub task_count: i64,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct WorkflowState {
     #[serde(default, rename = "workflowId")]
     pub workflow_id: String,
@@ -714,7 +767,7 @@ pub struct WorkflowState {
     pub phases: Vec<WorkflowStatePhase>,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct WorkflowStatePhase {
     #[serde(default, rename = "phaseKey")]
     pub phase_key: String,
