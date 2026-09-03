@@ -778,6 +778,48 @@ fn trunc(s: &str, n: usize) -> String {
     if s.len() <= n {
         s.to_string()
     } else {
-        format!("{}…", &s[..n])
+        // Byte-index slicing panics if `n` lands mid-character — routine on
+        // any non-ASCII error body (e.g. an internationalized message).
+        // Back off to the nearest char boundary at or before `n`.
+        let mut end = n;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}…", &s[..end])
+    }
+}
+
+#[cfg(test)]
+mod trunc_tests {
+    use super::trunc;
+
+    #[test]
+    fn leaves_short_strings_untouched() {
+        assert_eq!(trunc("hello", 10), "hello");
+    }
+
+    #[test]
+    fn does_not_panic_when_the_cut_lands_mid_character() {
+        // Each "é" is 2 bytes (0xC3 0xA9); a naive byte-index cut at an odd
+        // offset lands inside one of them. This used to panic with "byte
+        // index N is not a char boundary". The loop completing at all (for
+        // every n, including odd ones that used to panic) is the test; the
+        // assertion below just adds a sanity check on the shape of the result.
+        let s = "é".repeat(200); // 400 bytes, all multi-byte chars
+        for n in 0..8 {
+            let out = trunc(&s, n); // must not panic for any n near a boundary
+            assert!(out.ends_with('…'));
+        }
+    }
+
+    #[test]
+    fn truncates_to_at_most_n_bytes_plus_ellipsis() {
+        let s = "é".repeat(200);
+        let out = trunc(&s, 101); // 101 lands mid-character (chars are 2 bytes)
+        // The ellipsis is appended after backing off to a valid boundary at
+        // or before 101, so the pre-ellipsis part is <= 101 bytes.
+        let body = out.strip_suffix('…').unwrap();
+        assert!(body.len() <= 101);
+        assert!(body.len() % 2 == 0); // never split a 2-byte "é"
     }
 }

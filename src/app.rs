@@ -20,29 +20,40 @@ use std::collections::HashMap;
 use crate::pulse::{AppEvent, Field, StreamItem};
 
 /// Status of a tracked agent task.
+///
+/// `Blocked`/`Inconclusive` exist so a future backend fix for strobes-co/strobes#9203
+/// (orchestrator currently collapses these into "Completed") has somewhere to land —
+/// without them, an unrecognized status string falls through to `Created`, which
+/// reads as "not started yet" rather than "ran but didn't reach a real result".
 #[derive(Clone, Copy, PartialEq)]
 pub enum TaskStatus {
     Created,
     Running,
     Completed,
     Failed,
+    Blocked,
+    Inconclusive,
 }
 
 impl TaskStatus {
     fn icon(self) -> &'static str {
         match self {
-            TaskStatus::Created   => "○",
-            TaskStatus::Running   => "⟳",
-            TaskStatus::Completed => "✓",
-            TaskStatus::Failed    => "✗",
+            TaskStatus::Created      => "○",
+            TaskStatus::Running      => "⟳",
+            TaskStatus::Completed    => "✓",
+            TaskStatus::Failed       => "✗",
+            TaskStatus::Blocked      => "⊘",
+            TaskStatus::Inconclusive => "◐",
         }
     }
     fn color(self) -> Color {
         match self {
-            TaskStatus::Created   => Color::DarkGray,
-            TaskStatus::Running   => Color::Cyan,
-            TaskStatus::Completed => Color::Green,
-            TaskStatus::Failed    => Color::Red,
+            TaskStatus::Created      => Color::DarkGray,
+            TaskStatus::Running      => Color::Cyan,
+            TaskStatus::Completed    => Color::Green,
+            TaskStatus::Failed       => Color::Red,
+            TaskStatus::Blocked      => Color::Yellow,
+            TaskStatus::Inconclusive => Color::Magenta,
         }
     }
 }
@@ -811,10 +822,12 @@ impl App {
             "task" => {
                 let title = item.text.unwrap_or_default();
                 let task_status = match item.status.as_deref() {
-                    Some("started")   => TaskStatus::Running,
-                    Some("completed") => TaskStatus::Completed,
-                    Some("failed")    => TaskStatus::Failed,
-                    _                 => TaskStatus::Created,
+                    Some("started")      => TaskStatus::Running,
+                    Some("completed")    => TaskStatus::Completed,
+                    Some("failed")       => TaskStatus::Failed,
+                    Some("blocked")      => TaskStatus::Blocked,
+                    Some("inconclusive") => TaskStatus::Inconclusive,
+                    _                    => TaskStatus::Created,
                 };
                 if let Some(id) = &item.task_id {
                     if let Some(existing) = self.tasks.iter_mut().find(|t| &t.id == id) {
@@ -1722,10 +1735,12 @@ impl App {
                     let title = pstr("title");
                     let task_id = e.get("taskId").and_then(|v| v.as_str()).map(|s| s.to_string());
                     let hist_status = match t {
-                        "task.started"   => TaskStatus::Running,
-                        "task.completed" => TaskStatus::Completed,
-                        "task.failed"    => TaskStatus::Failed,
-                        _                => TaskStatus::Created,
+                        "task.started"      => TaskStatus::Running,
+                        "task.completed"    => TaskStatus::Completed,
+                        "task.failed"       => TaskStatus::Failed,
+                        "task.blocked"      => TaskStatus::Blocked,
+                        "task.inconclusive" => TaskStatus::Inconclusive,
+                        _                   => TaskStatus::Created,
                     };
                     // Upsert into the tasks panel.
                     if let Some(ref id) = task_id {
@@ -1765,10 +1780,12 @@ impl App {
                             if title.is_empty() { continue; }
                             let status_str = task.get("status").and_then(|v| v.as_str()).unwrap_or("pending");
                             let hist_status = match status_str {
-                                "running"   => TaskStatus::Running,
-                                "completed" => TaskStatus::Completed,
-                                "failed"    => TaskStatus::Failed,
-                                _           => TaskStatus::Created,
+                                "running"      => TaskStatus::Running,
+                                "completed"    => TaskStatus::Completed,
+                                "failed"       => TaskStatus::Failed,
+                                "blocked"      => TaskStatus::Blocked,
+                                "inconclusive" => TaskStatus::Inconclusive,
+                                _              => TaskStatus::Created,
                             };
                             if let Some(ref id) = tid {
                                 if let Some(existing) = self.tasks.iter_mut().find(|t| &t.id == id) {
