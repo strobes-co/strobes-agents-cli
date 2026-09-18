@@ -463,25 +463,6 @@ impl ApiClient {
 
     // ── GraphQL (workflow API) ────────────────────────────────────────────────
 
-    /// PATCH JSON to a REST path (MasterKey token auth). Returns the parsed body.
-    async fn patch_json(&self, path: &str, body: serde_json::Value) -> Result<serde_json::Value> {
-        let url = self.url(path)?;
-        let resp = self
-            .http
-            .patch(&url)
-            .header("Authorization", format!("token {}", self.profile.master_key))
-            .header("Accept", "application/json")
-            .json(&body)
-            .send()
-            .await?;
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        if !status.is_success() {
-            return Err(anyhow!("PATCH {path} -> HTTP {}: {}", status.as_u16(), trunc(&text, 300)));
-        }
-        Ok(serde_json::from_str(&text).unwrap_or(serde_json::Value::Null))
-    }
-
     /// DELETE a REST path (MasterKey token auth). Returns the parsed body.
     async fn delete_req(&self, path: &str) -> Result<serde_json::Value> {
         let url = self.url(path)?;
@@ -533,38 +514,6 @@ impl ApiClient {
             "variables": variables,
         });
         let data = self.post_json(&path, body).await?;
-        Ok(serde_json::from_value(data).unwrap_or_default())
-    }
-
-    pub async fn create_custom_workflow(
-        &self,
-        workspace_id: &str,
-        name: &str,
-        phases: &serde_json::Value,
-        variables: &serde_json::Value,
-    ) -> Result<WorkflowState> {
-        let path = self.org_path(&format!("/cli/workspaces/{workspace_id}/workflow/"));
-        let body = serde_json::json!({
-            "name": name,
-            "phases": phases,
-            "variables": variables,
-        });
-        let data = self.post_json(&path, body).await?;
-        Ok(serde_json::from_value(data).unwrap_or_default())
-    }
-
-    pub async fn edit_custom_workflow(
-        &self,
-        workspace_id: &str,
-        name: &str,
-        phases: &serde_json::Value,
-    ) -> Result<WorkflowState> {
-        let path = self.org_path(&format!("/cli/workspaces/{workspace_id}/workflow/"));
-        let body = serde_json::json!({
-            "name": name,
-            "phases": phases,
-        });
-        let data = self.patch_json(&path, body).await?;
         Ok(serde_json::from_value(data).unwrap_or_default())
     }
 
@@ -620,6 +569,13 @@ impl ApiClient {
         self.workflow_action(workspace_id, "pause", serde_json::json!({})).await
     }
 
+    /// Pause because this CLI is leaving (TUI closed / lost). Tagged so the
+    /// server knows it may auto-resume when a CLI reattaches — unlike a manual
+    /// `pause`, which stays paused until the user resumes.
+    pub async fn pause_workflow_on_exit(&self, workspace_id: &str) -> Result<()> {
+        self.workflow_action(workspace_id, "pause", serde_json::json!({ "reason": "cli_exit" })).await
+    }
+
     pub async fn resume_workflow(&self, workspace_id: &str) -> Result<()> {
         self.workflow_action(workspace_id, "resume", serde_json::json!({})).await
     }
@@ -647,6 +603,13 @@ impl ApiClient {
 
     pub async fn advance_workflow_phase(&self, workspace_id: &str) -> Result<()> {
         self.workflow_action(workspace_id, "advance", serde_json::json!({})).await
+    }
+
+    /// Presence heartbeat for a CLI-local workflow. The CLI is the execution
+    /// surface (it services `tool.local_execute`), so the server pauses the
+    /// workflow if these stop arriving. Sent periodically while attached.
+    pub async fn heartbeat_workflow(&self, workspace_id: &str) -> Result<()> {
+        self.workflow_action(workspace_id, "heartbeat", serde_json::json!({})).await
     }
 
     pub async fn detach_workflow(&self, workspace_id: &str) -> Result<()> {

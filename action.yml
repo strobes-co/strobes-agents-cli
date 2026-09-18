@@ -16,24 +16,20 @@ inputs:
   master-key:
     description: 'Strobes master API key'
     required: true
-  workflow-file:
-    description: 'Path to a local workflow YAML file to run (mutually exclusive with message)'
+  workflow-template:
+    description: 'Cloud workflow template slug to run (e.g. web-pentest or custom:my-flow). Executes on the Strobes cloud; requires workspace. Mutually exclusive with message.'
     required: false
     default: ''
   message:
-    description: 'One-shot assessment prompt sent via `strobes send` (used when workflow-file is not set)'
+    description: 'One-shot assessment prompt sent via `strobes send` (used when workflow-template is not set)'
     required: false
     default: ''
   workspace:
-    description: 'Existing workspace UUID to run the assessment in'
+    description: 'Existing workspace UUID to run the assessment in (required for workflow-template)'
     required: false
     default: ''
   vars:
     description: 'Workflow variables as newline-separated KEY=VALUE pairs'
-    required: false
-    default: ''
-  var-file:
-    description: 'Path to a JSON file of workflow variables ({"KEY": "VALUE"})'
     required: false
     default: ''
   fail-on-findings:
@@ -112,30 +108,56 @@ runs:
       run: |
         set -e
 
-        WORKFLOW_FILE="${{ inputs.workflow-file }}"
+        TEMPLATE="${{ inputs.workflow-template }}"
         MESSAGE="${{ inputs.message }}"
         WORKSPACE="${{ inputs.workspace }}"
         FAIL_ON="${{ inputs.fail-on-findings }}"
         TIMEOUT="${{ inputs.timeout }}"
         OUTPUT_FMT="${{ inputs.output-format }}"
-        VAR_FILE="${{ inputs.var-file }}"
 
         if [ -n "$WORKSPACE" ]; then
           export STROBES_AI_WORKSPACE_ID="$WORKSPACE"
         fi
 
-        if [ -n "$WORKFLOW_FILE" ]; then
-          CMD="strobes workflow run $WORKFLOW_FILE --no-tui --non-interactive"
-          # Append -v flags from multiline vars input
+        if [ -n "$TEMPLATE" ]; then
+          if [ -z "$WORKSPACE" ]; then
+            echo "::error::'workspace' is required when using 'workflow-template'"
+            exit 1
+          fi
+
+          # Kick off the workflow on the Strobes cloud (no TUI in CI).
+          ATTACH="strobes workflow attach --workspace $WORKSPACE --template $TEMPLATE --no-watch"
           while IFS= read -r line; do
             [ -z "$line" ] && continue
-            CMD="$CMD -v $(printf '%q' "$line")"
+            ATTACH="$ATTACH -v $(printf '%q' "$line")"
           done <<< "${{ inputs.vars }}"
-          [ -n "$VAR_FILE" ]  && CMD="$CMD --var-file $VAR_FILE"
-          [ -n "$FAIL_ON" ]   && CMD="$CMD --fail-on-findings $FAIL_ON"
-          [ "$TIMEOUT" != "0" ] && CMD="$CMD --timeout $TIMEOUT"
+          eval $ATTACH
 
-          eval $CMD
+          # Poll the cloud status until the workflow reaches a terminal state.
+          if [ "$TIMEOUT" != "0" ]; then
+            DEADLINE=$(( $(date +%s) + TIMEOUT ))
+          else
+            DEADLINE=0
+          fi
+          while true; do
+            STATUS=$(strobes workflow status --workspace "$WORKSPACE" | awk '/^status/{print $2; exit}')
+            echo "workflow status: ${STATUS:-unknown}"
+            case "$STATUS" in
+              completed) break ;;
+              failed|cancelled) echo "::error::workflow $STATUS"; exit 1 ;;
+            esac
+            if [ "$DEADLINE" != "0" ] && [ "$(date +%s)" -ge "$DEADLINE" ]; then
+              echo "::error::workflow did not finish within ${TIMEOUT}s"
+              exit 1
+            fi
+            sleep 15
+          done
+
+          # Gate on findings produced by the cloud workflow.
+          if [ -n "$FAIL_ON" ]; then
+            strobes findings --workspace "$WORKSPACE" --fail-on "$FAIL_ON"
+          fi
+          echo "workspace-id=$WORKSPACE" >> "$GITHUB_OUTPUT"
 
         elif [ -n "$MESSAGE" ]; then
           CMD="strobes send $(printf '%q' "$MESSAGE") --non-interactive"
@@ -153,7 +175,7 @@ runs:
           echo "workspace-id=$WORKSPACE" >> "$GITHUB_OUTPUT"
 
         else
-          echo "::error::Either 'workflow-file' or 'message' input is required"
+          echo "::error::Either 'workflow-template' or 'message' input is required"
           exit 1
         fi
 

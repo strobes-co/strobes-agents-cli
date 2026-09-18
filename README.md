@@ -407,120 +407,60 @@ once idle.
 
 ## Workflows (`strobes workflow`)
 
-Workflows let you define multi-agent security tasks in a YAML file and execute
-them offline — the CLI creates a dedicated workspace, spins up threads, and runs
-everything in a live terminal TUI with a task tree and streamed output.
-
-```
-┌─ Bug Bounty Recon ──── ws:a1b2c3d4 ── 2m 14s ─────────────────────────────┐
-│  PHASES & TASKS              │  LIVE OUTPUT                                 │
-│  ◆ Reconnaissance            │                                              │
-│    ✓ scope-definition  12s   │  ▶ execute_command(subfinder -d example.com) │
-│    ⟳ subdomain-enum   1m20s  │  ◀ execute_command: found 47 subdomains      │
-│    ○ port-scan waiting       │                                              │
-│    ○ tech-fingerprint        │  Scanning for open ports on the discovered   │
-│  ○ Phase 2  Exploitation     │  subdomains. This may take a few minutes...  │
-│  ○ Phase 3  Reporting        │                                              │
-│  ↑↓ select · Enter: chat · Tab: log · PgUp: scroll · q: quit               │
-└────────────────────────────────────────────────────────────────────────────┘
-```
-
-### Quick start
+Workflows are multi-phase, multi-agent security playbooks that run **entirely on
+the Strobes cloud**. The CLI does not orchestrate anything locally — it attaches
+a workflow *template* to a workspace, tells the cloud to run it, then acts as a
+live client: a TUI that streams every running task's output in real time and
+lets you pause / resume / restart / cancel the run.
 
 ```bash
-strobes workflow init --output myflow.yaml
-strobes workflow run myflow.yaml
+# See the templates your org has (built-in + custom:)
+strobes workflow templates
 
-# Use a bundled security template
-strobes workflow run workflows/bugbounty-recon.yaml \
-  -v TARGET=example.com \
-  -v PROGRAM="Example Bug Bounty"
+# Attach a template to a workspace, start it in the cloud, and open the
+# live streaming TUI. Prompts for the workspace and any required variables.
+strobes workflow attach --template web-pentest -v TARGET=https://example.com
 
-# Headless (no TUI) — for CI
-strobes workflow run myflow.yaml --no-tui -v TARGET=example.com
+# Start it in CI without a TUI (fire-and-forget; poll status separately)
+strobes workflow attach --template web-pentest -v TARGET=https://example.com --no-watch
+
+# Re-open the live TUI for a workspace whose workflow is already running
+strobes workflow watch --workspace <workspace-id>
+
+# One-shot text status (scriptable)
+strobes workflow status --workspace <workspace-id>
 ```
 
-### Workflow YAML format
+### The live TUI
 
-```yaml
-name: "Web App Pentest"
-description: "Automated security assessment"
+`attach` (without `--no-watch`) and `watch` open the same view:
 
-variables:
-  TARGET: "https://example.com"
-  CREDENTIALS: ""
-
-phases:
-  - name: "Reconnaissance"
-    tasks:
-      - name: port-scan
-        prompt: |
-          Scan ${TARGET} for open ports and services.
-
-      - name: tech-stack
-        prompt: |
-          Identify the technology stack of ${TARGET}.
-
-  - name: "Testing"
-    tasks:
-      - name: vuln-scan
-        depends_on: [port-scan, tech-stack]
-        prompt: |
-          Run a vulnerability scan on ${TARGET} using the recon results.
-
-      - name: auth-test
-        depends_on: [port-scan, tech-stack]
-        prompt: |
-          Test the authentication endpoints of ${TARGET}.
-
-  - name: "Report"
-    tasks:
-      - name: final-report
-        depends_on: [vuln-scan, auth-test]
-        prompt: |
-          Produce a final pentest report for ${TARGET}.
-```
-
-**DAG scheduling:** tasks without `depends_on` start immediately in parallel.
-Tasks with `depends_on` block until all named tasks complete. A failed
-dependency causes its dependents to be skipped.
+- **left** — the phase / task tree, updated from a 2s status poll
+- **right** — details for the selected item, and for a *running* task the agent's
+  live token / tool-call output, streamed over a pulse WebSocket to that task's
+  thread (marked `● live`)
+- **keys** — `↑↓` navigate · `Enter` open the task thread as a full chat ·
+  `p` pause · `r` resume · `s` restart · `d` detach · `q` quit
 
 ### Workflow commands
 
-| Command | Description |
-|---------|-------------|
-| `strobes workflow run <file> [-v KEY=VAL…] [--no-tui]` | Execute a workflow |
-| `strobes workflow validate <file>` | Parse and validate without running |
-| `strobes workflow list` | Find `.yaml` files with `phases:` in current dir |
-| `strobes workflow init [--output file.yaml]` | Write a starter template |
-| `strobes workflow history` | List past runs with status and progress |
-| `strobes workflow resume <run-id>` | Continue an interrupted run |
+| Command | What it does |
+|---------|--------------|
+| `strobes workflow templates` | List available templates (built-in and `custom:`) |
+| `strobes workflow attach [--workspace W] [--template SLUG] [-v K=V…] [--no-watch]` | Attach a template, start it in the cloud, open the live TUI |
+| `strobes workflow watch [--workspace W]` | Open the live streaming TUI for a running workflow |
+| `strobes workflow status [--workspace W]` | Print the current workflow status |
+| `strobes workflow pause \| resume \| cancel [--workspace W]` | Control a running workflow |
+| `strobes workflow restart [--workspace W] [--from-phase KEY]` | Restart from the start or a phase |
+| `strobes workflow advance [--workspace W]` | Advance past a manual-gate phase |
+| `strobes workflow detach [--workspace W] [-y]` | Cancel + remove the workflow from a workspace |
+| `strobes workflow save --workspace W --name NAME` | Save the running workflow as a reusable `custom:` template |
+| `strobes workflow delete-template <custom:slug>` | Delete a custom template |
 
-### History and resume
+Templates (their phases, tasks and required variables) are authored and stored
+on the server, so a workflow behaves identically no matter which machine drives
+it — there are no local YAML files to keep in sync.
 
-```bash
-strobes workflow history
-# RUN ID                                  WORKFLOW                    STATUS      DONE
-# ─────────────────────────────────────────────────────────────────────────────────────
-# 20260624-143021-bug-bounty-recon        Bug Bounty Recon            partial     3/9
-# 20260624-120015-webapp-pentest          WebApp Pentest              completed   8/8
-
-strobes workflow resume 20260624-143021-bug-bounty-recon
-```
-
-The resumed run reuses the same workspace and skips already-completed tasks
-(shown as `↷` in the TUI). Run records are stored in
-`~/.config/strobes-ai/workflow-runs/`.
-
-### Bundled templates
-
-| Template | Phases | Tasks | Variables |
-|----------|--------|-------|-----------|
-| `workflows/bugbounty-recon.yaml` | 4 | 9 | `TARGET`, `PROGRAM`, `SCOPE`, `OUT_OF_SCOPE`, `DEPTH` |
-| `workflows/webapp-pentest.yaml` | 3 | 8 | `TARGET`, `AUTH_URL`, `CREDENTIALS`, `SEVERITY_THRESHOLD` |
-| `workflows/full-bugbounty-hunt.yaml` | 5 | 11 | `TARGET`, `PROGRAM`, `PLATFORM`, `TEST_ACCOUNT`, `SECOND_ACCOUNT` |
-
----
 
 ## How it maps to the backend
 
@@ -530,8 +470,8 @@ The resumed run reuses the same workspace and skips already-completed tasks
 | `chat` stream | `PulseConsumer` (`ws/<org>/pulse/<thread>/`) |
 | local tools (shell / code / browser) | `LocalProxyTool` + `tool.local_execute` events |
 | workspaces · threads · history · files · findings · approvals · slash-commands | `cli_views` REST (MasterKey) |
-| workflow workspace | `create_workspace` → shared workspace for all workflow threads |
-| workflow threads | `create_thread` per task, one pulse connection each |
+| workflow templates + control | `cli_views` workflow REST → `WorkflowEngine` (server-side execution) |
+| live task output | one pulse connection per *running* task thread (`ws/<org>/pulse/<thread>/`) |
 
 ## Project layout
 
@@ -546,22 +486,13 @@ src/
   markdown.rs       Markdown → ratatui Line renderer (headings, tables, code blocks)
   picker.rs         full-screen list selector widget
   app.rs            Ratatui chat app: transcript, overlays, slash popup, input, status
-
-  workflow.rs       YAML schema + parser + variable interpolation + validator
-  workflow_runner.rs DAG executor: parallel task dispatch, pulse connection per task,
-                    run-record persistence (save on each task completion)
-  workflow_state.rs RunRecord JSON persistence (~/.config/strobes-ai/workflow-runs/)
-  workflow_tui.rs   Ratatui workflow TUI: task tree + markdown output pane + chat drill-down
+  remote_wf_tui.rs  Live cloud-workflow TUI: phase/task tree + per-task pulse
+                    streaming (● live) + pause/resume/restart/detach controls
 
 assets/
   banner.svg        README header banner (hex logo + feature badges)
   ws-arch.svg       WebSocket architecture diagram
   ci-pipeline.svg   CI scanning pipeline diagram
-
-workflows/
-  bugbounty-recon.yaml       Subdomain enum, port scan, tech fingerprint, dork search
-  webapp-pentest.yaml        Auth, injection, access control, XSS, SSRF, file upload
-  full-bugbounty-hunt.yaml   End-to-end hunt: recon → exploit → PoC → report
 ```
 
 ## Development
@@ -570,7 +501,7 @@ workflows/
 cargo test                      # unit tests
 cargo run -- chat
 cargo run -- ci sca .           # SCA scan of this repo
-cargo run -- workflow run workflows/bugbounty-recon.yaml --no-tui -v TARGET=example.com -v PROGRAM=test
+cargo run -- workflow templates       # list cloud workflow templates
 ```
 
 ## License
