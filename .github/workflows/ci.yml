@@ -18,7 +18,11 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install Linux build deps
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
+        # bubblewrap + netcat-openbsd are for the egress-sandbox test suite
+        # (src/sandbox.rs, src/procsandbox.rs) — bwrap is the actual Linux
+        # sandbox backend under test, nc is used as the "proxy-blind tool"
+        # in nc_gets_no_network_under_the_sandbox.
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config bubblewrap netcat-openbsd
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release
