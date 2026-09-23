@@ -335,8 +335,8 @@ impl App {
             };
             let spin = ["◐", "◓", "◑", "◒"][(self.spinner / 2) as usize % 4];
             let has_task = matches!(self.tree.get(self.list_state.selected().unwrap_or(0)), Some(TreeRow::Task { .. }));
-            let enter_hint = if has_task { "  Enter: open chat  |" } else { "" };
-            format!("  ↑↓ navigate{enter_hint}  {wf_controls}  [d] detach  [q] quit  |  {spin} 2s")
+            let enter_hint = if has_task { "  →/Enter: open chat  |" } else { "" };
+            format!("  ↑↓ navigate{enter_hint}  {wf_controls}  [d] detach  ←/q back  |  {spin} 2s")
         };
         f.render_widget(
             Paragraph::new(text).style(Style::default().fg(Color::DarkGray)),
@@ -381,9 +381,15 @@ fn trunc_str(s: &str, max: usize) -> String {
 
 // ── Polling ───────────────────────────────────────────────────────────────────
 
-async fn refresh(client: &ApiClient, workspace_id: &str, app: &mut App) {
+async fn refresh(client: &ApiClient, workspace_id: &str, workspace_name: &str, app: &mut App) {
     match client.workspace_workflow(workspace_id).await {
         Ok(s) => {
+            // Keep the CLI's own local record current while watching live —
+            // this is what lets a completed/failed run stay viewable later,
+            // even after the backend deletes it once a new one is attached.
+            if let Some(state) = &s {
+                crate::remote_history::record(workspace_id, workspace_name, state);
+            }
             app.state = s;
             app.error = None;
         }
@@ -405,30 +411,34 @@ async fn refresh(client: &ApiClient, workspace_id: &str, app: &mut App) {
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
+/// Returns `Ok(true)` if the user backed out (q/Esc/←) — the caller may
+/// return to a previous screen (e.g. the workflow list) — or `Ok(false)` if
+/// they quit outright (^C, or the terminal event stream ended).
 pub async fn run(
     terminal: &mut ratatui::DefaultTerminal,
     client: &ApiClient,
     workspace_id: String,
+    workspace_name: String,
     profile: Profile,
     tenant: String,
-) -> Result<()> {
+) -> Result<bool> {
     let mut app = App::new(workspace_id.clone());
 
     // Initial load before the event loop.
-    refresh(client, &workspace_id, &mut app).await;
+    refresh(client, &workspace_id, &workspace_name, &mut app).await;
 
     let mut events = EventStream::new();
     let mut poll_ticker = tokio::time::interval(std::time::Duration::from_secs(2));
     poll_ticker.tick().await; // skip the immediate first tick
     let mut draw_ticker = tokio::time::interval(std::time::Duration::from_millis(150));
 
-    loop {
+    let go_back = loop {
         terminal.draw(|f| app.draw(f))?;
 
         tokio::select! {
             maybe = events.next() => {
                 let Some(Ok(Event::Key(k))) = maybe else {
-                    if maybe.is_none() { break; }
+                    if maybe.is_none() { break false; }
                     continue;
                 };
                 if k.kind != KeyEventKind::Press { continue; }
@@ -448,11 +458,13 @@ pub async fn run(
                 }
 
                 match k.code {
-                    KeyCode::Char('q') | KeyCode::Esc => break,
-                    KeyCode::Char('c') if ctrl => break,
+                    // q/Esc/← step back to the workflow list; ^C quits outright.
+                    KeyCode::Char('q') | KeyCode::Esc | KeyCode::Left => break true,
+                    KeyCode::Char('c') if ctrl => break false,
                     KeyCode::Up => app.move_cursor(true),
                     KeyCode::Down => app.move_cursor(false),
-                    KeyCode::Enter => {
+                    // → mirrors Enter: drill forward into the selected task's chat.
+                    KeyCode::Enter | KeyCode::Right => {
                         if let Some(tid) = app.selected_thread_id() {
                             let _ = crate::run_chat(terminal, &tenant, profile.clone(), tid, None, None, None).await;
                             terminal.clear()?;
@@ -464,7 +476,7 @@ pub async fn run(
                             Ok(()) => app.feedback = Some("paused".to_string()),
                             Err(e) => app.error = Some(e.to_string()),
                         }
-                        refresh(client, &workspace_id, &mut app).await;
+                        refresh(client, &workspace_id, &workspace_name, &mut app).await;
                     }
                     KeyCode::Char('r') => {
                         app.feedback = None; app.error = None;
@@ -472,7 +484,7 @@ pub async fn run(
                             Ok(()) => app.feedback = Some("resumed".to_string()),
                             Err(e) => app.error = Some(e.to_string()),
                         }
-                        refresh(client, &workspace_id, &mut app).await;
+                        refresh(client, &workspace_id, &workspace_name, &mut app).await;
                     }
                     KeyCode::Char('s') => {
                         app.feedback = None; app.error = None;
@@ -480,20 +492,20 @@ pub async fn run(
                             Ok(()) => app.feedback = Some("restarted".to_string()),
                             Err(e) => app.error = Some(e.to_string()),
                         }
-                        refresh(client, &workspace_id, &mut app).await;
+                        refresh(client, &workspace_id, &workspace_name, &mut app).await;
                     }
                     KeyCode::Char('d') => app.confirm_detach = true,
                     _ => {}
                 }
             }
             _ = poll_ticker.tick() => {
-                refresh(client, &workspace_id, &mut app).await;
+                refresh(client, &workspace_id, &workspace_name, &mut app).await;
             }
             _ = draw_ticker.tick() => {
                 app.spinner = app.spinner.wrapping_add(1);
             }
         }
-    }
+    };
 
-    Ok(())
+    Ok(go_back)
 }

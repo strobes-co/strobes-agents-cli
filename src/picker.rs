@@ -12,6 +12,43 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
 };
 
+/// Run `fut` (typically a list-fetching network call) while animating a
+/// spinner overlay on `terminal` — same banner as the pickers, so a slow
+/// fetch shows feedback in place instead of leaving the raw terminal (or a
+/// blank alternate screen) visible with no indication anything is happening.
+/// The caller owns init/restore of `terminal`, so this composes with an
+/// immediately-following `select_with`/`select_with_mask` on the same screen.
+pub async fn with_loading<T>(
+    terminal: &mut ratatui::DefaultTerminal,
+    label: &str,
+    fut: impl std::future::Future<Output = T>,
+) -> T {
+    tokio::pin!(fut);
+    const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    let mut i = 0usize;
+    let mut ticker = tokio::time::interval(std::time::Duration::from_millis(90));
+    loop {
+        tokio::select! {
+            biased;
+            res = &mut fut => return res,
+            _ = ticker.tick() => {
+                let spin = FRAMES[i % FRAMES.len()];
+                let _ = terminal.draw(|f| {
+                    let area = f.area();
+                    let mut lines = banner_lines("");
+                    lines.push(Line::default());
+                    lines.push(Line::from(Span::styled(
+                        format!("   {spin} {label}"),
+                        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    )));
+                    f.render_widget(Paragraph::new(lines), area);
+                });
+                i += 1;
+            }
+        }
+    }
+}
+
 /// Outcome of a picker interaction.
 pub enum Nav {
     /// The user selected the row at this index.
@@ -43,14 +80,31 @@ pub async fn select_with(
     items: &[String],
     auth: &str,
 ) -> Result<Nav> {
+    select_with_mask(terminal, title, items, None, auth).await
+}
+
+/// Like `select_with`, but rows where `selectable[i] == false` render as
+/// plain (non-highlightable) group headers — skipped by ↑/↓, Enter, and Tab.
+/// `selectable: None` means every row is selectable (same as `select_with`).
+pub async fn select_with_mask(
+    terminal: &mut ratatui::DefaultTerminal,
+    title: &str,
+    items: &[String],
+    selectable: Option<&[bool]>,
+    auth: &str,
+) -> Result<Nav> {
     if items.is_empty() {
         return Ok(Nav::Back);
     }
+    let is_selectable = |i: usize| selectable.map(|m| m[i]).unwrap_or(true);
     let mut events = EventStream::new();
     let mut state = ListState::default();
-    state.select(Some(0));
     // Type-to-search filter over item labels (case-insensitive substring).
     let mut filter = String::new();
+
+    // Land the initial cursor on the first selectable row.
+    let first_sel = (0..items.len()).find(|&i| is_selectable(i)).unwrap_or(0);
+    state.select(Some(first_sel));
 
     let result = loop {
         // Indices of items matching the current filter.
@@ -63,6 +117,10 @@ pub async fn select_with(
             .collect();
         let sel = state.selected().unwrap_or(0).min(visible.len().saturating_sub(1));
         state.select(Some(sel));
+        // A filter change may have landed the cursor on a header row — nudge off it.
+        if visible.get(sel).is_some_and(|&orig| !is_selectable(orig)) {
+            move_sel_mask(&mut state, &visible, &is_selectable, 1);
+        }
 
         terminal.draw(|f| {
             let chunks = Layout::vertical([Constraint::Min(1), Constraint::Length(1)])
@@ -83,8 +141,19 @@ pub async fn select_with(
                     Rect { x: body.x, y: body.y, width: body.width, height: top_h },
                 );
             }
-            let list_items: Vec<ListItem> =
-                visible.iter().map(|&i| ListItem::new(Line::from(items[i].clone()))).collect();
+            let list_items: Vec<ListItem> = visible
+                .iter()
+                .map(|&i| {
+                    if is_selectable(i) {
+                        ListItem::new(Line::from(items[i].clone()))
+                    } else {
+                        ListItem::new(Line::from(Span::styled(
+                            items[i].clone(),
+                            Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
+                        )))
+                    }
+                })
+                .collect();
             let search = if filter.is_empty() {
                 String::new()
             } else {
@@ -106,7 +175,7 @@ pub async fn select_with(
                 .highlight_symbol("➤ ");
             f.render_stateful_widget(list, list_area, &mut state);
             f.render_widget(
-                Paragraph::new(" type to search · ↑/↓ move · Enter select · Tab shortcut · Esc back · ^C quit")
+                Paragraph::new(" type to search · ↑/↓ move · →/Enter select · ←/Esc back · Tab shortcut · ^C quit")
                     .style(Style::default().fg(Color::DarkGray)),
                 chunks[1],
             );
@@ -117,19 +186,28 @@ pub async fn select_with(
                 let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
                 match k.code {
                     KeyCode::Char('c') if ctrl => break Nav::Quit,
-                    KeyCode::Up => move_sel(&mut state, visible.len(), -1),
-                    KeyCode::Down => move_sel(&mut state, visible.len(), 1),
-                    KeyCode::Enter => {
+                    KeyCode::Up => move_sel_mask(&mut state, &visible, &is_selectable, -1),
+                    KeyCode::Down => move_sel_mask(&mut state, &visible, &is_selectable, 1),
+                    // Right = "forward" (same as Enter): drill into the selected
+                    // row. Left = "back" (same as Esc): step back a screen.
+                    // Only active when there's no in-progress search filter, so
+                    // they don't fight with a query the user might want to edit
+                    // with the arrow keys later — plain ↑/↓/Enter/Esc still work.
+                    KeyCode::Enter | KeyCode::Right => {
                         if let Some(&orig) = visible.get(state.selected().unwrap_or(0)) {
-                            break Nav::Item(orig);
+                            if is_selectable(orig) {
+                                break Nav::Item(orig);
+                            }
                         }
                     }
                     KeyCode::Tab => {
                         if let Some(&orig) = visible.get(state.selected().unwrap_or(0)) {
-                            break Nav::Shortcut(orig);
+                            if is_selectable(orig) {
+                                break Nav::Shortcut(orig);
+                            }
                         }
                     }
-                    KeyCode::Esc => break Nav::Back,
+                    KeyCode::Esc | KeyCode::Left => break Nav::Back,
                     KeyCode::Backspace => {
                         filter.pop();
                         state.select(Some(0));
@@ -142,8 +220,8 @@ pub async fn select_with(
                 }
             }
             Some(Ok(Event::Mouse(m))) => match m.kind {
-                MouseEventKind::ScrollUp => move_sel(&mut state, visible.len(), -1),
-                MouseEventKind::ScrollDown => move_sel(&mut state, visible.len(), 1),
+                MouseEventKind::ScrollUp => move_sel_mask(&mut state, &visible, &is_selectable, -1),
+                MouseEventKind::ScrollDown => move_sel_mask(&mut state, &visible, &is_selectable, 1),
                 _ => {}
             },
             Some(Err(_)) | None => break Nav::Quit,
@@ -230,8 +308,25 @@ pub async fn prompt_text(
     Ok(result)
 }
 
-fn move_sel(state: &mut ListState, len: usize, delta: i32) {
-    let cur = state.selected().unwrap_or(0) as i32;
-    let next = (cur + delta).rem_euclid(len as i32) as usize;
-    state.select(Some(next));
+/// Move the cursor by `delta` positions within `visible` (a list of original
+/// indices), wrapping around, and skipping any row `is_selectable` rejects
+/// (group headers). `state`'s selection is an index into `visible`.
+fn move_sel_mask(
+    state: &mut ListState,
+    visible: &[usize],
+    is_selectable: &impl Fn(usize) -> bool,
+    delta: i32,
+) {
+    let len = visible.len();
+    if len == 0 {
+        return;
+    }
+    let mut cur = state.selected().unwrap_or(0) as i32;
+    for _ in 0..len {
+        cur = (cur + delta).rem_euclid(len as i32);
+        if is_selectable(visible[cur as usize]) {
+            state.select(Some(cur as usize));
+            return;
+        }
+    }
 }
