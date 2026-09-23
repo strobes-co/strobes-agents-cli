@@ -766,6 +766,27 @@ struct CicdCommon {
     /// Abort the AI-triage step after this many seconds (default: 600).
     #[arg(long, default_value = "600", value_name = "SECS")]
     ai_timeout: u64,
+    /// Don't submit findings to the platform (submission is on by default
+    /// for sast/sca — this is a purely local run, same as before this flag
+    /// existed).
+    #[arg(long)]
+    no_submit: bool,
+    /// Override/supply the asset identity used when submitting findings —
+    /// a repo URL for sast/sca (auto-detected from `git remote get-url
+    /// origin` in the scanned dir when omitted) or an image reference for
+    /// container (defaults to the scanned `--image` itself). If neither an
+    /// explicit value nor auto-detection works, submission is skipped with
+    /// a warning rather than failing the scan.
+    #[arg(long, value_name = "REF")]
+    asset_ref: Option<String>,
+    /// Fail the whole command (non-zero exit) if the platform doesn't
+    /// verifiably ingest the submitted findings (default: warn only).
+    #[arg(long)]
+    strict_ingest: bool,
+    /// How long to wait for the platform to finish ingesting submitted
+    /// findings before giving up (default: 90s).
+    #[arg(long, default_value = "90", value_name = "SECS")]
+    verify_timeout: u64,
 }
 
 /// `strobes cicd <type>` — run Strobes' own containerized scanners directly
@@ -2345,6 +2366,8 @@ struct AnalyzerBug {
     container: Option<serde_json::Value>,
     #[serde(default)]
     sast: Option<serde_json::Value>,
+    #[serde(default)]
+    package: Option<serde_json::Value>,
 }
 
 #[derive(serde::Deserialize, serde::Serialize, Debug, Clone, Default)]
@@ -2357,6 +2380,445 @@ struct AnalyzerScanResult {
     scan_meta: AnalyzerScanMeta,
     #[serde(rename = "bugsList", default)]
     bugs: Vec<AnalyzerBug>,
+}
+
+// ── `strobes cicd` — submitting findings to the platform ────────────────────
+//
+// POST /api/v1/webhook/ shape, reverse-engineered and empirically verified
+// (real payload, real ScanLog poll, real non-zero bugs/assets) against a live
+// backend this session — see api::ApiClient::submit_webhook_finding/
+// wait_for_scan_log. Several of these fields silently break ingestion if
+// gotten wrong (the finding vanishes or is orphaned with a 200 response and
+// no error), so this function exists specifically to get them right exactly
+// once rather than at every call site.
+
+/// The real backend connector slug for `scan_type`'s webhook submissions.
+/// An unmatched `analyzer` field is accepted by the webhook and silently
+/// dropped — no error, no ingestion — so this must never guess. Confirmed
+/// directly against `strobes/connectors/enums.py` on a live backend:
+/// `STROBES_SAST = "strobes_sast"`, `STROBES_SCA = "strobes_sca"`,
+/// `STROBES_CONTAINER_SECURITY = "strobes_container_security"`,
+/// `STROBES_DAST = "strobes_dast"`.
+///
+/// IaC deliberately reuses the `sast` slug rather than inventing one: the
+/// connector registry has no dedicated IaC connector at all, and the
+/// webhook silently drops anything that doesn't match a real one — so this
+/// is the only real option today, not a guess dressed up as one.
+fn webhook_analyzer_slug(scan_type: analyzer_registry::ScanType) -> &'static str {
+    match scan_type {
+        analyzer_registry::ScanType::Sast | analyzer_registry::ScanType::Iac => "strobes_sast",
+        analyzer_registry::ScanType::Sca => "strobes_sca",
+        analyzer_registry::ScanType::Container => "strobes_container_security",
+        analyzer_registry::ScanType::Dast => "strobes_dast",
+    }
+}
+
+/// The webhook asset `type` string for `scan_type` — must be the exact
+/// protobuf enum NAME (confirmed directly against the running backend's
+/// compiled protobuf, not guessed): `CODE_REPO` for sast/sca/iac,
+/// `CONTAINER_IMAGE` for container, `WEB` for dast.
+///
+/// `WEB` is not a typo for `WEBSITE`: both are real, DIFFERENT asset types
+/// (`Asset.web = 1`, `Asset.website = 5` in the backend's own model) that
+/// look interchangeable for "a URL" but are not — verified live, `WEBSITE`
+/// silently orphans the finding (parses the bug, drops the asset: `bugs=1,
+/// assets=0`) because the normalizer's name/target-from-url special case
+/// only matches `web`, not `website`. An unmapped/wrong type here silently
+/// orphans the finding rather than erroring, exactly like that.
+fn webhook_asset_type(scan_type: analyzer_registry::ScanType) -> &'static str {
+    match scan_type {
+        analyzer_registry::ScanType::Sast | analyzer_registry::ScanType::Sca | analyzer_registry::ScanType::Iac => "CODE_REPO",
+        analyzer_registry::ScanType::Container => "CONTAINER_IMAGE",
+        analyzer_registry::ScanType::Dast => "WEB",
+    }
+}
+
+/// A bare CWE number as the webhook expects (`"798"`), stripping any
+/// `"CWE-"` prefix an analyzer's own output may already have added —
+/// verified this session: the webhook accepts the prefixed form silently
+/// without erroring, but it doesn't map to a real CWE record either.
+fn strip_cwe_prefix(raw: &str) -> String {
+    raw.strip_prefix("CWE-")
+        .or_else(|| raw.strip_prefix("cwe-"))
+        .unwrap_or(raw)
+        .to_string()
+}
+
+/// Force `startLineNo`/`endLineNo` to JSON strings if present — the webhook's
+/// SAST parser expects strings (protobuf field), but an analyzer's own JSON
+/// output isn't guaranteed to have emitted them that way.
+fn coerce_sast_line_numbers(sast: &serde_json::Value) -> serde_json::Value {
+    let mut sast = sast.clone();
+    if let Some(obj) = sast.as_object_mut() {
+        for key in ["startLineNo", "endLineNo"] {
+            if let Some(v) = obj.get(key) {
+                if !v.is_string() {
+                    let as_str = match v {
+                        serde_json::Value::Number(n) => n.to_string(),
+                        other => other.to_string(),
+                    };
+                    obj.insert(key.to_string(), serde_json::Value::String(as_str));
+                }
+            }
+        }
+    }
+    sast
+}
+
+/// Whitelist + coerce a `container` bug sub-object to exactly the fields the
+/// backend's protobuf `Container` message accepts. This one is unforgiving
+/// in a way `sast` isn't: an unrecognized field anywhere in the payload
+/// makes protobuf JSON parsing reject the WHOLE finding (both the bug and
+/// its asset — not just this field), confirmed live against a real backend
+/// (`affectedVersions`/`commit`, which normalizer_util.py's Python-side code
+/// references, aren't real fields on this protobuf message and silently
+/// killed an otherwise-valid submission). The real, confirmed field set is
+/// `packageName`/`installedVersion`/`fixedVersion`/`cpe`/`digest` — and
+/// `cpe` specifically must be a repeated (array) field, not a bare string.
+fn coerce_container_fields(container: &serde_json::Value) -> serde_json::Value {
+    let mut out = serde_json::Map::new();
+    for key in ["packageName", "installedVersion", "fixedVersion", "digest"] {
+        if let Some(v) = container.get(key) {
+            out.insert(key.to_string(), v.clone());
+        }
+    }
+    if let Some(v) = container.get("cpe") {
+        let arr = match v {
+            serde_json::Value::Array(_) => v.clone(),
+            serde_json::Value::String(_) => serde_json::Value::Array(vec![v.clone()]),
+            _ => serde_json::Value::Array(vec![]),
+        };
+        out.insert("cpe".to_string(), arr);
+    }
+    serde_json::Value::Object(out)
+}
+
+/// Whitelist + coerce a `package` bug sub-object (SCA findings) to fields
+/// confirmed against the backend's protobuf `Package` message. Unlike
+/// `container`, every field here IS a real field on that message (checked
+/// live) — this still whitelists rather than passing the analyzer's raw
+/// object through untouched, since an unrecognized field anywhere in the
+/// payload drops the WHOLE finding, and the analyzer's own JSON isn't a
+/// contract we control. `branch`/`cpe` are repeated (array) fields on the
+/// protobuf side; coerce a bare string into a one-element array the same
+/// way `coerce_container_fields` does for `cpe`.
+fn coerce_package_fields(package: &serde_json::Value) -> serde_json::Value {
+    let mut out = serde_json::Map::new();
+    for key in [
+        "packageName",
+        "installedVersion",
+        "fixedVersion",
+        "affectedVersions",
+        "commit",
+        "fileName",
+        "ecosystem",
+        "purl",
+    ] {
+        if let Some(v) = package.get(key) {
+            out.insert(key.to_string(), v.clone());
+        }
+    }
+    for key in ["branch", "cpe", "releases"] {
+        if let Some(v) = package.get(key) {
+            let arr = match v {
+                serde_json::Value::Array(_) => v.clone(),
+                serde_json::Value::Null => serde_json::Value::Array(vec![]),
+                other => serde_json::Value::Array(vec![other.clone()]),
+            };
+            out.insert(key.to_string(), arr);
+        }
+    }
+    serde_json::Value::Object(out)
+}
+
+/// Build the full `POST /api/v1/webhook/` body for `scan_type` — see
+/// `webhook_analyzer_slug`/`webhook_asset_type` for the per-type
+/// connector slug and asset type this derives internally.
+///
+/// `asset_ref` must be the asset's real identity — a git remote URL for
+/// sast/sca/iac, an image reference for container, the target URL for
+/// dast — never the local scan directory. The webhook identifies/attaches
+/// the asset by `assetRef`, which MUST equal `name` (both `asset_ref`) or
+/// the finding can't attach to anything.
+fn build_webhook_payload(
+    scan: &AnalyzerScanResult,
+    asset_ref: &str,
+    tenant_host: &str,
+    scan_type: analyzer_registry::ScanType,
+) -> serde_json::Value {
+    let analyzer_slug = webhook_analyzer_slug(scan_type);
+    let asset_type = webhook_asset_type(scan_type);
+    let asset = serde_json::json!({
+        "name": asset_ref,
+        "assetRef": asset_ref,
+        "url": "",
+        "type": asset_type,
+        "hostname": "",
+        "ipaddress": "",
+        "state": "DOWN",
+        "exposure": "PUBLIC",
+        "tags": [],
+    });
+
+    let bugs_list: Vec<serde_json::Value> = scan
+        .bugs
+        .iter()
+        .map(|b| {
+            let cwe: Vec<String> = b
+                .cwe
+                .as_deref()
+                .unwrap_or(&[])
+                .iter()
+                .map(|s| strip_cwe_prefix(s))
+                .collect();
+            let mut bug = serde_json::json!({
+                "title": b.title,
+                "description": b.description,
+                "mitigation": "",
+                "severity": b.severity,
+                "CVSS": b.cvss,
+                "CWE": cwe,
+                "CVE": b.cve.clone().unwrap_or_default(),
+                "tags": ["strobes-cicd"],
+                "asset": asset.clone(),
+            });
+            if let Some(sast) = &b.sast {
+                bug["sast"] = coerce_sast_line_numbers(sast);
+            }
+            if let Some(container) = &b.container {
+                bug["container"] = coerce_container_fields(container);
+            }
+            if let Some(package) = &b.package {
+                bug["package"] = coerce_package_fields(package);
+            }
+            // Every DAST bug needs a `dast` sub-object — its mere presence
+            // is what makes the backend's normalizer assign `bug_level =
+            // Bug.web` (normalizer_util.py, end of the `elif "dast" in
+            // bug_item"` branch). Without it, bug_level stays unset, which
+            // makes `get_asset_id()` skip asset-matching entirely and the
+            // bug gets silently dropped a few lines later on `if not
+            // raw_bug_item["asset_id"]: continue` — no error anywhere,
+            // confirmed live (ScanLog had a real new asset row but an empty
+            // `bugSet` despite the raw `bugs` JSON showing findings). ZAP's
+            // own JSON output has no reliable per-finding endpoint, so `uri`
+            // falls back to the scanned target itself.
+            if matches!(scan_type, analyzer_registry::ScanType::Dast) {
+                bug["dast"] = serde_json::json!({ "uri": [asset_ref] });
+            }
+            bug
+        })
+        .collect();
+
+    serde_json::json!({
+        "bugsList": bugs_list,
+        "analyzer": analyzer_slug,
+        "parser": "NOPARSER",
+        "success": true,
+        "function": "NOFUNCTION",
+        "extraInfo": { "tags": [] },
+        "prsCreated": [],
+        "url": tenant_host,
+    })
+}
+
+#[cfg(test)]
+mod webhook_payload_tests {
+    use super::*;
+
+    fn sample_bug(cwe: Vec<&str>, sast: Option<serde_json::Value>) -> AnalyzerBug {
+        AnalyzerBug {
+            title: "Hardcoded secret".into(),
+            description: "desc".into(),
+            severity: 3,
+            cvss: Some(4.1),
+            cve: None,
+            cwe: Some(cwe.into_iter().map(String::from).collect()),
+            container: None,
+            sast,
+            package: None,
+        }
+    }
+
+    #[test]
+    fn asset_is_code_repo_with_matching_name_and_ref() {
+        let scan = AnalyzerScanResult { success: true, analyzer: "strobessastanalyzer".into(), scan_meta: Default::default(), bugs: vec![sample_bug(vec!["798"], None)] };
+        let payload = build_webhook_payload(&scan, "https://github.com/acme/repo", "tenant.strobes.co", analyzer_registry::ScanType::Sast);
+        let asset = &payload["bugsList"][0]["asset"];
+        assert_eq!(asset["type"], "CODE_REPO");
+        assert_eq!(asset["name"], "https://github.com/acme/repo");
+        assert_eq!(asset["assetRef"], "https://github.com/acme/repo");
+        assert_eq!(asset["name"], asset["assetRef"]);
+        assert_eq!(payload["analyzer"], "strobes_sast");
+    }
+
+    #[test]
+    fn cwe_prefix_is_stripped() {
+        let scan = AnalyzerScanResult { success: true, analyzer: "x".into(), scan_meta: Default::default(), bugs: vec![sample_bug(vec!["CWE-798", "cwe-89", "22"], None)] };
+        let payload = build_webhook_payload(&scan, "https://github.com/acme/repo", "t", analyzer_registry::ScanType::Sast);
+        let cwe = payload["bugsList"][0]["CWE"].as_array().unwrap();
+        assert_eq!(cwe, &[serde_json::json!("798"), serde_json::json!("89"), serde_json::json!("22")]);
+    }
+
+    #[test]
+    fn sast_line_numbers_are_coerced_to_strings() {
+        let sast = serde_json::json!({"fileName": "a.py", "startLineNo": 42, "endLineNo": 42});
+        let scan = AnalyzerScanResult { success: true, analyzer: "x".into(), scan_meta: Default::default(), bugs: vec![sample_bug(vec![], Some(sast))] };
+        let payload = build_webhook_payload(&scan, "https://github.com/acme/repo", "t", analyzer_registry::ScanType::Sast);
+        let sast_out = &payload["bugsList"][0]["sast"];
+        assert_eq!(sast_out["startLineNo"], serde_json::json!("42"));
+        assert_eq!(sast_out["endLineNo"], serde_json::json!("42"));
+        assert!(sast_out["startLineNo"].is_string());
+    }
+
+    #[test]
+    fn already_string_line_numbers_are_left_alone() {
+        let sast = serde_json::json!({"startLineNo": "42", "endLineNo": "42"});
+        let scan = AnalyzerScanResult { success: true, analyzer: "x".into(), scan_meta: Default::default(), bugs: vec![sample_bug(vec![], Some(sast))] };
+        let payload = build_webhook_payload(&scan, "https://github.com/acme/repo", "t", analyzer_registry::ScanType::Sast);
+        assert_eq!(payload["bugsList"][0]["sast"]["startLineNo"], serde_json::json!("42"));
+    }
+
+    #[test]
+    fn analyzer_slugs_match_the_real_backend_connector_registry() {
+        assert_eq!(webhook_analyzer_slug(analyzer_registry::ScanType::Sast), "strobes_sast");
+        assert_eq!(webhook_analyzer_slug(analyzer_registry::ScanType::Sca), "strobes_sca");
+        assert_eq!(webhook_analyzer_slug(analyzer_registry::ScanType::Container), "strobes_container_security");
+        assert_eq!(webhook_analyzer_slug(analyzer_registry::ScanType::Dast), "strobes_dast");
+        // No dedicated IaC connector exists in the backend — deliberately
+        // reuses sast's slug rather than inventing one that would silently
+        // no-op.
+        assert_eq!(webhook_analyzer_slug(analyzer_registry::ScanType::Iac), "strobes_sast");
+    }
+
+    #[test]
+    fn asset_types_match_the_real_backend_enum() {
+        assert_eq!(webhook_asset_type(analyzer_registry::ScanType::Sast), "CODE_REPO");
+        assert_eq!(webhook_asset_type(analyzer_registry::ScanType::Sca), "CODE_REPO");
+        assert_eq!(webhook_asset_type(analyzer_registry::ScanType::Iac), "CODE_REPO");
+        assert_eq!(webhook_asset_type(analyzer_registry::ScanType::Container), "CONTAINER_IMAGE");
+        // WEB, not WEBSITE — verified live that WEBSITE silently orphans the
+        // finding (see webhook_asset_type's doc comment).
+        assert_eq!(webhook_asset_type(analyzer_registry::ScanType::Dast), "WEB");
+    }
+
+    #[test]
+    fn asset_is_web_type_for_dast_with_matching_name_and_ref() {
+        let scan = AnalyzerScanResult { success: true, analyzer: "zapanalyzer".into(), scan_meta: Default::default(), bugs: vec![sample_bug(vec![], None)] };
+        let payload = build_webhook_payload(&scan, "https://target.example.com", "t", analyzer_registry::ScanType::Dast);
+        let asset = &payload["bugsList"][0]["asset"];
+        assert_eq!(asset["type"], "WEB");
+        assert_eq!(asset["name"], "https://target.example.com");
+        assert_eq!(asset["assetRef"], "https://target.example.com");
+        assert_eq!(payload["analyzer"], "strobes_dast");
+    }
+
+    #[test]
+    fn dast_bugs_carry_a_dast_subobject_so_bug_level_resolves_to_web() {
+        // Without this, the backend's normalizer never assigns `bug_level =
+        // Bug.web` (it's only set inside the `elif "dast" in bug_item`
+        // branch), which makes asset-matching skip entirely and the bug gets
+        // silently dropped with zero errors anywhere — confirmed live
+        // against a real backend (asset created, bug never was).
+        let scan = AnalyzerScanResult { success: true, analyzer: "zapanalyzer".into(), scan_meta: Default::default(), bugs: vec![sample_bug(vec![], None)] };
+        let payload = build_webhook_payload(&scan, "https://target.example.com", "t", analyzer_registry::ScanType::Dast);
+        let dast = &payload["bugsList"][0]["dast"];
+        assert_eq!(dast["uri"], serde_json::json!(["https://target.example.com"]));
+    }
+
+    #[test]
+    fn non_dast_bugs_have_no_dast_subobject() {
+        let scan = AnalyzerScanResult { success: true, analyzer: "x".into(), scan_meta: Default::default(), bugs: vec![sample_bug(vec![], None)] };
+        let payload = build_webhook_payload(&scan, "https://github.com/acme/repo", "t", analyzer_registry::ScanType::Sast);
+        assert!(payload["bugsList"][0].get("dast").is_none());
+    }
+
+    #[test]
+    fn iac_submits_as_code_repo_under_the_sast_slug() {
+        let scan = AnalyzerScanResult { success: true, analyzer: "checkovanalyzer".into(), scan_meta: Default::default(), bugs: vec![sample_bug(vec![], None)] };
+        let payload = build_webhook_payload(&scan, "https://github.com/acme/infra", "t", analyzer_registry::ScanType::Iac);
+        assert_eq!(payload["bugsList"][0]["asset"]["type"], "CODE_REPO");
+        assert_eq!(payload["analyzer"], "strobes_sast");
+    }
+
+    #[test]
+    fn asset_is_container_image_with_matching_name_and_ref() {
+        let scan = AnalyzerScanResult { success: true, analyzer: "trivyanalyzer".into(), scan_meta: Default::default(), bugs: vec![sample_bug(vec![], None)] };
+        let payload = build_webhook_payload(&scan, "ghcr.io/acme/app:latest", "t", analyzer_registry::ScanType::Container);
+        let asset = &payload["bugsList"][0]["asset"];
+        assert_eq!(asset["type"], "CONTAINER_IMAGE");
+        assert_eq!(asset["name"], "ghcr.io/acme/app:latest");
+        assert_eq!(asset["assetRef"], "ghcr.io/acme/app:latest");
+        assert_eq!(payload["analyzer"], "strobes_container_security");
+    }
+
+    /// The costliest possible mistake for this field: the backend's protobuf
+    /// `Container` message has NO `affectedVersions`/`commit` fields at all
+    /// (confirmed live — including any unrecognized field here makes
+    /// protobuf JSON parsing reject the WHOLE finding, not just this field,
+    /// so both the bug and its asset silently vanish). This test exists so
+    /// nobody re-adds them by copying the (different) `package`/SCA shape.
+    #[test]
+    fn container_fields_are_whitelisted_to_the_real_protobuf_schema() {
+        let mut bug = sample_bug(vec![], None);
+        bug.container = Some(serde_json::json!({
+            "packageName": "openssl",
+            "installedVersion": "1.1.1",
+            "fixedVersion": "1.1.1w",
+            "cpe": "cpe:2.3:a:openssl:openssl:1.1.1:*:*:*:*:*:*:*",
+            "digest": "sha256:deadbeef",
+            "affectedVersions": "<1.1.1w", // must be dropped
+            "commit": "",                  // must be dropped
+        }));
+        let scan = AnalyzerScanResult { success: true, analyzer: "x".into(), scan_meta: Default::default(), bugs: vec![bug] };
+        let payload = build_webhook_payload(&scan, "ghcr.io/acme/app:latest", "t", analyzer_registry::ScanType::Container);
+        let out = &payload["bugsList"][0]["container"];
+        assert_eq!(out.as_object().unwrap().len(), 5, "expected exactly the 5 real fields, got: {out}");
+        assert!(out.get("affectedVersions").is_none());
+        assert!(out.get("commit").is_none());
+        assert_eq!(out["packageName"], "openssl");
+        assert_eq!(out["cpe"], serde_json::json!(["cpe:2.3:a:openssl:openssl:1.1.1:*:*:*:*:*:*:*"]));
+    }
+
+    #[test]
+    fn sca_bugs_carry_a_package_subobject_so_bug_level_resolves_to_package() {
+        // Without this, the backend's normalizer never assigns `bug_level =
+        // Bug.package` (only set inside `if "package" in bug_item: if
+        // packageName: ...`), so the finding gets silently dropped the same
+        // way DAST bugs were before the `dast` sub-object fix — confirmed
+        // live: a real SCA scan submitted 9 findings, the platform's
+        // bugStats showed 0 landed, because `AnalyzerBug` didn't carry the
+        // `package` field the analyzer's own JSON output actually emits.
+        let mut bug = sample_bug(vec!["20"], None);
+        bug.package = Some(serde_json::json!({
+            "packageName": "flask",
+            "installedVersion": "0.12",
+            "fixedVersion": "0.12.3",
+            "fileName": "requirements.txt",
+            "ecosystem": "PIP",
+            "branch": ["main"],
+            "purl": "pkg:pypi/flask@0.12",
+            "affectedVersions": "",
+            "commit": "",
+            "cpe": [],
+            "isMalicious": false, // not whitelisted — must be dropped
+        }));
+        let scan = AnalyzerScanResult { success: true, analyzer: "dependency".into(), scan_meta: Default::default(), bugs: vec![bug] };
+        let payload = build_webhook_payload(&scan, "https://github.com/acme/repo", "t", analyzer_registry::ScanType::Sca);
+        let out = &payload["bugsList"][0]["package"];
+        assert_eq!(out["packageName"], "flask");
+        assert_eq!(out["ecosystem"], "PIP");
+        assert_eq!(out["branch"], serde_json::json!(["main"]));
+        assert!(out.get("isMalicious").is_none());
+    }
+
+    #[test]
+    fn container_cpe_string_is_wrapped_as_a_repeated_field() {
+        let mut bug = sample_bug(vec![], None);
+        bug.container = Some(serde_json::json!({"packageName": "x", "cpe": "cpe:2.3:a:x:x:1:*:*:*:*:*:*:*"}));
+        let scan = AnalyzerScanResult { success: true, analyzer: "x".into(), scan_meta: Default::default(), bugs: vec![bug] };
+        let payload = build_webhook_payload(&scan, "ghcr.io/acme/app:latest", "t", analyzer_registry::ScanType::Container);
+        assert!(payload["bugsList"][0]["container"]["cpe"].is_array());
+    }
 }
 
 /// Analyzer severities are ints 5..1 — matches every scan we ran by hand
@@ -5534,6 +5996,7 @@ async fn cicd_finish(
     target: &str,
     elapsed: std::time::Duration,
     common: &CicdCommon,
+    asset_ref: Option<String>,
 ) -> Result<()> {
     let Some(json) = run.output_json else {
         return Err(anyhow!(
@@ -5597,7 +6060,89 @@ async fn cicd_finish(
         run_ai_triage(profile, scan_type, &result, target, common).await?;
     }
 
+    submit_and_verify_findings(profile, scan_type, &result, asset_ref.as_deref(), common).await?;
+
     check_analyzer_gate(&common.fail_on, &result)
+}
+
+/// After a local scan completes, submit its findings to the platform and
+/// confirm they actually landed — see the module-level comment above
+/// `build_webhook_payload` for why a bare 200 isn't enough to trust. A no-op
+/// (returns `Ok(())` immediately) when: `--no-submit` was given, no asset
+/// identity could be resolved, or the scan found zero findings (nothing to
+/// submit or verify — a clean scan is not an ingestion failure).
+async fn submit_and_verify_findings(
+    profile: &config::Profile,
+    scan_type: analyzer_registry::ScanType,
+    result: &AnalyzerScanResult,
+    asset_ref: Option<&str>,
+    common: &CicdCommon,
+) -> Result<()> {
+    if common.no_submit {
+        return Ok(());
+    }
+    if result.bugs.is_empty() {
+        return Ok(());
+    }
+    let Some(asset_ref) = asset_ref.or(common.asset_ref.as_deref()) else {
+        eprintln!(
+            "⚠ no asset identity detected (no git 'origin' remote for a repo scan, or no image \
+             given) and --asset-ref not given — skipping platform submission. The scan results \
+             above are unaffected."
+        );
+        return Ok(());
+    };
+
+    let client = api::ApiClient::new(profile.clone())?;
+    let tenant_host = profile.host().unwrap_or_default();
+    let payload = build_webhook_payload(result, asset_ref, &tenant_host, scan_type);
+
+    eprintln!("\nsubmitting {} finding(s) to the platform...", result.bugs.len());
+    // Watermark BEFORE submitting, so we know which ScanLog is genuinely new
+    // — same pattern as verify_masterkey_ingest.py's latest_scanlog_id().
+    let watermark = client.latest_scan_log_id().await.unwrap_or(0);
+    client
+        .submit_webhook_finding(payload)
+        .await
+        .context("submitting findings to the platform")?;
+
+    let timeout = std::time::Duration::from_secs(common.verify_timeout);
+    match client.wait_for_scan_log(watermark, timeout).await {
+        Some(log) if log.bugs_count > 0 && log.assets_count > 0 => {
+            eprintln!(
+                "✔ platform ingest verified: ScanLog {} — {} bug(s), {} asset(s)",
+                log.id, log.bugs_count, log.assets_count
+            );
+            Ok(())
+        }
+        Some(log) => {
+            let msg = format!(
+                "platform ingest verification failed: ScanLog {} (status={}) reports {} bug(s), \
+                 {} asset(s) — findings may not have landed correctly. Shown for reference only: \
+                 a ScanLog can report a \"successful\" status here and still have dropped every \
+                 finding, which is exactly why bug/asset counts (not status) decide this check.",
+                log.id, log.status, log.bugs_count, log.assets_count
+            );
+            if common.strict_ingest {
+                Err(anyhow!(msg))
+            } else {
+                eprintln!("⚠ {msg}");
+                Ok(())
+            }
+        }
+        None => {
+            let msg = format!(
+                "platform ingest verification timed out after {}s — no ScanLog appeared for this submission",
+                common.verify_timeout
+            );
+            if common.strict_ingest {
+                Err(anyhow!(msg))
+            } else {
+                eprintln!("⚠ {msg}");
+                Ok(())
+            }
+        }
+    }
 }
 
 /// Opt-in second pass: hand the deterministic findings to an AI agent for
@@ -5677,6 +6222,10 @@ async fn cmd_cicd_sast(profile: &config::Profile, dir: String, common: CicdCommo
     let start = std::time::Instant::now();
     let image_ref = cicd_prepare(profile, scan_type, &common).await?;
     let target_dir = std::fs::canonicalize(&dir).with_context(|| format!("cannot resolve directory: {dir}"))?;
+    // Resolve the real repo URL before anything else touches this directory's
+    // git remotes (irrelevant for sast today, but kept in the same spot as
+    // sca below so the two stay easy to compare).
+    let asset_ref = analyzer_registry::resolve_repo_url(&target_dir);
     let out_dir = tempdir_for_cicd()?;
     let docker_args = vec![
         "-v".to_string(), format!("{}:/scan:ro", target_dir.display()),
@@ -5694,7 +6243,7 @@ async fn cmd_cicd_sast(profile: &config::Profile, dir: String, common: CicdCommo
     // leaking a strobes-cicd-<uuid> dir into /tmp on every single run.
     let _ = std::fs::remove_dir_all(&out_dir);
     let run = run?;
-    cicd_finish(profile, scan_type, run, &dir, start.elapsed(), &common).await
+    cicd_finish(profile, scan_type, run, &dir, start.elapsed(), &common, asset_ref).await
 }
 
 async fn cmd_cicd_sca(profile: &config::Profile, dir: String, common: CicdCommon) -> Result<()> {
@@ -5702,6 +6251,11 @@ async fn cmd_cicd_sca(profile: &config::Profile, dir: String, common: CicdCommon
     let start = std::time::Instant::now();
     let image_ref = cicd_prepare(profile, scan_type, &common).await?;
     let target_dir = std::fs::canonicalize(&dir).with_context(|| format!("cannot resolve directory: {dir}"))?;
+    // MUST resolve before ensure_origin_remote: that call may add a
+    // synthetic placeholder remote for the analyzer's own benefit, which
+    // resolve_repo_url would otherwise have no way to distinguish from a
+    // real one if it ran second.
+    let asset_ref = analyzer_registry::resolve_repo_url(&target_dir);
     analyzer_registry::ensure_origin_remote(&target_dir)?;
     let out_dir = tempdir_for_cicd()?;
     let docker_args = vec![
@@ -5721,7 +6275,7 @@ async fn cmd_cicd_sca(profile: &config::Profile, dir: String, common: CicdCommon
     // leaking a strobes-cicd-<uuid> dir into /tmp on every single run.
     let _ = std::fs::remove_dir_all(&out_dir);
     let run = run?;
-    cicd_finish(profile, scan_type, run, &dir, start.elapsed(), &common).await
+    cicd_finish(profile, scan_type, run, &dir, start.elapsed(), &common, asset_ref).await
 }
 
 async fn cmd_cicd_container(profile: &config::Profile, image: String, common: CicdCommon) -> Result<()> {
@@ -5744,7 +6298,9 @@ async fn cmd_cicd_container(profile: &config::Profile, image: String, common: Ci
     // leaking a strobes-cicd-<uuid> dir into /tmp on every single run.
     let _ = std::fs::remove_dir_all(&out_dir);
     let run = run?;
-    cicd_finish(profile, scan_type, run, &image, start.elapsed(), &common).await
+    // The image reference itself IS the asset identity here — no separate
+    // "resolution" step needed the way sast/sca need a git remote.
+    cicd_finish(profile, scan_type, run, &image, start.elapsed(), &common, Some(image.clone())).await
 }
 
 async fn cmd_cicd_iac(profile: &config::Profile, dir: String, common: CicdCommon) -> Result<()> {
@@ -5752,6 +6308,10 @@ async fn cmd_cicd_iac(profile: &config::Profile, dir: String, common: CicdCommon
     let start = std::time::Instant::now();
     let image_ref = cicd_prepare(profile, scan_type, &common).await?;
     let target_dir = std::fs::canonicalize(&dir).with_context(|| format!("cannot resolve directory: {dir}"))?;
+    // Same asset identity as sast: IaC findings submit under the sast
+    // connector slug too (see webhook_analyzer_slug), so they need the same
+    // CODE_REPO shape and the same real repo URL.
+    let asset_ref = analyzer_registry::resolve_repo_url(&target_dir);
     let out_dir = tempdir_for_cicd()?;
     let docker_args = vec![
         "-v".to_string(), format!("{}:/scan:ro", target_dir.display()),
@@ -5771,7 +6331,7 @@ async fn cmd_cicd_iac(profile: &config::Profile, dir: String, common: CicdCommon
     // leaking a strobes-cicd-<uuid> dir into /tmp on every single run.
     let _ = std::fs::remove_dir_all(&out_dir);
     let run = run?;
-    cicd_finish(profile, scan_type, run, &dir, start.elapsed(), &common).await
+    cicd_finish(profile, scan_type, run, &dir, start.elapsed(), &common, asset_ref).await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5847,7 +6407,9 @@ async fn cmd_cicd_dast(
     // leaking a strobes-cicd-<uuid> dir into /tmp on every single run.
     let _ = std::fs::remove_dir_all(&out_dir);
     let run = run?;
-    cicd_finish(profile, scan_type, run, &url, start.elapsed(), &common).await
+    // The target URL itself is the asset identity — no separate resolution
+    // step needed, same as container's image reference.
+    cicd_finish(profile, scan_type, run, &url, start.elapsed(), &common, Some(url.clone())).await
 }
 
 /// A fresh, per-run temp dir for an analyzer container's `/out` mount.
