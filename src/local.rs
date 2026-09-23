@@ -120,15 +120,29 @@ async fn run_shell(command: &str, sandbox: &std::path::Path) -> LocalResult {
         }
         _ => command.to_string(),
     };
-    let mut cmd = if cfg!(windows) {
-        let mut c = Command::new("cmd");
-        c.arg("/C").arg(&effective);
-        c
+    let (program, args): (&str, Vec<String>) = if cfg!(windows) {
+        ("cmd", vec!["/C".to_string(), effective])
     } else {
-        let mut c = Command::new("/bin/bash");
-        c.arg("-lc").arg(&effective);
-        c
+        ("/bin/bash", vec!["-lc".to_string(), effective])
     };
+
+    // Every AI-issued command is confined to the egress scope before it
+    // spawns — there is no unsandboxed fallback. See sandbox.rs.
+    let confined = match crate::sandbox::confine(program, &args).await {
+        Ok(c) => c,
+        Err(e) => {
+            return LocalResult {
+                output: String::new(),
+                exit_code: None,
+                error: Some(format!("egress sandbox unavailable, refusing to run unsandboxed: {e}")),
+                captured_network: vec![],
+            }
+        }
+    };
+
+    let mut cmd = Command::new(&confined.program);
+    cmd.args(&confined.args);
+    cmd.envs(confined.env);
     // Put the sandbox pack's tools in front on PATH so nmap/nuclei/httpx/… resolve
     // to the bundled copies, exactly as the bridge daemon does. No-op without a pack.
     if let Some(path) = crate::pack::path_with_pack() {
@@ -175,9 +189,27 @@ async fn run_code(code: &str, lang: &str, sandbox: &std::path::Path) -> LocalRes
             captured_network: vec![],
         };
     }
-    let out = Command::new(program)
-        .args(&args)
-        .arg(&file)
+    let mut full_args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+    full_args.push(file.to_string_lossy().to_string());
+
+    // Every AI-issued command is confined to the egress scope before it
+    // spawns — there is no unsandboxed fallback. See sandbox.rs.
+    let confined = match crate::sandbox::confine(program, &full_args).await {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = tokio::fs::remove_file(&file).await;
+            return LocalResult {
+                output: String::new(),
+                exit_code: None,
+                error: Some(format!("egress sandbox unavailable, refusing to run unsandboxed: {e}")),
+                captured_network: vec![],
+            };
+        }
+    };
+
+    let out = Command::new(&confined.program)
+        .args(&confined.args)
+        .envs(confined.env)
         .envs(
             crate::pack::path_with_pack()
                 .map(|p| vec![("PATH".to_string(), p)])
@@ -292,6 +324,13 @@ fn meta_json(sandbox: &std::path::Path) -> String {
     });
     if let Ok(ws) = std::env::var("STROBES_AI_WORKSPACE_ID") {
         meta["workspace_id"] = serde_json::Value::from(ws);
+    }
+    // Lets the agent know, before it runs a scanner, whether raw sockets
+    // survive the current egress lane — under the proxy lane (the only one
+    // this CLI has today) they don't, so a port scanner's results would be
+    // meaningless "everything filtered" noise rather than a real answer.
+    if let Ok(lane) = serde_json::to_value(crate::sandbox::lane_capability()) {
+        meta["egress_lane"] = lane;
     }
     meta.to_string()
 }

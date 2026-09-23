@@ -10,11 +10,16 @@ mod api;
 mod app;
 mod browser;
 mod config;
+mod egress_proxy;
 mod local;
+mod netpolicy;
 mod pack;
 mod markdown;
 mod picker;
+mod procsandbox;
 mod pulse;
+mod sandbox;
+mod winsandbox;
 mod workflow;
 mod remote_wf_tui;
 mod workflow_runner;
@@ -106,6 +111,19 @@ enum Cmd {
         /// Force the thread picker / create a new thread instead of resuming.
         #[arg(long)]
         new: bool,
+        /// Allow AI-issued commands to reach this host (repeatable). Exact
+        /// host, `*.suffix` wildcard, or IP literal. Cloud-metadata/link-local
+        /// stay denied regardless.
+        #[arg(long, value_name = "HOST")]
+        net_allow: Vec<String>,
+        /// Deny AI-issued commands from reaching this host (repeatable);
+        /// takes priority over --net-allow.
+        #[arg(long, value_name = "HOST")]
+        net_deny: Vec<String>,
+        /// What to do with a host matching neither list: "allow" (default —
+        /// open, matching today's unrestricted behavior) or "deny".
+        #[arg(long, default_value = "allow", value_name = "allow|deny")]
+        net_default: String,
     },
     /// Configure credentials interactively (or pass flags to skip prompts).
     Login {
@@ -260,6 +278,19 @@ enum Cmd {
         /// Corresponds to the agent_id registered on the server.
         #[arg(long, value_name = "AGENT_ID")]
         agent: Option<String>,
+        /// Allow AI-issued commands to reach this host (repeatable). Exact
+        /// host, `*.suffix` wildcard, or IP literal. Cloud-metadata/link-local
+        /// stay denied regardless.
+        #[arg(long, value_name = "HOST")]
+        net_allow: Vec<String>,
+        /// Deny AI-issued commands from reaching this host (repeatable);
+        /// takes priority over --net-allow.
+        #[arg(long, value_name = "HOST")]
+        net_deny: Vec<String>,
+        /// What to do with a host matching neither list: "allow" (default —
+        /// open, matching today's unrestricted behavior) or "deny".
+        #[arg(long, default_value = "allow", value_name = "allow|deny")]
+        net_default: String,
     },
     /// List or export workspace findings (JSON / SARIF for CI integration).
     Findings {
@@ -307,6 +338,27 @@ enum Cmd {
         /// Markdown only: omit tool calls, tool output, thinking and task markers.
         #[arg(long)]
         messages_only: bool,
+    },
+    /// Verify the egress sandbox actually enforces its scope: proves an
+    /// out-of-scope connection is denied AND an in-scope one still works,
+    /// using a temporary policy independent of --net-allow/--net-deny.
+    SandboxCheck,
+    /// One-time elevated setup for platforms that need it (currently a
+    /// no-op everywhere except Windows, which isn't implemented yet).
+    SandboxSetup,
+    /// Undo `sandbox-setup`.
+    SandboxTeardown,
+    /// Internal: the relay bwrap execs inside the Linux sandbox's isolated
+    /// network namespace. Not for direct use.
+    #[command(name = "__egress-relay", hide = true)]
+    EgressRelay {
+        #[arg(long)]
+        unix: String,
+        #[arg(long)]
+        port: u16,
+        /// The real command to run, after a literal `--`.
+        #[arg(last = true)]
+        command: Vec<String>,
     },
 }
 
@@ -923,7 +975,22 @@ async fn main() -> Result<()> {
     let tenant = cli.tenant.clone().unwrap_or_else(|| cfg.current_profile.clone());
     let profile = cfg.profile_for(&tenant);
 
-    match cli.cmd.unwrap_or(Cmd::Chat { thread: None, workspace: None, model: None, reasoning: None, new: false }) {
+    // Every AI-issued shell/code command this run makes is scoped to this
+    // policy before it can spawn (local.rs -> sandbox::confine). Only Chat
+    // and Send carry --net-* flags — anything else runs with the open
+    // default (unrestricted egress, same as before this feature existed).
+    if let Some(Cmd::Chat { net_allow, net_deny, net_default, .. } | Cmd::Send { net_allow, net_deny, net_default, .. }) =
+        cli.cmd.as_ref()
+    {
+        let default = if net_default.eq_ignore_ascii_case("deny") {
+            netpolicy::Action::Deny
+        } else {
+            netpolicy::Action::Allow
+        };
+        netpolicy::set_policy(netpolicy::NetworkPolicy::from_flags(net_allow, net_deny, default));
+    }
+
+    match cli.cmd.unwrap_or(Cmd::Chat { thread: None, workspace: None, model: None, reasoning: None, new: false, net_allow: vec![], net_deny: vec![], net_default: "allow".to_string() }) {
         Cmd::Login { base_url, org_id, master_key, deployment, analyzer_registry_url, no_verify } => {
             cmd_login(&mut cfg, &tenant, base_url, org_id, master_key, deployment, analyzer_registry_url, no_verify).await
         }
@@ -955,7 +1022,7 @@ async fn main() -> Result<()> {
         }
         Cmd::Pull { workspace, dir } => cmd_pull(&mut cfg, &profile, workspace, dir).await,
         Cmd::Push { files, workspace, dir } => cmd_push(&cfg, &profile, files, workspace, dir).await,
-        Cmd::Chat { thread, workspace, model, reasoning, new } => {
+        Cmd::Chat { thread, workspace, model, reasoning, new, net_allow: _, net_deny: _, net_default: _ } => {
             let reasoning = reasoning;
             // Enter the alternate screen ONCE for the whole interactive flow
             // (pickers + chat) and restore ONCE, so switching between workspace,
@@ -977,7 +1044,7 @@ async fn main() -> Result<()> {
         }
         Cmd::Probe { thread, send, secs, model, reasoning } => cmd_probe(&profile, &thread, send, secs, model, reasoning).await,
         Cmd::Workflow { sub } => cmd_workflow(profile, sub, &tenant).await,
-        Cmd::Send { message, workspace, new_workspace, title, model, reasoning, output, non_interactive, timeout, fail_on_findings, sandbox_id, agent } => {
+        Cmd::Send { message, workspace, new_workspace, title, model, reasoning, output, non_interactive, timeout, fail_on_findings, sandbox_id, agent, net_allow: _, net_deny: _, net_default: _ } => {
             cmd_send(&profile, message, workspace, new_workspace, title, model, reasoning, &output, non_interactive, timeout, fail_on_findings, sandbox_id, agent).await
         }
         Cmd::Ci { sub } => match sub {
@@ -1012,7 +1079,65 @@ async fn main() -> Result<()> {
         Cmd::Export { workspace, thread, dir, format, messages_only } => {
             cmd_export(&profile, workspace, thread, dir, &format, messages_only).await
         }
+        Cmd::SandboxCheck => cmd_sandbox_check().await,
+        Cmd::SandboxSetup => cmd_sandbox_setup(),
+        Cmd::SandboxTeardown => cmd_sandbox_teardown(),
+        Cmd::EgressRelay { unix, port, command } => {
+            let Some((program, args)) = command.split_first() else {
+                eprintln!("__egress-relay: no command given after --");
+                std::process::exit(2);
+            };
+            procsandbox::run_relay_and_exec(std::path::Path::new(&unix), port, program, args);
+        }
     }
+}
+
+/// `strobes sandbox-check` — see [`sandbox::sandbox_check`] for what this
+/// actually proves.
+async fn cmd_sandbox_check() -> Result<()> {
+    let result = sandbox::sandbox_check().await;
+    println!("{}", serde_json::to_string_pretty(&result)?);
+    if !result.backend_available {
+        println!("\nNo sandbox backend on this host — AI-issued commands will refuse to run rather than execute with unrestricted egress.");
+    } else if !result.out_of_scope_denied || !result.in_scope_allowed {
+        println!("\nWARNING: the sandbox is not enforcing correctly — see the fields above.");
+    } else {
+        println!("\nSandbox lane verified: out-of-scope denied, in-scope still works.");
+    }
+    Ok(())
+}
+
+/// `strobes sandbox-setup` — a no-op on macOS/Linux (sandbox-exec and
+/// bubblewrap need no privileged one-time setup); the Windows backend that
+/// would need this isn't implemented yet.
+fn cmd_sandbox_setup() -> Result<()> {
+    #[cfg(windows)]
+    {
+        match winsandbox::setup() {
+            Ok(msg) => println!("{msg}"),
+            Err(e) => println!("{e}"),
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        println!("No setup needed on this platform — sandbox-exec (macOS) / bubblewrap (Linux) are used directly, no elevated one-time step required.");
+    }
+    Ok(())
+}
+
+fn cmd_sandbox_teardown() -> Result<()> {
+    #[cfg(windows)]
+    {
+        match winsandbox::teardown() {
+            Ok(msg) => println!("{msg}"),
+            Err(e) => println!("{e}"),
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        println!("Nothing to tear down on this platform.");
+    }
+    Ok(())
 }
 
 /// The interactive chat flow: pick a workspace → thread (unless given), persist
