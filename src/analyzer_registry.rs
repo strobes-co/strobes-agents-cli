@@ -215,6 +215,37 @@ pub fn ensure_origin_remote(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The synthetic placeholder `ensure_origin_remote` adds when a scan target
+/// has no real `origin` — never a value that should reach the platform as a
+/// finding's asset identity.
+const PLACEHOLDER_REMOTE_HOST: &str = "example.invalid";
+
+/// The target's real git origin remote URL, for identifying the asset a
+/// `strobes cicd` finding belongs to when submitting it to the platform.
+///
+/// Deliberately separate from [`ensure_origin_remote`], which may have
+/// *added* a fake placeholder remote for the analyzer's own internal needs —
+/// callers that need the real thing (or nothing) must call this BEFORE
+/// `ensure_origin_remote` runs on the same directory, and it independently
+/// refuses to ever return the placeholder host even if ordering changes
+/// later. Returns `None` rather than erroring: a scan target with no real
+/// remote (a fresh `git init`, a shallow CI checkout) is a normal, expected
+/// case, not a failure — the scan itself should still run.
+pub fn resolve_repo_url(dir: &Path) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .args(["-C", &dir.to_string_lossy(), "remote", "get-url", "origin"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if url.is_empty() || url.contains(PLACEHOLDER_REMOTE_HOST) {
+        return None;
+    }
+    Some(url)
+}
+
 /// Result of running an analyzer container: whatever it wrote to stderr/stdout
 /// (for the text-mode summary and for detecting known-bug signatures — see
 /// the checkov IaC handling in main.rs) plus its parsed output JSON, if any.

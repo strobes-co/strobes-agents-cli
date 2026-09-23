@@ -461,6 +461,102 @@ impl ApiClient {
         self.list_workspaces().await.map(|_| ())
     }
 
+    // ── Findings ingest (`strobes cicd`) ─────────────────────────────────────
+    //
+    // POST /api/v1/webhook/ — the same endpoint every third-party scanner
+    // connector posts to. A 2xx here only means the platform *queued* a
+    // Celery task to parse the payload, NOT that it was actually ingested —
+    // see `wait_for_scan_log` below, which is the only reliable confirmation.
+
+    pub async fn submit_webhook_finding(&self, payload: serde_json::Value) -> Result<()> {
+        let path = format!("{}/webhook/", self.profile.api_prefix());
+        self.post_json(&path, payload).await.map(|_| ())
+    }
+
+    // ── GraphQL (real) ────────────────────────────────────────────────────────
+    //
+    // Lives at a fixed path off the HTTP origin, NOT under `api_prefix()` —
+    // confirmed against a live backend (`/api/public/graphql/` regardless of
+    // deployment mode). Note: despite the section header two below this one,
+    // nothing under "GraphQL (workflow API)" is actually GraphQL — it's all
+    // plain REST. This is the CLI's only real GraphQL client.
+
+    async fn graphql_query(&self, query: &str) -> Result<serde_json::Value> {
+        let url = format!("{}/api/public/graphql/", self.profile.http_base()?);
+        let resp = self
+            .http
+            .post(&url)
+            .header("Authorization", format!("token {}", self.profile.master_key))
+            .header("Accept", "application/json")
+            .json(&serde_json::json!({ "query": query }))
+            .timeout(std::time::Duration::from_secs(20))
+            .send()
+            .await
+            .context("GraphQL query timed out or failed to connect")?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(anyhow!("GraphQL POST -> HTTP {}: {}", status.as_u16(), trunc(&text, 300)));
+        }
+        Ok(serde_json::from_str(&text).unwrap_or(serde_json::Value::Null))
+    }
+
+    /// The highest `ScanLog` id currently in the org (0 if none) — the
+    /// watermark to diff against after submitting a finding, so
+    /// `wait_for_scan_log` knows which row is actually new.
+    pub async fn latest_scan_log_id(&self) -> Result<i64> {
+        let query = format!(
+            r#"{{ allLogs(organizationId: "{}") {{ objects {{ id }} }} }}"#,
+            self.profile.org_id
+        );
+        let v = self.graphql_query(&query).await?;
+        Ok(v.pointer("/data/allLogs/objects/0/id").and_then(|x| x.as_i64()).unwrap_or(0))
+    }
+
+    /// Poll until a `ScanLog` newer than `after_id` stops being
+    /// Pending(0)/Running(1), or `timeout` elapses.
+    ///
+    /// `ScanLog.status` alone is NOT a reliable success signal — confirmed
+    /// against a live backend, a run that successfully ingested every
+    /// finding can still report `status=3` (Failed). Callers MUST judge
+    /// success by `bugs_count`/`assets_count`, never by `status`.
+    pub async fn wait_for_scan_log(&self, after_id: i64, timeout: std::time::Duration) -> Option<ScanLogStatus> {
+        let query = format!(
+            r#"{{ allLogs(organizationId: "{}") {{ objects {{ id status bugs assets }} }} }}"#,
+            self.profile.org_id
+        );
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut last: Option<ScanLogStatus> = None;
+        loop {
+            if let Ok(v) = self.graphql_query(&query).await {
+                let objs = v
+                    .pointer("/data/allLogs/objects")
+                    .and_then(|x| x.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                if let Some(fresh) = objs
+                    .iter()
+                    .find(|o| o.get("id").and_then(|x| x.as_i64()).unwrap_or(0) > after_id)
+                {
+                    let status = fresh.get("status").and_then(|x| x.as_i64()).unwrap_or(-1);
+                    last = Some(ScanLogStatus {
+                        id: fresh.get("id").and_then(|x| x.as_i64()).unwrap_or(0),
+                        status,
+                        bugs_count: json_string_list_len(fresh.get("bugs")),
+                        assets_count: json_string_list_len(fresh.get("assets")),
+                    });
+                    if status != 0 && status != 1 {
+                        return last;
+                    }
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return last;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        }
+    }
+
     // ── GraphQL (workflow API) ────────────────────────────────────────────────
 
     /// PATCH JSON to a REST path (MasterKey token auth). Returns the parsed body.
@@ -772,6 +868,28 @@ pub fn gql_string(s: &str) -> String {
     } else {
         format!("\"\"\"{}\"\"\"", s)
     }
+}
+
+/// A `ScanLog` row's ingest outcome, as reported by GraphQL. `status` is
+/// the raw enum (0=Pending, 1=Running, 2=Completed, 3=Failed, 4=Aborted) —
+/// callers should treat `bugs_count`/`assets_count` as the real signal (see
+/// `ApiClient::wait_for_scan_log`'s doc comment for why).
+#[derive(Debug, Clone)]
+pub struct ScanLogStatus {
+    pub id: i64,
+    pub status: i64,
+    pub bugs_count: usize,
+    pub assets_count: usize,
+}
+
+/// Length of a GraphQL `bugs`/`assets` field, which comes back as a JSON
+/// *string* (e.g. `"[]"` or `"[{...}]"`) rather than a nested array — the
+/// backend stores it as serialized text, so this needs a second parse.
+fn json_string_list_len(v: Option<&serde_json::Value>) -> usize {
+    let Some(s) = v.and_then(|x| x.as_str()) else { return 0 };
+    serde_json::from_str::<Vec<serde_json::Value>>(s)
+        .map(|a| a.len())
+        .unwrap_or(0)
 }
 
 fn trunc(s: &str, n: usize) -> String {
