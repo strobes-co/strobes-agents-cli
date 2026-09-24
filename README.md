@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/banner.svg" alt="Strobes Agents AI" width="800"/>
+  <img src="assets/banner.png" alt="Strobes Agents AI" width="800"/>
 </p>
 
 A local, terminal-native client for **Strobes Agents AI**. It connects to a
@@ -9,7 +9,7 @@ and ships a self-contained **CI scanning suite** (SAST · SCA · Container · Ia
 DAST) that works without any extra services.
 
 <p align="center">
-  <img src="assets/ws-arch.svg" alt="WebSocket architecture" width="700"/>
+  <img src="assets/ws-arch.png" alt="WebSocket architecture" width="700"/>
 </p>
 
 > **Security:** no credentials are committed to this repo. You provide your own
@@ -119,7 +119,7 @@ These persist to `~/.config/strobes-ai/config.json`
 ## `strobes ci` — Security Scanning Suite
 
 <p align="center">
-  <img src="assets/ci-pipeline.svg" alt="CI scanning pipeline" width="800"/>
+  <img src="assets/ci-pipeline.png" alt="CI scanning pipeline" width="800"/>
 </p>
 
 `strobes ci` is a self-contained security scanning engine built into the CLI.
@@ -490,9 +490,9 @@ src/
                     streaming (● live) + pause/resume/restart/detach controls
 
 assets/
-  banner.svg        README header banner (hex logo + feature badges)
-  ws-arch.svg       WebSocket architecture diagram
-  ci-pipeline.svg   CI scanning pipeline diagram
+  banner.png        README header banner (hex logo + feature badges)
+  ws-arch.png       WebSocket architecture diagram
+  ci-pipeline.png   CI scanning pipeline diagram
 ```
 
 ## Development
