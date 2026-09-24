@@ -9,7 +9,7 @@ and ships a self-contained **CI scanning suite** (SAST · SCA · Container · Ia
 DAST) that works without any extra services.
 
 <p align="center">
-  <img src="assets/ws-arch.svg" alt="WebSocket architecture" width="700"/>
+  <img src="assets/ws-arch.png" alt="WebSocket architecture" width="700"/>
 </p>
 
 > **Security:** no credentials are committed to this repo. You provide your own
@@ -491,7 +491,7 @@ src/
 
 assets/
   banner.png        README header banner (hex logo + feature badges)
-  ws-arch.svg       WebSocket architecture diagram
+  ws-arch.png       WebSocket architecture diagram
   ci-pipeline.png   CI scanning pipeline diagram
 ```
 
