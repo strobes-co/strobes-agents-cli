@@ -1,7 +1,17 @@
-//! Live TUI for monitoring and controlling a remote workflow.
+//! Live TUI for a cloud-orchestrated, CLI-executed workflow.
 //!
-//! Layout: left = phase/task tree  |  right = details for selected item
+//! The cloud runs the orchestration (phases, tasks, the agent loop); THIS
+//! machine runs the work. The TUI polls status every 2s and opens a pulse
+//! connection to every *running* task thread — each connection both renders the
+//! agent's tokens/tool-calls in the details pane AND services `tool.local_execute`
+//! locally (see pulse::handle_frame), so the task's shell/code/browser commands
+//! run here. A periodic heartbeat tells the server the CLI is present; leaving
+//! pauses the workflow so it waits for a CLI to reattach rather than stalling.
+//!
+//! Layout: left = phase/task tree  |  right = details + live output for selected item
 //! Keys: ↑↓ navigate · Enter open thread · [p]ause · [r]esume · [s]tart · [d]etach · [q]uit
+
+use std::collections::HashMap;
 
 use anyhow::Result;
 use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers};
@@ -13,9 +23,57 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
     Frame,
 };
+use tokio::sync::mpsc;
 
 use crate::api::{ApiClient, Thread, WorkflowState};
 use crate::config::Profile;
+use crate::pulse::{self, PulseHandle, StreamItem};
+
+/// Max characters of live output retained per task thread (keeps memory bounded
+/// on a long-running workflow).
+const MAX_OUTPUT_CHARS: usize = 64 * 1024;
+
+/// Convert a StreamItem into a displayable line for the live output pane.
+fn format_stream_item(item: &StreamItem) -> Option<String> {
+    match item.kind.as_str() {
+        "token" => item.text.clone(),
+        "thinking" => item.text.as_ref().map(|t| format!("💭 {t}")),
+        "tool_start" => {
+            let name = item.tool_name.as_deref().unwrap_or("?");
+            let detail = item.detail.as_deref().unwrap_or("");
+            if detail.is_empty() {
+                Some(format!("\n▶ {name}\n"))
+            } else {
+                Some(format!("\n▶ {name}({detail})\n"))
+            }
+        }
+        "tool_output" => {
+            let name = item.tool_name.as_deref().unwrap_or("?");
+            let detail = item.detail.as_deref().unwrap_or("");
+            if detail.is_empty() {
+                None
+            } else {
+                Some(format!("◀ {name}: {detail}\n"))
+            }
+        }
+        "tool_failed" => {
+            let name = item.tool_name.as_deref().unwrap_or("?");
+            let err = item.detail.as_deref().unwrap_or("unknown error");
+            Some(format!("✗ {name}: {err}\n"))
+        }
+        "task" => item.text.as_ref().map(|t| {
+            let status = item.status.as_deref().unwrap_or("");
+            if status.is_empty() {
+                format!("[task] {t}\n")
+            } else {
+                format!("[task:{status}] {t}\n")
+            }
+        }),
+        "note" | "system" => item.text.as_ref().map(|t| format!("ℹ {t}\n")),
+        "approval" => item.text.as_ref().map(|t| format!("[auto-approved] {t}\n")),
+        _ => item.text.clone(),
+    }
+}
 
 // ── Tree model ────────────────────────────────────────────────────────────────
 
@@ -77,6 +135,7 @@ fn build_tree(state: &WorkflowState, threads: &[Thread]) -> Vec<TreeRow> {
 
 struct App {
     workspace_id: String,
+    profile: Profile,
     state: Option<WorkflowState>,
     threads: Vec<Thread>,
     tree: Vec<TreeRow>,
@@ -85,14 +144,25 @@ struct App {
     feedback: Option<String>,
     confirm_detach: bool,
     spinner: u64,
+    /// Live per-thread output, keyed by thread id (accumulated from pulse).
+    outputs: HashMap<String, String>,
+    /// Open pulse connections, keyed by thread id. Dropping a handle stops it.
+    streams: HashMap<String, PulseHandle>,
+    /// Tagged stream events from every live connection funnel through here.
+    stream_tx: mpsc::UnboundedSender<(String, pulse::AppEvent)>,
 }
 
 impl App {
-    fn new(workspace_id: String) -> Self {
+    fn new(
+        workspace_id: String,
+        profile: Profile,
+        stream_tx: mpsc::UnboundedSender<(String, pulse::AppEvent)>,
+    ) -> Self {
         let mut list_state = ListState::default();
         list_state.select(Some(0));
         Self {
             workspace_id,
+            profile,
             state: None,
             threads: Vec::new(),
             tree: Vec::new(),
@@ -101,6 +171,81 @@ impl App {
             feedback: None,
             confirm_detach: false,
             spinner: 0,
+            outputs: HashMap::new(),
+            streams: HashMap::new(),
+            stream_tx,
+        }
+    }
+
+    /// Append streamed text to a thread's live buffer, trimming from the front
+    /// once it exceeds the retention cap.
+    fn push_output(&mut self, thread_id: String, text: &str) {
+        let buf = self.outputs.entry(thread_id).or_default();
+        buf.push_str(text);
+        if buf.len() > MAX_OUTPUT_CHARS {
+            let cut = buf.len() - MAX_OUTPUT_CHARS;
+            // Trim on a char boundary.
+            let mut idx = cut;
+            while idx < buf.len() && !buf.is_char_boundary(idx) {
+                idx += 1;
+            }
+            *buf = buf[idx..].to_string();
+        }
+    }
+
+    /// Open pulse streams for every running task thread not already streaming,
+    /// and drop connections for tasks that are no longer running. Called after
+    /// each status poll.
+    async fn sync_streams(&mut self) {
+        use std::collections::HashSet;
+
+        // Threads that should currently be streaming = running task threads.
+        let mut running: HashSet<String> = HashSet::new();
+        for row in &self.tree {
+            if let TreeRow::Task { thread_id, status, .. } = row {
+                if status == "running" {
+                    running.insert(thread_id.clone());
+                }
+            }
+        }
+
+        // Drop finished/vanished connections (keeps their captured output).
+        let stale: Vec<String> = self
+            .streams
+            .keys()
+            .filter(|tid| !running.contains(*tid))
+            .cloned()
+            .collect();
+        for tid in stale {
+            self.streams.remove(&tid); // Drop stops the pulse supervisor.
+        }
+
+        // Open new connections for newly-running threads.
+        let to_open: Vec<String> = running
+            .into_iter()
+            .filter(|tid| !self.streams.contains_key(tid))
+            .collect();
+        for tid in to_open {
+            let (tx, mut rx) = mpsc::unbounded_channel::<pulse::AppEvent>();
+            let out_tx = self.stream_tx.clone();
+            let tid_for_task = tid.clone();
+            tokio::spawn(async move {
+                while let Some(ev) = rx.recv().await {
+                    if out_tx.send((tid_for_task.clone(), ev)).is_err() {
+                        break;
+                    }
+                }
+            });
+            match pulse::connect(&self.profile, &tid, tx, None, None).await {
+                Ok(handle) => {
+                    self.streams.insert(tid.clone(), handle);
+                    self.outputs.entry(tid).or_default();
+                }
+                Err(_) => {
+                    // Best-effort: a failed connect just means no live view for
+                    // this task; the 2s status poll still tracks its state.
+                }
+            }
         }
     }
 
@@ -272,20 +417,52 @@ impl App {
             }
             Some(TreeRow::Task { thread_id, display, status, created_at, .. }) => {
                 let (_, color) = task_icon(status);
-                lines.push(Line::from(vec![
+                let streaming = self.streams.contains_key(thread_id);
+                let mut title_spans = vec![
                     Span::raw("  task:    "),
                     Span::styled(display.clone(), Style::default().fg(color).add_modifier(Modifier::BOLD)),
-                ]));
+                ];
+                if streaming {
+                    title_spans.push(Span::styled(
+                        "  ● live",
+                        Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                    ));
+                }
+                lines.push(Line::from(title_spans));
                 lines.push(Line::from(format!("  status:  {status}")));
                 lines.push(Line::from(format!("  thread:  {}…", &thread_id[..8.min(thread_id.len())])));
                 if let Some(ts) = created_at {
                     lines.push(Line::from(format!("  started: {}", fmt_time(ts))));
                 }
-                lines.push(Line::from(""));
                 lines.push(Line::from(Span::styled(
                     "  Enter: open thread in chat",
                     Style::default().fg(Color::Cyan),
                 )));
+
+                // Live output streamed from the cloud for this task thread.
+                let out = self.outputs.get(thread_id).map(|s| s.as_str()).unwrap_or("");
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    "  ── live output ──",
+                    Style::default().fg(Color::DarkGray),
+                )));
+                if out.trim().is_empty() {
+                    let placeholder = if streaming {
+                        "  (waiting for the agent to emit output…)"
+                    } else {
+                        "  (no live output — task not running; press Enter for full transcript)"
+                    };
+                    lines.push(Line::from(Span::styled(
+                        placeholder,
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                } else {
+                    // Show the tail so the newest output stays in view.
+                    let tail: Vec<&str> = out.lines().rev().take(200).collect();
+                    for l in tail.into_iter().rev() {
+                        lines.push(Line::from(format!("  {l}")));
+                    }
+                }
             }
             None => {
                 if self.state.is_none() && self.error.is_none() {
@@ -412,15 +589,25 @@ pub async fn run(
     profile: Profile,
     tenant: String,
 ) -> Result<()> {
-    let mut app = App::new(workspace_id.clone());
+    // Live task-output events from every per-thread pulse connection arrive here,
+    // tagged with their thread id.
+    let (stream_tx, mut stream_rx) = mpsc::unbounded_channel::<(String, pulse::AppEvent)>();
+    let mut app = App::new(workspace_id.clone(), profile.clone(), stream_tx);
 
-    // Initial load before the event loop.
+    // Initial load before the event loop, then open live streams for anything
+    // already running.
     refresh(client, &workspace_id, &mut app).await;
+    app.sync_streams().await;
 
     let mut events = EventStream::new();
     let mut poll_ticker = tokio::time::interval(std::time::Duration::from_secs(2));
     poll_ticker.tick().await; // skip the immediate first tick
     let mut draw_ticker = tokio::time::interval(std::time::Duration::from_millis(150));
+    // Presence heartbeat: this CLI is the execution surface for a CLI-local
+    // workflow, so it must tell the server it is still here. If these stop,
+    // the server pauses the workflow (nothing left to service local tools).
+    let mut hb_ticker = tokio::time::interval(std::time::Duration::from_secs(10));
+    let _ = client.heartbeat_workflow(&workspace_id).await;
 
     loop {
         terminal.draw(|f| app.draw(f))?;
@@ -486,13 +673,40 @@ pub async fn run(
                     _ => {}
                 }
             }
+            maybe_stream = stream_rx.recv() => {
+                if let Some((tid, ev)) = maybe_stream {
+                    if let pulse::AppEvent::Stream(item) = ev {
+                        if let Some(text) = format_stream_item(&item) {
+                            app.push_output(tid, &text);
+                        }
+                    }
+                }
+            }
             _ = poll_ticker.tick() => {
                 refresh(client, &workspace_id, &mut app).await;
+                app.sync_streams().await;
+            }
+            _ = hb_ticker.tick() => {
+                let _ = client.heartbeat_workflow(&workspace_id).await;
             }
             _ = draw_ticker.tick() => {
                 app.spinner = app.spinner.wrapping_add(1);
             }
         }
+    }
+
+    // Leaving the TUI stops all local-tool servicing, so a still-running
+    // CLI-local workflow would have nothing to execute its commands. Pause it
+    // on the way out (best-effort) so it waits for a CLI to reattach rather
+    // than stalling on tool calls that never get answered. A detached workflow
+    // (state cleared) needs no pause.
+    let still_running = app
+        .state
+        .as_ref()
+        .map(|s| matches!(s.status.as_str(), "running" | "pending"))
+        .unwrap_or(false);
+    if still_running {
+        let _ = client.pause_workflow_on_exit(&workspace_id).await;
     }
 
     Ok(())

@@ -15,11 +15,7 @@ mod pack;
 mod markdown;
 mod picker;
 mod pulse;
-mod workflow;
 mod remote_wf_tui;
-mod workflow_runner;
-mod workflow_state;
-mod workflow_tui;
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Args, Parser, Subcommand};
@@ -211,7 +207,8 @@ enum Cmd {
         #[arg(long, value_name = "LEVEL")]
         reasoning: Option<String>,
     },
-    /// Run YAML-based offline workflows (sequence, parallel, DAG).
+    /// Run cloud workflows: attach a template, watch it stream live, and control it.
+    /// All execution happens on the Strobes cloud; the CLI is a live client.
     Workflow {
         #[command(subcommand)]
         sub: WorkflowCmd,
@@ -312,65 +309,15 @@ enum Cmd {
 
 #[derive(Subcommand)]
 enum WorkflowCmd {
-    /// Run a YAML workflow file.
-    Run {
-        /// Path to the workflow YAML file.
-        file: String,
-        /// Override a workflow variable (KEY=VALUE). Repeatable.
-        #[arg(long, short = 'v', value_name = "KEY=VALUE")]
-        var: Vec<String>,
-        /// Print events to stdout instead of opening the TUI.
-        #[arg(long)]
-        no_tui: bool,
-        /// Do not prompt for missing variables; fail if any are unset (CI-safe).
-        #[arg(long)]
-        non_interactive: bool,
-        /// Load workflow variables from a JSON file ({"KEY": "VALUE"} map).
-        #[arg(long, value_name = "FILE")]
-        var_file: Option<String>,
-        /// Abort after this many seconds if the workflow has not finished.
-        #[arg(long, value_name = "SECS")]
-        timeout: Option<u64>,
-        /// Exit 1 if any findings at or above this severity exist after the
-        /// workflow completes (critical, high, medium, low).
-        #[arg(long, value_name = "SEVERITY")]
-        fail_on_findings: Option<String>,
-    },
-    /// List workflow YAML files (.yaml/.yml with phases:) in the current directory.
-    List,
-    /// Write a starter workflow template (defaults to stdout).
-    Init {
-        /// Write to this file instead of stdout.
-        #[arg(long, short)]
-        output: Option<String>,
-    },
-    /// Show history of locally recorded workflow runs.
-    History,
-    /// Resume a previously interrupted workflow run.
-    Resume {
-        /// Run ID shown by `strobes workflow history`.
-        id: String,
-        /// Print events to stdout instead of opening the TUI.
-        #[arg(long)]
-        no_tui: bool,
-    },
-    /// Manage remote workflows via the Strobes GraphQL API.
-    Remote {
-        #[command(subcommand)]
-        sub: RemoteWorkflowCmd,
-    },
-}
-
-#[derive(Subcommand)]
-enum RemoteWorkflowCmd {
-    /// List available workflow templates (built-in and custom:).
+    /// List available cloud workflow templates (built-in and custom:).
     Templates,
     /// Show the workflow currently attached to a workspace.
     Status {
         #[arg(long, short)]
         workspace: Option<String>,
     },
-    /// Attach a workflow template to a workspace and start it.
+    /// Attach a workflow template to a workspace, start it in the cloud, and
+    /// open the live streaming TUI (use --no-watch to just start it).
     Attach {
         #[arg(long, short)]
         workspace: Option<String>,
@@ -381,6 +328,9 @@ enum RemoteWorkflowCmd {
         /// Set a workflow variable (KEY=VALUE). Repeatable.
         #[arg(long, short = 'v', value_name = "KEY=VALUE")]
         var: Vec<String>,
+        /// Start the workflow but do not open the live TUI (CI-safe).
+        #[arg(long)]
+        no_watch: bool,
     },
     /// Detach (cancel + remove) the workflow from a workspace.
     Detach {
@@ -391,38 +341,7 @@ enum RemoteWorkflowCmd {
         #[arg(long, short = 'y')]
         yes: bool,
     },
-    /// Create a new remote workflow from a local YAML file.
-    Create {
-        #[arg(long, short)]
-        workspace: Option<String>,
-        /// Local workflow YAML file to push.
-        #[arg(long, short)]
-        file: String,
-        /// Override a workflow variable (KEY=VALUE). Repeatable.
-        #[arg(long, short = 'v', value_name = "KEY=VALUE")]
-        var: Vec<String>,
-    },
-    /// Edit the existing remote workflow from a local YAML file.
-    /// Not allowed while the workflow is running.
-    Edit {
-        #[arg(long, short)]
-        workspace: Option<String>,
-        /// Local workflow YAML file.
-        #[arg(long, short)]
-        file: String,
-    },
-    /// Smart sync: push a local YAML to remote — creates if none, edits if one exists.
-    Sync {
-        #[arg(long, short)]
-        workspace: Option<String>,
-        /// Local workflow YAML file.
-        #[arg(long, short)]
-        file: String,
-        /// Override a workflow variable (KEY=VALUE). Repeatable.
-        #[arg(long, short = 'v', value_name = "KEY=VALUE")]
-        var: Vec<String>,
-    },
-    /// Save the current remote workflow as a reusable custom template.
+    /// Save the current workflow as a reusable custom template.
     Save {
         #[arg(long, short)]
         workspace: Option<String>,
@@ -469,7 +388,7 @@ enum RemoteWorkflowCmd {
         #[arg(long, short)]
         workspace: Option<String>,
     },
-    /// Open a live TUI showing workflow phase status with pause/resume/detach controls.
+    /// Open the live streaming TUI for a workspace's workflow.
     Watch {
         #[arg(long, short)]
         workspace: Option<String>,
@@ -8481,488 +8400,11 @@ async fn fetch_workspaces_overlay(profile: &config::Profile) -> DeferResult {
 }
 
 async fn cmd_workflow(profile: config::Profile, sub: WorkflowCmd, tenant: &str) -> Result<()> {
-    match sub {
-        WorkflowCmd::Remote { sub } => return cmd_workflow_remote(profile, sub, tenant.to_string()).await,
-        WorkflowCmd::Run { file, var, no_tui, non_interactive, var_file, timeout, fail_on_findings } => {
-            require_complete(&profile)?;
-            let def = workflow::load(&file)?;
-            let abs_file = std::path::Path::new(&file)
-                .canonicalize()
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_else(|_| file.clone());
-
-            // Vars from --var-file (JSON map) are loaded first (lowest priority).
-            let mut file_vars: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-            if let Some(ref vf) = var_file {
-                let raw = std::fs::read_to_string(vf)
-                    .map_err(|e| anyhow!("cannot read var-file '{vf}': {e}"))?;
-                let map: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&raw)
-                    .map_err(|e| anyhow!("var-file '{vf}' must be a JSON object: {e}"))?;
-                for (k, v) in map {
-                    file_vars.insert(k, v.as_str().unwrap_or_default().to_string());
-                }
-            }
-
-            // Vars explicitly set via -v flags take priority over var-file.
-            let cli_vars: std::collections::HashMap<String, String> = var
-                .iter()
-                .filter_map(|kv| {
-                    let mut it = kv.splitn(2, '=');
-                    Some((it.next()?.to_string(), it.next()?.to_string()))
-                })
-                .collect();
-
-            // Merge: file_vars < cli_vars
-            let mut extra_vars = file_vars;
-            extra_vars.extend(cli_vars);
-
-            // Print a brief workflow summary.
-            let total_tasks: usize = def.phases.iter().map(|p| p.tasks.len()).sum();
-            println!(
-                "\n  Workflow : {}\n  Phases   : {}  |  Tasks: {}",
-                def.name,
-                def.phases.len(),
-                total_tasks,
-            );
-            if !def.description.is_empty() {
-                println!("  {}", def.description);
-            }
-
-            if !def.variables.is_empty() {
-                let mut keys: Vec<&String> = def.variables.keys().collect();
-                keys.sort();
-                let all_provided = keys.iter().all(|k| extra_vars.contains_key(*k));
-                if !all_provided && !non_interactive {
-                    println!("\n  Variables (Enter to keep default):");
-                }
-                for k in keys {
-                    if extra_vars.contains_key(k) {
-                        println!("  {k} = {}", extra_vars[k]);
-                        continue;
-                    }
-                    let default = &def.variables[k];
-                    if non_interactive {
-                        // Every variable declared under `variables:` already carries a
-                        // default in the YAML itself — there is no schema for a
-                        // variable with no fallback at all. --non-interactive uses that
-                        // default silently, exactly as pressing Enter would
-                        // interactively, instead of demanding it be re-supplied via -v.
-                        println!("  {k} = {default} (default)");
-                        extra_vars.insert(k.clone(), default.clone());
-                        continue;
-                    }
-                    let secret = ["key", "secret", "token", "password", "pass", "credential"]
-                        .iter()
-                        .any(|s| k.to_lowercase().contains(s));
-                    let val = prompt_line(&format!("  {k}"), default, secret)?;
-                    extra_vars.insert(k.clone(), val);
-                }
-            }
-            println!();
-
-            let (ev_tx, ev_rx) =
-                mpsc::unbounded_channel::<workflow_runner::WfEvent>();
-
-            if no_tui {
-                // Headless: print events to stdout.
-                let ev_tx2 = ev_tx.clone();
-                let def2 = def.clone();
-                let profile2 = profile.clone();
-                let extra2 = extra_vars.clone();
-                let abs_file2 = abs_file.clone();
-                let runner = tokio::spawn(async move {
-                    if let Err(e) =
-                        workflow_runner::run(def2, profile2, ev_tx2.clone(), extra2, None, abs_file2).await
-                    {
-                        let _ = ev_tx2.send(workflow_runner::WfEvent::WorkflowFailed {
-                            reason: e.to_string(),
-                        });
-                    }
-                });
-                let mut rx = ev_rx;
-                let mut failed = false;
-                let mut any_tasks_failed = false;
-                let mut run_workspace_id: Option<String> = None;
-                let deadline = timeout.map(|s| tokio::time::Instant::now() + std::time::Duration::from_secs(s));
-                loop {
-                    let ev_opt = if let Some(dl) = deadline {
-                        tokio::select! {
-                            _ = tokio::time::sleep_until(dl) => {
-                                runner.abort();
-                                eprintln!("error: workflow timed out after {}s", timeout.unwrap_or(0));
-                                return Err(anyhow!("workflow timed out after {}s", timeout.unwrap_or(0)));
-                            }
-                            ev = rx.recv() => ev,
-                        }
-                    } else {
-                        rx.recv().await
-                    };
-                    let ev = match ev_opt {
-                        None => break,
-                        Some(e) => e,
-                    };
-                    use workflow_runner::WfEvent::*;
-                    match &ev {
-                        Log(m) => println!("{m}"),
-                        WorkspaceReady { id, name } => {
-                            run_workspace_id = Some(id.clone());
-                            println!("workspace: {name} [{id}]");
-                        }
-                        SetupStarted { thread_id } => {
-                            println!("▶ workspace-setup ({}…)", &thread_id[..8.min(thread_id.len())])
-                        }
-                        PhaseStarted { phase } => println!("▶ phase: {phase}"),
-                        TaskStarted { task, thread_id, .. } => {
-                            println!("▶ {task} ({}…)", &thread_id[..8.min(thread_id.len())])
-                        }
-                        TaskOutput { task, text } => print!("[{task}] {text}"),
-                        TaskDone { task } => println!("✔ {task}"),
-                        TaskFailed { task, reason } => {
-                            println!("✗ {task}: {reason}");
-                            any_tasks_failed = true;
-                        }
-                        TaskSkipped { task } => println!("↷ {task} (skipped)"),
-                        // WorkflowDone/WorkflowFailed are terminal — nothing else will
-                        // ever arrive on this channel. Without breaking here, the loop
-                        // falls back into rx.recv() waiting for a channel that never
-                        // naturally closes (the outer `ev_tx` handle this fn holds
-                        // keeps it open), so a run with no --timeout would hang
-                        // forever after completing, and one WITH --timeout would
-                        // eventually report a successful run as a false timeout.
-                        WorkflowDone => {
-                            println!("✔ workflow complete");
-                            break;
-                        }
-                        WorkflowFailed { reason } => {
-                            println!("✗ workflow failed: {reason}");
-                            failed = true;
-                            break;
-                        }
-                    }
-                }
-                let _ = runner.await;
-                if failed {
-                    return Err(anyhow!("workflow failed"));
-                }
-                if any_tasks_failed {
-                    return Err(anyhow!("one or more workflow tasks failed"));
-                }
-                // --fail-on-findings check after successful workflow completion.
-                if let (Some(threshold), Some(ws)) = (&fail_on_findings, &run_workspace_id) {
-                    let client = api::ApiClient::new(profile.clone())?;
-                    let threshold_level = severity_level(threshold);
-                    let findings = client.list_workspace_findings(ws).await.unwrap_or_default();
-                    let matching: Vec<_> = findings.iter()
-                        .filter(|f| severity_level(&f.severity_label) >= threshold_level)
-                        .collect();
-                    if !matching.is_empty() {
-                        eprintln!("findings: {} finding(s) at or above '{threshold}' severity", matching.len());
-                        for f in &matching {
-                            eprintln!("  [{}] {}", f.severity_label, f.title);
-                        }
-                        return Err(anyhow!("{} finding(s) at or above '{}' severity — failing build", matching.len(), threshold));
-                    }
-                }
-            } else {
-                // TUI mode — one terminal instance shared with any drill-down chat views.
-                let ev_tx2 = ev_tx.clone();
-                let def2 = def.clone();
-                let profile2 = profile.clone();
-                let extra2 = extra_vars.clone();
-                let abs_file3 = abs_file.clone();
-                tokio::spawn(async move {
-                    if let Err(e) =
-                        workflow_runner::run(def2, profile2, ev_tx2.clone(), extra2, None, abs_file3).await
-                    {
-                        let _ = ev_tx2.send(workflow_runner::WfEvent::WorkflowFailed {
-                            reason: e.to_string(),
-                        });
-                    }
-                });
-                let mut terminal = ratatui::init();
-                enable_mouse();
-                let r = workflow_tui::run_tui(
-                    &mut terminal,
-                    def,
-                    ev_rx,
-                    profile.clone(),
-                    tenant.to_string(),
-                )
-                .await;
-                disable_mouse();
-                ratatui::restore();
-                r?;
-            }
-            Ok(())
-        }
-        WorkflowCmd::List => {
-            let files = workflow::list_workflows(".");
-            if files.is_empty() {
-                println!(
-                    "no workflow files (.yaml/.yml with 'phases:') found in current directory"
-                );
-            } else {
-                for f in &files {
-                    println!("{f}");
-                }
-                println!("\n{} file(s) found", files.len());
-            }
-            Ok(())
-        }
-        WorkflowCmd::Init { output } => {
-            let tpl = workflow::starter_template();
-            match output {
-                Some(path) => {
-                    std::fs::write(&path, tpl)?;
-                    println!("✔ wrote {path}");
-                    println!("edit the file, then run: strobes workflow run {path}");
-                }
-                None => print!("{tpl}"),
-            }
-            Ok(())
-        }
-
-        WorkflowCmd::History => {
-            let runs = workflow_state::list_runs();
-            if runs.is_empty() {
-                println!("No workflow runs recorded yet.");
-                println!("Runs are saved in: {}", workflow_state::runs_dir().display());
-                return Ok(());
-            }
-            println!(
-                "\n{:<38}  {:<26}  {:<10}  {:<6}  {}",
-                "RUN ID", "WORKFLOW", "STATUS", "DONE", "STARTED"
-            );
-            println!("{}", "─".repeat(96));
-            for r in &runs {
-                let done = format!("{}/{}", r.done_count(), r.total_tasks());
-                let name_trunc = if r.workflow_name.len() > 26 {
-                    format!("{}…", &r.workflow_name[..25])
-                } else {
-                    r.workflow_name.clone()
-                };
-                let started = r
-                    .started_at
-                    .trim_end_matches('Z')
-                    .replacen('T', " ", 1);
-                let started = &started[..started.len().min(19)];
-                println!(
-                    "{:<38}  {:<26}  {:<10}  {:<6}  {}",
-                    r.id, name_trunc, r.status.label(), done, started
-                );
-            }
-            println!();
-            Ok(())
-        }
-
-        WorkflowCmd::Resume { id, no_tui } => {
-            require_complete(&profile)?;
-            let resume_record = workflow_state::load(&id)?;
-
-            // Validate we can still load the workflow file.
-            let def = workflow::load(&resume_record.workflow_file).map_err(|e| {
-                anyhow!(
-                    "cannot reload workflow file '{}': {e}\n\
-                     (if the file moved, update 'workflow_file' in {})",
-                    resume_record.workflow_file,
-                    workflow_state::runs_dir().join(format!("{id}.json")).display()
-                )
-            })?;
-
-            let vars = resume_record.vars.clone();
-
-            println!("\n  Resuming : {}", resume_record.workflow_name);
-            println!("  Run ID   : {id}");
-            println!(
-                "  Progress : {}/{} tasks done",
-                resume_record.done_count(),
-                resume_record.total_tasks()
-            );
-            println!();
-
-            let (ev_tx, ev_rx) = mpsc::unbounded_channel::<workflow_runner::WfEvent>();
-
-            if no_tui {
-                let ev_tx2 = ev_tx.clone();
-                let def2 = def.clone();
-                let profile2 = profile.clone();
-                let resume2 = Some(resume_record);
-                let wf_file = String::new(); // unused — taken from resume record
-                let runner = tokio::spawn(async move {
-                    if let Err(e) = workflow_runner::run(
-                        def2, profile2, ev_tx2.clone(), vars, resume2, wf_file,
-                    )
-                    .await
-                    {
-                        let _ = ev_tx2.send(workflow_runner::WfEvent::WorkflowFailed {
-                            reason: e.to_string(),
-                        });
-                    }
-                });
-                let mut rx = ev_rx;
-                let mut failed = false;
-                while let Some(ev) = rx.recv().await {
-                    use workflow_runner::WfEvent::*;
-                    match &ev {
-                        Log(m) => println!("{m}"),
-                        WorkspaceReady { id, name } => println!("workspace: {name} [{id}]"),
-                        SetupStarted { thread_id } => println!(
-                            "▶ workspace-setup ({}…)",
-                            &thread_id[..8.min(thread_id.len())]
-                        ),
-                        PhaseStarted { phase } => println!("▶ phase: {phase}"),
-                        TaskStarted { task, thread_id, .. } => println!(
-                            "▶ {task} ({}…)",
-                            &thread_id[..8.min(thread_id.len())]
-                        ),
-                        TaskOutput { task, text } => println!("[{task}] {text}"),
-                        TaskDone { task } => println!("✔ {task}"),
-                        TaskFailed { task, reason } => println!("✗ {task}: {reason}"),
-                        TaskSkipped { task } => println!("↷ {task} (skipped)"),
-                        // See the matching comment in `workflow run`'s --no-tui loop —
-                        // without breaking here this hangs forever after completion,
-                        // since nothing else ever closes the channel.
-                        WorkflowDone => {
-                            println!("✔ workflow complete");
-                            break;
-                        }
-                        WorkflowFailed { reason } => {
-                            println!("✗ workflow failed: {reason}");
-                            failed = true;
-                            break;
-                        }
-                    }
-                }
-                let _ = runner.await;
-                if failed {
-                    return Err(anyhow!("workflow failed"));
-                }
-            } else {
-                let ev_tx2 = ev_tx.clone();
-                let def2 = def.clone();
-                let profile2 = profile.clone();
-                let resume2 = Some(resume_record);
-                let wf_file = String::new(); // unused — taken from resume record
-                tokio::spawn(async move {
-                    if let Err(e) = workflow_runner::run(
-                        def2, profile2, ev_tx2.clone(), vars, resume2, wf_file,
-                    )
-                    .await
-                    {
-                        let _ = ev_tx2.send(workflow_runner::WfEvent::WorkflowFailed {
-                            reason: e.to_string(),
-                        });
-                    }
-                });
-                let mut terminal = ratatui::init();
-                enable_mouse();
-                let r = workflow_tui::run_tui(
-                    &mut terminal,
-                    def,
-                    ev_rx,
-                    profile.clone(),
-                    tenant.to_string(),
-                )
-                .await;
-                disable_mouse();
-                ratatui::restore();
-                r?;
-            }
-            Ok(())
-        }
-    }
-}
-
-// ── Remote workflow management (GraphQL API) ─────────────────────────────────
-
-fn resolve_workspace(w: Option<String>, profile: &config::Profile) -> Result<String> {
-    w.or_else(|| profile.workspace_id.clone())
-        .ok_or_else(|| anyhow!("no workspace — pass --workspace <UUID> or run `strobes bind` first"))
-}
-
-/// Like `resolve_workspace` but shows a workspace picker when no workspace is bound.
-/// Returns `None` if the user cancels the picker.
-async fn resolve_workspace_or_pick(
-    workspace: Option<String>,
-    profile: &config::Profile,
-    client: &api::ApiClient,
-) -> Result<Option<String>> {
-    if let Some(w) = workspace.or_else(|| profile.workspace_id.clone()) {
-        return Ok(Some(w));
-    }
-    let workspaces = client.list_workspaces().await?;
-    if workspaces.is_empty() {
-        return Err(anyhow!("no workspaces found — create one with `strobes bind`"));
-    }
-    let labels: Vec<String> = workspaces
-        .iter()
-        .map(|w| format!("{}…  {}", &w.id[..8.min(w.id.len())], w.name))
-        .collect();
-    match picker::select("Select workspace", &labels).await? {
-        picker::Nav::Item(i) => Ok(Some(workspaces[i].id.clone())),
-        _ => Ok(None),
-    }
-}
-
-/// Convert a kebab-case / lower-case name to Title Case words.
-fn title_case(s: &str) -> String {
-    s.replace('-', " ")
-        .replace('_', " ")
-        .split_whitespace()
-        .map(|w| {
-            let mut c = w.chars();
-            match c.next() {
-                None => String::new(),
-                Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-/// Serialise `Vec<PhaseDef>` from a workflow YAML into a GraphQL input literal
-/// suitable for `createCustomWorkflow` / `editCustomWorkflow`.
-fn phases_to_json(phases: &[workflow::PhaseDef]) -> serde_json::Value {
-    let arr: Vec<serde_json::Value> = phases
-        .iter()
-        .enumerate()
-        .map(|(i, phase)| {
-            let tasks: Vec<serde_json::Value> = phase
-                .tasks
-                .iter()
-                .map(|task| {
-                    serde_json::json!({
-                        "key": task.name,
-                        "title": title_case(&task.name),
-                        "instructions": task.prompt,
-                        "agentType": "general",
-                        "taskType": "agent",
-                    })
-                })
-                .collect();
-            serde_json::json!({
-                "key": phase.name,
-                "name": title_case(&phase.name),
-                "order": i,
-                "gateType": "all_complete",
-                "failurePolicy": "continue",
-                "tasks": tasks,
-            })
-        })
-        .collect();
-    serde_json::Value::Array(arr)
-}
-
-async fn cmd_workflow_remote(
-    profile: config::Profile,
-    sub: RemoteWorkflowCmd,
-    tenant: String,
-) -> Result<()> {
     require_complete(&profile)?;
     let client = api::ApiClient::new(profile.clone())?;
 
     match sub {
-        RemoteWorkflowCmd::Templates => {
+        WorkflowCmd::Templates => {
             let templates = client.workflow_templates().await?;
             if templates.is_empty() {
                 println!("(no templates available)");
@@ -8992,7 +8434,7 @@ async fn cmd_workflow_remote(
             }
         }
 
-        RemoteWorkflowCmd::Status { workspace } => {
+        WorkflowCmd::Status { workspace } => {
             let ws = match resolve_workspace_or_pick(workspace, &profile, &client).await? {
                 Some(w) => w,
                 None => return Ok(()),
@@ -9029,7 +8471,7 @@ async fn cmd_workflow_remote(
             }
         }
 
-        RemoteWorkflowCmd::Attach { workspace, template, var } => {
+        WorkflowCmd::Attach { workspace, template, var, no_watch } => {
             // For attach, always show the workspace picker when --workspace is not
             // given explicitly — defaulting silently to the bound workspace would
             // attach to the wrong place without the user realising.
@@ -9126,9 +8568,20 @@ async fn cmd_workflow_remote(
             let wf = client.attach_workflow_template(&ws, &slug, &variables).await?;
             println!("✔ attached '{slug}' to workspace {}…", &ws[..8.min(ws.len())]);
             println!("  workflow {} [{}]", wf.workflow_id, wf.status);
+
+            // Execution runs entirely in the cloud; open the live streaming TUI
+            // unless the caller opted out (e.g. CI).
+            if !no_watch {
+                let mut terminal = ratatui::init();
+                enable_mouse();
+                let r = remote_wf_tui::run(&mut terminal, &client, ws, profile.clone(), tenant.to_string()).await;
+                disable_mouse();
+                ratatui::restore();
+                r?;
+            }
         }
 
-        RemoteWorkflowCmd::Detach { workspace, yes } => {
+        WorkflowCmd::Detach { workspace, yes } => {
             let ws = match resolve_workspace_or_pick(workspace, &profile, &client).await? {
                 Some(w) => w,
                 None => return Ok(()),
@@ -9151,97 +8604,7 @@ async fn cmd_workflow_remote(
             println!("✔ workflow detached");
         }
 
-        RemoteWorkflowCmd::Create { workspace, file, var } => {
-            let ws = match resolve_workspace_or_pick(workspace, &profile, &client).await? {
-                Some(w) => w,
-                None => return Ok(()),
-            };
-            let def = workflow::load(&file)?;
-            let phases_json = phases_to_json(&def.phases);
-            let mut vars: serde_json::Map<String, serde_json::Value> = def
-                .variables
-                .iter()
-                .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
-                .collect();
-            for kv in &var {
-                let mut it = kv.splitn(2, '=');
-                if let (Some(k), Some(v)) = (it.next(), it.next()) {
-                    vars.insert(k.to_string(), serde_json::Value::String(v.to_string()));
-                }
-            }
-            let vars_json = serde_json::Value::Object(vars);
-            let wf = client
-                .create_custom_workflow(&ws, &def.name, &phases_json, &vars_json)
-                .await?;
-            let total_tasks: usize = def.phases.iter().map(|p| p.tasks.len()).sum();
-            println!("✔ workflow created: {} [{}]", wf.workflow_id, wf.status);
-            println!(
-                "  {} phases, {total_tasks} tasks from '{file}'",
-                def.phases.len()
-            );
-        }
-
-        RemoteWorkflowCmd::Edit { workspace, file } => {
-            let ws = match resolve_workspace_or_pick(workspace, &profile, &client).await? {
-                Some(w) => w,
-                None => return Ok(()),
-            };
-            let def = workflow::load(&file)?;
-            let phases_json = phases_to_json(&def.phases);
-            let wf = client
-                .edit_custom_workflow(&ws, &def.name, &phases_json)
-                .await?;
-            println!("✔ workflow updated: {} [{}]", wf.workflow_id, wf.status);
-        }
-
-        RemoteWorkflowCmd::Sync { workspace, file, var } => {
-            let ws = match resolve_workspace_or_pick(workspace, &profile, &client).await? {
-                Some(w) => w,
-                None => return Ok(()),
-            };
-            let def = workflow::load(&file)?;
-            let phases_json = phases_to_json(&def.phases);
-            let mut vars: serde_json::Map<String, serde_json::Value> = def
-                .variables
-                .iter()
-                .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
-                .collect();
-            for kv in &var {
-                let mut it = kv.splitn(2, '=');
-                if let (Some(k), Some(v)) = (it.next(), it.next()) {
-                    vars.insert(k.to_string(), serde_json::Value::String(v.to_string()));
-                }
-            }
-            let vars_json = serde_json::Value::Object(vars);
-            match client.workspace_workflow(&ws).await? {
-                None => {
-                    let wf = client
-                        .create_custom_workflow(&ws, &def.name, &phases_json, &vars_json)
-                        .await?;
-                    println!(
-                        "✔ created workflow from '{file}': {} [{}]",
-                        wf.workflow_id, wf.status
-                    );
-                }
-                Some(wf) if wf.status == "running" => {
-                    return Err(anyhow!(
-                        "workflow {} is currently running — cancel it first before syncing",
-                        wf.workflow_id
-                    ));
-                }
-                Some(existing) => {
-                    let updated = client
-                        .edit_custom_workflow(&ws, &def.name, &phases_json)
-                        .await?;
-                    println!(
-                        "✔ updated workflow {} from '{file}' [{} → {}]",
-                        updated.workflow_id, existing.status, updated.status
-                    );
-                }
-            }
-        }
-
-        RemoteWorkflowCmd::Save { workspace, name, description, icon } => {
+        WorkflowCmd::Save { workspace, name, description, icon } => {
             let ws = match resolve_workspace_or_pick(workspace, &profile, &client).await? {
                 Some(w) => w,
                 None => return Ok(()),
@@ -9255,10 +8618,10 @@ async fn cmd_workflow_remote(
                 )
                 .await?;
             println!("✔ saved as template '{slug}'");
-            println!("  use with: strobes workflow remote attach --template {slug}");
+            println!("  use with: strobes workflow attach --template {slug}");
         }
 
-        RemoteWorkflowCmd::DeleteTemplate { slug } => {
+        WorkflowCmd::DeleteTemplate { slug } => {
             if !slug.starts_with("custom:") {
                 return Err(anyhow!(
                     "only custom: templates can be deleted (got '{slug}')"
@@ -9277,7 +8640,7 @@ async fn cmd_workflow_remote(
             println!("✔ deleted template '{slug}'");
         }
 
-        RemoteWorkflowCmd::Pause { workspace } => {
+        WorkflowCmd::Pause { workspace } => {
             let ws = match resolve_workspace_or_pick(workspace, &profile, &client).await? {
                 Some(w) => w,
                 None => return Ok(()),
@@ -9285,7 +8648,7 @@ async fn cmd_workflow_remote(
             client.pause_workflow(&ws).await?;
             println!("✔ workflow paused");
         }
-        RemoteWorkflowCmd::Resume { workspace } => {
+        WorkflowCmd::Resume { workspace } => {
             let ws = match resolve_workspace_or_pick(workspace, &profile, &client).await? {
                 Some(w) => w,
                 None => return Ok(()),
@@ -9293,7 +8656,7 @@ async fn cmd_workflow_remote(
             client.resume_workflow(&ws).await?;
             println!("✔ workflow resumed");
         }
-        RemoteWorkflowCmd::Cancel { workspace } => {
+        WorkflowCmd::Cancel { workspace } => {
             let ws = match resolve_workspace_or_pick(workspace, &profile, &client).await? {
                 Some(w) => w,
                 None => return Ok(()),
@@ -9301,7 +8664,7 @@ async fn cmd_workflow_remote(
             client.cancel_workflow(&ws).await?;
             println!("✔ workflow cancelled");
         }
-        RemoteWorkflowCmd::Restart { workspace, from_phase } => {
+        WorkflowCmd::Restart { workspace, from_phase } => {
             let ws = match resolve_workspace_or_pick(workspace, &profile, &client).await? {
                 Some(w) => w,
                 None => return Ok(()),
@@ -9317,7 +8680,7 @@ async fn cmd_workflow_remote(
                 }
             }
         }
-        RemoteWorkflowCmd::Advance { workspace } => {
+        WorkflowCmd::Advance { workspace } => {
             let ws = match resolve_workspace_or_pick(workspace, &profile, &client).await? {
                 Some(w) => w,
                 None => return Ok(()),
@@ -9325,7 +8688,7 @@ async fn cmd_workflow_remote(
             client.advance_workflow_phase(&ws).await?;
             println!("✔ phase advanced");
         }
-        RemoteWorkflowCmd::Watch { workspace } => {
+        WorkflowCmd::Watch { workspace } => {
             let ws = match resolve_workspace_or_pick(workspace, &profile, &client).await? {
                 Some(w) => w,
                 None => return Ok(()),
@@ -9340,6 +8703,29 @@ async fn cmd_workflow_remote(
     }
     Ok(())
 }
+
+async fn resolve_workspace_or_pick(
+    workspace: Option<String>,
+    profile: &config::Profile,
+    client: &api::ApiClient,
+) -> Result<Option<String>> {
+    if let Some(w) = workspace.or_else(|| profile.workspace_id.clone()) {
+        return Ok(Some(w));
+    }
+    let workspaces = client.list_workspaces().await?;
+    if workspaces.is_empty() {
+        return Err(anyhow!("no workspaces found — create one with `strobes bind`"));
+    }
+    let labels: Vec<String> = workspaces
+        .iter()
+        .map(|w| format!("{}…  {}", &w.id[..8.min(w.id.len())], w.name))
+        .collect();
+    match picker::select("Select workspace", &labels).await? {
+        picker::Nav::Item(i) => Ok(Some(workspaces[i].id.clone())),
+        _ => Ok(None),
+    }
+}
+
 
 #[cfg(test)]
 mod tests {
