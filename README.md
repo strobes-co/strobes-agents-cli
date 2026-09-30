@@ -114,6 +114,26 @@ These persist to `~/.config/strobes-ai/config.json`
 > The API path prefix defaults to `/api/v1` (nginx/ALB-fronted deployments).
 > Only if you hit Django directly (no proxy) set `STROBES_AI_DEPLOYMENT=direct`.
 
+Or configure interactively (prompts for anything you don't pass as a flag):
+
+```bash
+strobes login                                   # interactive
+strobes login --base-url https://app.strobes.co --org-id <ORG_UUID> --master-key <KEY>
+strobes tenants                                 # list configured tenants (default marked ★)
+strobes --tenant acme status                    # use another tenant for one run (alias: --profile)
+```
+
+| `login` flag | Description |
+|--------------|-------------|
+| `--base-url <URL>` | Deployment base URL, e.g. `https://app.strobes.co` |
+| `--org-id <UUID>` | Organization UUID |
+| `--master-key <KEY>` | 40-char MasterKey |
+| `--deployment <STYLE>` | Path style: blank/`proxy` = `/api/v1`, `direct` = bare `/v1` |
+| `--analyzer-registry-url <URL>` | Analyzer-registry ("maze") base URL, required for `strobes cicd` (env: `STROBES_AI_ANALYZER_REGISTRY_URL`) |
+| `--no-verify` | Skip the post-save connectivity check |
+
+`--tenant <NAME>` (alias `--profile`) is a **global** flag accepted by every command.
+
 ---
 
 ## `strobes ci` — Security Scanning Suite
@@ -121,6 +141,10 @@ These persist to `~/.config/strobes-ai/config.json`
 <p align="center">
   <img src="assets/ci-pipeline.png" alt="CI scanning pipeline" width="800"/>
 </p>
+
+> `strobes ci` is the **agent-driven** scanner (LLM-based). It is hidden from
+> `strobes --help` but fully supported. For deterministic, containerized
+> scanners with no LLM call by default, see [`strobes cicd`](#strobes-cicd--containerized-analyzer-scanning).
 
 `strobes ci` is a self-contained security scanning engine built into the CLI.
 It runs five scan types — source code, dependencies, container images,
@@ -135,6 +159,15 @@ strobes ci container nginx:1.24            # Docker image CVE scan
 strobes ci iac ./infra                     # IaC misconfiguration scan
 strobes ci dast https://staging.myapp.com  # live web app testing
 ```
+
+**Flags shared by every `strobes ci` scan type** (in addition to the per-type
+tables below):
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-w / --workspace <UUID>` | new workspace | Attach to an existing workspace by ID |
+| `-m / --model <ID>` | org default | LLM model picker id (see [model ids](#interactive-chat-strobes-chat)) |
+| `--reasoning <LEVEL>` | — | Reasoning depth: `low`, `medium`, `high`, `xhigh`, `max` (persists on the thread) |
 
 ### `strobes ci sast` — Static Application Security Testing
 
@@ -204,7 +237,7 @@ strobes ci sca . --fail-on high
 ### `strobes ci container` — Docker Image Scanning
 
 Pulls the image, creates a temporary container to extract the OS package
-database (dpkg/apk) and any app-level manifests, queries OSV.dev for CVEs,
+database (dpkg/apk/rpm) and any app-level manifests, queries OSV.dev for CVEs,
 then uses AI reachability analysis. **Requires Docker.**
 
 ```bash
@@ -215,7 +248,7 @@ strobes ci container ubuntu:20.04 --output sarif -o container.sarif
 strobes ci container myapp:latest --platform linux/amd64
 ```
 
-**Supported base images:** Debian/Ubuntu (dpkg), Alpine (apk), plus any
+**Supported base images:** Debian/Ubuntu (dpkg), Alpine (apk), RPM-based (rpm), plus any
 app-level language manifests found on the image filesystem.
 
 | Flag | Default | Description |
@@ -348,10 +381,64 @@ jobs:
 
 ---
 
+## `strobes cicd` — Containerized Analyzer Scanning
+
+`strobes cicd` runs Strobes' own scanner images (pulled from your tenant's
+analyzer registry) directly — **no LLM call by default**. Requires **Docker** and
+an analyzer registry URL (`strobes login --analyzer-registry-url <url>`).
+
+```bash
+strobes cicd sast .                              # opengrep-based SAST
+strobes cicd sca .                               # dependency scan (target must be a git repo)
+strobes cicd container nginx:1.24                # Trivy image scan
+strobes cicd iac ./infra                         # Checkov IaC scan
+strobes cicd dast https://staging.myapp.com --activescan   # OWASP ZAP
+```
+
+| Command | Analyzer | Notes |
+|---------|----------|-------|
+| `strobes cicd sast [dir]` | `strobessastanalyzer` | `dir` defaults to `.` |
+| `strobes cicd sca [dir]` | `analyzers/dependency` | Must be a git repository; a placeholder `origin` is added if missing |
+| `strobes cicd container <image>` | `analyzers/trivyanalyzer` | Image is pulled by Trivy itself; must be publicly reachable or already local |
+| `strobes cicd iac [dir]` | `analyzers/checkovanalyzer` | Warns explicitly when Checkov's single-framework output bug yields zero findings |
+| `strobes cicd dast <url>` | `analyzers/zapanalyzer` | Uses ZAP's bundled daemon |
+
+**DAST-only flags:**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--cookie <COOKIE>` | — | Cookie header value for all requests |
+| `--bearer <TOKEN>` | — | Bearer token for `Authorization` header |
+| `-m / --minutes <MINS>` | `1` | Minutes to let ZAP's spider crawl before scanning |
+| `--activescan` | — | Active scan (slower, more thorough) instead of passive only |
+| `--ajaxspider` | — | Crawl with ZAP's AJAX spider (JS-heavy SPAs) |
+
+**Flags common to every `cicd` scan type:**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--output <FORMAT>` | `text` | `text`, `json`, `sarif`, `csv`, `html` |
+| `-o / --output-file <FILE>` | — | Save results to a file |
+| `--fail-on <SEVERITY>` | — | Exit 1 if any finding ≥ severity |
+| `--tag <TAG>` | `latest` | Analyzer image tag to pull |
+| `--cred-duration <SECS>` | `900` | Validity of the minted ECR pull credentials (auto-extended for slow steps) |
+| `--no-submit` | — | Don't submit findings to the platform (submission is on by default for sast/sca) |
+| `--asset-ref <REF>` | auto | Asset identity for submission: repo URL (sast/sca, auto-detected from `git remote get-url origin`) or image ref (container) |
+| `--strict-ingest` | — | Exit non-zero if the platform doesn't verifiably ingest submitted findings (default: warn) |
+| `--verify-timeout <SECS>` | `90` | How long to wait for platform ingestion |
+| `--ai-triage` | — | Opt-in second pass: send findings to an AI agent for reachability triage |
+| `-w / --workspace <UUID>` | — | Workspace for the AI-triage step (with `--ai-triage`) |
+| `-m / --model <ID>` | — | Model id for AI triage (with `--ai-triage`) |
+| `--reasoning <LEVEL>` | — | Reasoning depth for AI triage |
+| `--ai-timeout <SECS>` | `600` | Abort the AI-triage step after this long |
+
+---
+
 ## Interactive Chat (`strobes chat`)
 
 Opens a full terminal UI that streams a remote agent run and executes
-its tools (shell, code, browser) on your local machine.
+its tools (shell, code, browser) on your local machine. `strobes` with no
+subcommand is the same as `strobes chat`.
 
 ```bash
 strobes status                  # check connectivity
@@ -359,13 +446,29 @@ strobes workspaces              # list remote workspaces
 strobes threads                 # list your threads
 strobes chat                    # interactive chat (thread picker)
 strobes chat --thread <UUID> --model 18    # resume a thread (Sonnet 4.6)
+strobes chat -w <UUID> --reasoning high    # bind a workspace, set reasoning depth
+strobes chat --new              # force the thread picker / new thread
 strobes bind --download         # pick + download a workspace locally
 strobes pull --workspace <UUID> # download workspace files to a folder
+strobes push a.txt b.txt -w <UUID> --dir inputs/   # upload local files to a workspace
 strobes export -w <UUID>        # export thread transcripts (Markdown + index.md)
 strobes export -w <UUID> --format json --dir out/   # raw event JSON
+strobes credits                 # AI credit usage (org total + per-workspace)
 strobes update                  # self-update to the latest release
 strobes --version               # print the version
 ```
+
+| Command | Flags |
+|---------|-------|
+| `chat` | `-t/--thread <UUID>` · `-w/--workspace <UUID>` · `-m/--model <ID>` · `--reasoning <LEVEL>` (`low`/`medium`/`high`/`xhigh`/`max`) · `--new` |
+| `bind` | `-w/--workspace <UUID>` · `--new` (create a workspace) · `--name <NAME>` (default `CLI Workspace`) · `--download` · `--dir <PATH>` |
+| `pull` | `-w/--workspace <UUID>` · `--dir <PATH>` |
+| `push <FILES…>` | `-w/--workspace <UUID>` · `--dir <PREFIX>` (destination dir inside the workspace; default: file name at root) |
+| `export` | `-w/--workspace <UUID>` · `-t/--thread <UUID>` (single thread) · `--dir <PATH>` (default `./strobes-transcripts-<workspace>`) · `--format md\|json` (default `md`) · `--messages-only` (Markdown: omit tool calls, tool output, thinking, task markers) |
+| `credits` | `-w/--workspace <UUID>` · `-t/--thread <UUID>` |
+| `update` | `--force` (reinstall even if already latest) |
+| `pack` | `--install` · `--url <URL>` |
+| `probe` | `-t/--thread <UUID>` (required) · `--send <PROMPT>` · `--secs <N>` (default `200`) · `-m/--model <ID>` · `--reasoning <LEVEL>` — headless WS + local-tool check without the TUI |
 
 ### In-chat keys
 
@@ -394,14 +497,52 @@ or set `STROBES_AI_BROWSER_AUTOINSTALL=1` to download Chrome for Testing on firs
 **Browser isolation:** parallel agents each get their own CDP tab within a
 shared Chrome process per workspace.
 
-**Model picker ids:** `4` Haiku 4.5 · `18` Sonnet 4.6 · `21` Opus 4.7
-(Bedrock), or your org's BYOM id.
+**Model picker ids:** `0` org default · `4` Haiku 4.5 · `10` Sonnet 4.5 ·
+`18` Sonnet 4.6 · `11` Opus 4.5 · `14` Opus 4.6 · `21` Opus 4.7 · `24` Opus 4.8
+(Bedrock), plus non-Anthropic built-ins (Nova, DeepSeek, MiniMax, Kimi, GLM, GPT)
+— the in-app picker lists them all — or your org's BYOM id.
 
 ### Credits & tokens
 
 The status bar shows **AI credits + token usage**: the current run's usage
 while streaming (`◈ 0.036 cr · 1.8k tok`), and the session total (`◈ Σ …`)
 once idle.
+
+---
+
+## Scripting: `strobes send` and `strobes findings`
+
+`send` creates a thread, sends one message, streams the response to stdout and
+exits — handy for scripts and orchestrator prompts. `findings` lists or exports a
+workspace's findings for CI gating.
+
+```bash
+strobes send "Review this repo for auth flaws" --new-workspace "Auth review" --non-interactive
+strobes send "Triage open findings" -w <UUID> --output json --timeout 900 --fail-on-findings high
+strobes send "Review PR" --agent pr_security_review_agent --sandbox-id pr-123
+strobes findings -w <UUID> --format sarif --fail-on high
+```
+
+| `send` flag | Default | Description |
+|-------------|---------|-------------|
+| `<MESSAGE>` | — | Full prompt text (required) |
+| `-w / --workspace <ID>` | — | Attach the thread to an existing workspace |
+| `--new-workspace <NAME>` | — | Create a workspace with this name and attach the thread |
+| `-t / --title <TITLE>` | first 60 chars of message | Thread title |
+| `-m / --model <ID>` | org default | LLM model picker id |
+| `--reasoning <LEVEL>` | — | `low`, `medium`, `high`, `xhigh`, `max` |
+| `--output <FORMAT>` | `text` | `text` or `json` |
+| `--non-interactive` | — | Fail instead of prompting on human-input interrupts (CI-safe) |
+| `--timeout <SECS>` | — | Abort if the agent hasn't finished |
+| `--fail-on-findings <SEVERITY>` | — | Exit 1 if findings ≥ severity exist after the run |
+| `--sandbox-id <ID>` | — | Pre-populate the local sandbox at `~/.strobes-ai/sandboxes/<ID>/` (copy your code there first) |
+| `--agent <AGENT_ID>` | — | Select a specific system agent (e.g. `pr_security_review_agent`) |
+
+| `findings` flag | Default | Description |
+|-----------------|---------|-------------|
+| `-w / --workspace <UUID>` | bound workspace | Workspace to query |
+| `--format <FORMAT>` | `text` | `text`, `json`, `sarif` |
+| `--fail-on <SEVERITY>` | — | Exit 1 if any finding ≥ severity |
 
 ---
 
@@ -447,14 +588,14 @@ strobes workflow status --workspace <workspace-id>
 | Command | What it does |
 |---------|--------------|
 | `strobes workflow templates` | List available templates (built-in and `custom:`) |
-| `strobes workflow attach [--workspace W] [--template SLUG] [-v K=V…] [--no-watch]` | Attach a template, start it in the cloud, open the live TUI |
+| `strobes workflow attach [-w W] [-t SLUG] [-v K=V…] [--no-watch]` | Attach a template, start it in the cloud, open the live TUI |
 | `strobes workflow watch [--workspace W]` | Open the live streaming TUI for a running workflow |
 | `strobes workflow status [--workspace W]` | Print the current workflow status |
 | `strobes workflow pause \| resume \| cancel [--workspace W]` | Control a running workflow |
 | `strobes workflow restart [--workspace W] [--from-phase KEY]` | Restart from the start or a phase |
 | `strobes workflow advance [--workspace W]` | Advance past a manual-gate phase |
 | `strobes workflow detach [--workspace W] [-y]` | Cancel + remove the workflow from a workspace |
-| `strobes workflow save --workspace W --name NAME` | Save the running workflow as a reusable `custom:` template |
+| `strobes workflow save -w W -n NAME [-d DESC] [-i ICON]` | Save the running workflow as a reusable `custom:` template |
 | `strobes workflow delete-template <custom:slug>` | Delete a custom template |
 
 Templates (their phases, tasks and required variables) are authored and stored
@@ -478,7 +619,9 @@ it — there are no local YAML files to keep in sync.
 ```
 src/
   main.rs           clap commands + async entry point (ci scanning suite lives here)
-  config.rs         profiles, secret storage, URL/path helpers
+  config.rs         profiles (tenants), secret storage, URL/path helpers
+  pack.rs           sandbox pack (bundled scanners + Python) install/locate
+  analyzer_registry.rs  analyzer-registry client for `strobes cicd`
   api.rs            reqwest MasterKey REST client
   pulse.rs          pulse WebSocket client (flat StreamEvents, CLI_LOCAL tool dispatch)
   local.rs          local shell/code execution sandbox
@@ -500,7 +643,8 @@ assets/
 ```bash
 cargo test                      # unit tests
 cargo run -- chat
-cargo run -- ci sca .           # SCA scan of this repo
+cargo run -- ci sca .           # SCA scan of this repo (agent-driven)
+cargo run -- cicd sca .         # SCA scan of this repo (containerized analyzer)
 cargo run -- workflow templates       # list cloud workflow templates
 ```
 
