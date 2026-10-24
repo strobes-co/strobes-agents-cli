@@ -350,6 +350,32 @@ impl ApiClient {
         Ok(())
     }
 
+    /// Bytes of ONE workspace file (presigned URL → GET), for incremental
+    /// refreshes of the local mirror. `Ok(None)` when the file is gone.
+    pub async fn download_workspace_file(&self, workspace_id: &str, path: &str) -> Result<Option<Vec<u8>>> {
+        let url = self.url(&self.org_path(&format!("/cli/workspaces/{workspace_id}/file-url/")))?;
+        let resp = self
+            .http
+            .get(&url)
+            .query(&[("path", path)])
+            .header("Authorization", format!("token {}", self.profile.master_key))
+            .send()
+            .await?;
+        if resp.status().as_u16() == 404 {
+            return Ok(None);
+        }
+        if !resp.status().is_success() {
+            let s = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(anyhow!("file url failed: HTTP {s}: {}", trunc(&body, 200)));
+        }
+        let v: serde_json::Value = resp.json().await?;
+        let presigned = v.get("url").and_then(|u| u.as_str())
+            .ok_or_else(|| anyhow!("no url in file-url response"))?;
+        let bytes = reqwest::Client::new().get(presigned).send().await?.error_for_status()?.bytes().await?;
+        Ok(Some(bytes.to_vec()))
+    }
+
     /// Download the workspace zip bytes (presigned URL → GET).
     pub async fn download_workspace_bytes(&self, workspace_id: &str) -> Result<Vec<u8>> {
         let url = self.workspace_download_url(workspace_id).await?;
