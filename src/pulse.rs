@@ -186,6 +186,7 @@ pub async fn connect(
     reasoning_effort: Option<String>,
 ) -> Result<PulseHandle> {
     let url = profile.pulse_ws_url(thread_id)?;
+    crate::wsync::set_profile(profile);
     // The first connection must succeed so the caller gets a live handle.
     let ws = dial_ws(&url, profile).await?;
 
@@ -430,7 +431,14 @@ fn handle_frame(v: Value, app_tx: &mpsc::UnboundedSender<AppEvent>, out_tx: &mps
         // working directory for execute_command / execute_code / todo_*.
         let mut input = b.get("input").cloned().unwrap_or(json!({}));
         input["_thread_id"] = json!(thread_id);
-        if let Some(ws) = workspace_id {
+        // The handle knows the workspace only where the caller bound it; most
+        // entry points (send, workflow, …) instead set STROBES_AI_WORKSPACE_ID
+        // when they mirror the workspace, so fall back to that. wsync still
+        // checks the sandbox really is that workspace's mirror before acting.
+        let ws_any = workspace_id
+            .map(String::from)
+            .or_else(|| std::env::var("STROBES_AI_WORKSPACE_ID").ok().filter(|s| !s.is_empty()));
+        if let Some(ws) = ws_any {
             input["_workspace_id"] = json!(ws);
         }
         let arg_summary = concise_args(&tool_name, &input);
@@ -448,7 +456,18 @@ fn handle_frame(v: Value, app_tx: &mpsc::UnboundedSender<AppEvent>, out_tx: &mps
         let out_tx = out_tx.clone();
         tokio::spawn(async move {
             let start = std::time::Instant::now();
+            // Keep the local workspace mirror in step around commands that can
+            // read or write it, the way the cloud sandbox's mount always is.
+            let ws = input.get("_workspace_id").and_then(|v| v.as_str()).map(String::from);
+            let syncs = matches!(tool_name.as_str(), "execute_command" | "execute_code");
+            let sandbox = local::sandbox_dir_for(input.get("_thread_id").and_then(|v| v.as_str()));
+            if let (true, Some(ws)) = (syncs, ws.as_deref()) {
+                crate::wsync::before(ws, &sandbox).await;
+            }
             let res = local::run_tool(&tool_name, &input).await;
+            if let (true, Some(ws)) = (syncs, ws.as_deref()) {
+                crate::wsync::after(ws, &sandbox).await;
+            }
             let ms = start.elapsed().as_millis();
             let frame = if let Some(err) = &res.error {
                 json!({ "type": "tool.local_error", "payload": {

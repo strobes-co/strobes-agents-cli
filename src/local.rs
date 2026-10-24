@@ -17,6 +17,17 @@ pub struct LocalResult {
     pub captured_network: Vec<serde_json::Value>,
 }
 
+/// Point a command at the workspace's own HOME, remembering the real one.
+fn with_workspace_home(cmd: &mut Command, home: Option<&std::path::Path>) {
+    if let Some(h) = home {
+        if let Some(real) = dirs::home_dir() {
+            cmd.env("STROBES_REAL_HOME", real);
+        }
+        cmd.env("HOME", h);
+    }
+}
+
+
 /// Return the sandbox directory for a given thread.
 ///
 /// When a `thread_id` is present (injected by pulse.rs) each thread gets its
@@ -52,11 +63,17 @@ pub async fn run_tool(tool_name: &str, input: &serde_json::Value) -> LocalResult
     // We use it to key an isolated sandbox directory per task.
     let thread_id = input.get("_thread_id").and_then(|v| v.as_str());
     let sandbox = sandbox_dir_for(thread_id);
+    // Inside a workspace mirror, commands run with that workspace's own HOME so
+    // `~/.strobes/workspace` is the workspace (see wsync).
+    let home = input
+        .get("_workspace_id")
+        .and_then(|v| v.as_str())
+        .and_then(|ws| crate::wsync::workspace_home(ws, &sandbox));
 
     match tool_name {
         "execute_command" => {
             let cmd = input.get("command").and_then(|v| v.as_str()).unwrap_or("");
-            run_shell(cmd, &sandbox).await
+            run_shell(cmd, &sandbox, home.as_deref()).await
         }
         "execute_code" => {
             let code = input.get("code").and_then(|v| v.as_str()).unwrap_or("");
@@ -64,7 +81,7 @@ pub async fn run_tool(tool_name: &str, input: &serde_json::Value) -> LocalResult
                 .get("language")
                 .and_then(|v| v.as_str())
                 .unwrap_or("python");
-            run_code(code, lang, &sandbox).await
+            run_code(code, lang, &sandbox, home.as_deref()).await
         }
         "workspace_get_meta" => LocalResult {
             output: meta_json(&sandbox),
@@ -104,7 +121,7 @@ fn shell_quote(v: &str) -> String {
     format!("'{}'", v.replace('\'', "'\\''"))
 }
 
-async fn run_shell(command: &str, sandbox: &std::path::Path) -> LocalResult {
+async fn run_shell(command: &str, sandbox: &std::path::Path, home: Option<&std::path::Path>) -> LocalResult {
     let _ = std::fs::create_dir_all(sandbox);
     // Use the native shell: cmd.exe on Windows, login bash elsewhere.
     // Prepend the pack INSIDE the shell, not via `Command::env`.
@@ -137,6 +154,7 @@ async fn run_shell(command: &str, sandbox: &std::path::Path) -> LocalResult {
     // See the matching comment in run_code — unlike PATH, a login shell doesn't
     // reset arbitrary env vars, so this one does survive `bash -lc`.
     cmd.env("STROBES_SURFACE", "cli_local");
+    with_workspace_home(&mut cmd, home);
     let out = cmd
         .current_dir(sandbox)
         .stdout(Stdio::piped())
@@ -146,7 +164,7 @@ async fn run_shell(command: &str, sandbox: &std::path::Path) -> LocalResult {
     finish(out)
 }
 
-async fn run_code(code: &str, lang: &str, sandbox: &std::path::Path) -> LocalResult {
+async fn run_code(code: &str, lang: &str, sandbox: &std::path::Path, home: Option<&std::path::Path>) -> LocalResult {
     // The pack's standalone interpreter when one is installed (it has boto3,
     // curl_cffi, reportlab, strobes_pt … baked in); otherwise the host launcher,
     // `python` on Windows and `python3` elsewhere.
@@ -175,7 +193,9 @@ async fn run_code(code: &str, lang: &str, sandbox: &std::path::Path) -> LocalRes
             captured_network: vec![],
         };
     }
-    let out = Command::new(program)
+    let mut cmd = Command::new(program);
+    with_workspace_home(&mut cmd, home);
+    let out = cmd
         .args(&args)
         .arg(&file)
         .envs(
@@ -313,7 +333,7 @@ mod surface_marker_tests {
     /// STROBES_SANDBOX=1 could silently defeat.
     #[tokio::test]
     async fn run_code_sets_the_cli_local_surface_marker() {
-        let result = run_code("echo \"$STROBES_SURFACE\"", "bash", &sandbox()).await;
+        let result = run_code("echo \"$STROBES_SURFACE\"", "bash", &sandbox(), None).await;
         assert_eq!(result.error, None, "unexpected error: {:?}", result.error);
         assert_eq!(result.output.trim(), "cli_local");
     }
@@ -324,7 +344,7 @@ mod surface_marker_tests {
         // own profile and may add its own output — assert containment, not an
         // exact match, so this doesn't depend on the test environment's shell
         // profile being silent.
-        let result = run_shell("echo \"STROBES_SURFACE=$STROBES_SURFACE\"", &sandbox()).await;
+        let result = run_shell("echo \"STROBES_SURFACE=$STROBES_SURFACE\"", &sandbox(), None).await;
         assert_eq!(result.error, None, "unexpected error: {:?}", result.error);
         assert!(
             result.output.contains("STROBES_SURFACE=cli_local"),

@@ -16,6 +16,7 @@ mod markdown;
 mod picker;
 mod pulse;
 mod remote_wf_tui;
+mod wsync;
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Args, Parser, Subcommand};
