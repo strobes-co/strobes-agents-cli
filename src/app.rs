@@ -270,6 +270,11 @@ pub struct App {
     /// the agent-turn case already; this covers everything else that used
     /// to give no feedback at all while it awaited a response.
     busy: Option<String>,
+    /// When set, a centered animated "Loading…" overlay is drawn on top of the
+    /// chat UI (for in-chat fetches like opening the Threads/Workspaces overlay
+    /// or switching threads). Distinct from `busy`, which is the bottom
+    /// status-bar spinner used for lighter/inline waits and upload progress.
+    loading: Option<String>,
     overlay: Option<Overlay>,
     pub has_workspace: bool,
     // Shown top-right in the transcript: where work is running.
@@ -346,6 +351,7 @@ impl App {
             last_tool: None,
             todo_state: HashMap::new(),
             busy: None,
+            loading: None,
             overlay: None,
             has_workspace: false,
             workspace_name: None,
@@ -1154,6 +1160,11 @@ impl App {
         self.draw_input(f, chunks[1]);
         self.draw_hint(f, chunks[2]);
         self.draw_status(f, chunks[3]);
+        // Centered animated loader, drawn LAST so it floats on top of the chat
+        // UI during an in-chat fetch (overlay open, thread switch, …).
+        if let Some(label) = &self.loading {
+            crate::picker::draw_loader(f, label, self.spinner);
+        }
     }
 
     fn draw_overlay(&self, f: &mut Frame, area: Rect) {
@@ -2058,6 +2069,20 @@ impl App {
 
     pub fn is_busy(&self) -> bool {
         self.busy.is_some()
+    }
+
+    /// Show the centered "Loading…" overlay on top of the chat UI (for in-chat
+    /// fetches). Cleared with `clear_loading` when the result arrives.
+    pub fn set_loading(&mut self, msg: impl Into<String>) {
+        self.loading = Some(msg.into());
+    }
+
+    pub fn clear_loading(&mut self) {
+        self.loading = None;
+    }
+
+    pub fn is_loading(&self) -> bool {
+        self.loading.is_some()
     }
 
     /// A non-error informational line (workspace bound, hints, etc.).

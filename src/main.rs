@@ -7854,6 +7854,7 @@ pub async fn run_chat(
             }
             maybe_defer = defer_rx.recv() => {
                 app.clear_busy();
+                app.clear_loading();
                 match maybe_defer {
                     Some(DeferResult::OpenOverlay(kind, title, items)) => app.open_overlay(kind, title, items),
                     Some(DeferResult::Notice(s)) => app.notice(&s),
@@ -7865,7 +7866,7 @@ pub async fn run_chat(
                 // Advance the spinner while running OR waiting on a
                 // non-agent request (busy) — idle otherwise, since
                 // ratatui's diff means an idle redraw writes nothing.
-                if app.running || app.is_busy() {
+                if app.running || app.is_busy() || app.is_loading() {
                     app.tick();
                 }
             }
@@ -7882,12 +7883,15 @@ pub async fn run_chat(
         // identical to a frozen app — nothing changed on screen until it
         // either finished or (before the timeout fixes above) never did.
         match &defer {
-            Some(Defer::Workspaces) => app.set_busy("loading workspaces…"),
-            Some(Defer::Threads) => app.set_busy("loading threads…"),
-            Some(Defer::Findings) => app.set_busy("loading findings…"),
-            Some(Defer::Approvals) => app.set_busy("loading approvals…"),
-            Some(Defer::SwitchThread(_)) => app.set_busy("switching thread…"),
-            Some(Defer::BindWorkspace(_)) => app.set_busy("binding workspace…"),
+            // These fetches get the centered preloader overlay (on top of the
+            // chat UI), not the bottom status-bar spinner.
+            Some(Defer::Workspaces) => app.set_loading("Loading workspaces"),
+            Some(Defer::Threads) => app.set_loading("Loading threads"),
+            Some(Defer::Findings) => app.set_loading("Loading findings"),
+            Some(Defer::Approvals) => app.set_loading("Loading approvals"),
+            Some(Defer::SwitchThread(_)) => app.set_loading("Switching thread"),
+            Some(Defer::BindWorkspace(_)) => app.set_loading("Binding workspace"),
+            // Upload keeps the bottom status-bar progress ("uploading N/M …").
             Some(Defer::UploadFiles(_)) => app.set_busy("uploading…"),
             _ => {}
         }
@@ -8059,6 +8063,7 @@ pub async fn run_chat(
                 // the prompt dialogs below are their own interactive step,
                 // not a network wait.
                 app.clear_busy();
+                app.clear_loading();
                 let auth = auth_line(&profile, tenant);
                 let name = match picker::prompt_text(terminal, "New workspace — name", "", &auth).await {
                     Ok(Some(n)) => {
@@ -8127,6 +8132,9 @@ pub async fn run_chat(
                 }
             }
             Some(Defer::BindWorkspace(id)) => {
+                // Paint the centered loader once before the blocking binds/fetches
+                // below (they .await inline, so there's no redraw until they return).
+                let _ = terminal.draw(|f| app.draw(f));
                 profile.workspace_id = Some(id.clone());
                 handle.set_workspace(Some(id.clone()));
                 app.has_workspace = true;
@@ -8149,6 +8157,7 @@ pub async fn run_chat(
                 // for this workspace.
                 let threads_res = client.list_threads(Some(&id)).await;
                 app.clear_busy();
+                app.clear_loading();
                 match threads_res {
                     Ok(ts) => app.open_overlay(
                         app::OverlayKind::Threads,
@@ -8159,6 +8168,9 @@ pub async fn run_chat(
                 }
             }
             Some(Defer::SwitchThread(sel)) => {
+                // Paint the centered loader once before the blocking reconnect +
+                // thread-data reload below (all .await inline, no redraw until done).
+                let _ = terminal.draw(|f| app.draw(f));
                 // "__new__" means create a fresh thread (in the bound workspace).
                 let target = if sel == "__new__" {
                     match client.create_thread("CLI session", profile.workspace_id.as_deref(), None).await {
@@ -8186,6 +8198,7 @@ pub async fn run_chat(
                     }
                 }
                 app.clear_busy();
+                app.clear_loading();
             }
             None => {}
         }
