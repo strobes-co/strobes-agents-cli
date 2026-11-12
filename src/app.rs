@@ -1046,10 +1046,15 @@ impl App {
                         ),
                     ];
                     if !detail.is_empty() {
+                        // Args/code rendered in a readable gray (not washed-out
+                        // dark gray) so the parsed code/command is legible, with
+                        // the enclosing parens kept dim.
+                        spans.push(Span::styled("(".to_string(), Style::default().fg(Color::DarkGray)));
                         spans.push(Span::styled(
-                            format!("({detail})"),
-                            Style::default().fg(Color::DarkGray),
+                            detail.clone(),
+                            Style::default().fg(Color::Gray),
                         ));
+                        spans.push(Span::styled(")".to_string(), Style::default().fg(Color::DarkGray)));
                     }
                     out.push(Line::from(spans));
                 }
@@ -1750,17 +1755,22 @@ impl App {
                 }
                 "tool.start" => {
                     // Historical calls are already complete → Done (green dot);
-                    // a following tool.failed downgrades it to Failed.
+                    // a following tool.failed downgrades it to Failed. Summarize
+                    // the args the same way the live path does (code/command,
+                    // not a raw JSON dump).
                     let name = pstr("toolName");
-                    let args = compact_json(p.get("arguments"), 120);
+                    let args = crate::pulse::concise_args(&name, p.get("arguments").unwrap_or(&Value::Null));
                     self.flush_stream();
                     self.blocks.push(Block::Tool { name, detail: args, status: ToolStatus::Done, agent: agent.clone() });
                 }
                 "tool.output" => {
                     let dur = p.get("durationMs").and_then(|d| d.as_i64())
                         .map(|d| format!("  ·{d}ms")).unwrap_or_default();
-                    let res = compact_json(p.get("result"), 220);
-                    let body = if res.is_empty() { "(ok)".to_string() } else { res };
+                    let body = match p.get("result") {
+                        Some(v) => concise_result_value(v),
+                        None => "(ok)".to_string(),
+                    };
+                    let body = if body.is_empty() { "(ok)".to_string() } else { body };
                     self.push(Line::from(Span::styled(
                         format!("  ⎿ {body}{dur}"), Style::default().fg(Color::DarkGray))));
                 }
@@ -2330,15 +2340,15 @@ fn truncate(s: &str, n: usize) -> String {
     }
 }
 
-/// Beautify a tool result for the dim "⎿ …" child line: when it's a JSON
-/// object (as code-exec tools return), surface just the outcome — errors if
-/// any, else the program output — and drop the repetitive `edit_hint` /
-/// `environment` / `script_id` boilerplate the agent needs but the reader
-/// doesn't. Non-JSON results are shown as-is (truncated).
-fn concise_tool_result(detail: &str) -> String {
-    if let Ok(Value::Object(obj)) = serde_json::from_str::<Value>(detail) {
-        let join_strs = |v: &Value| -> String {
-            v.as_array()
+/// Beautify a parsed tool-result value for the dim "⎿ …" child line: when it's
+/// a JSON object (as code-exec / shell tools return), surface just the outcome
+/// — errors if any, else the program output — and drop the repetitive
+/// `edit_hint` / `environment` / `script_id` / `note` boilerplate the agent
+/// needs but the reader doesn't. Anything else is compacted as-is.
+fn concise_result_value(v: &Value) -> String {
+    if let Value::Object(obj) = v {
+        let join_strs = |val: &Value| -> String {
+            val.as_array()
                 .map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(" "))
                 .unwrap_or_default()
                 .replace('\n', " ")
@@ -2349,16 +2359,41 @@ fn concise_tool_result(detail: &str) -> String {
                 return format!("✗ {}", truncate(e.trim(), 200));
             }
         }
-        if let Some(outs) = obj.get("outputs") {
-            let o = join_strs(outs);
-            return if o.trim().is_empty() {
-                "(no output)".to_string()
-            } else {
-                truncate(o.trim(), 200)
-            };
+        // Output-bearing results (outputs/stdout_tail/message/note) → show that.
+        for key in ["outputs", "stdout_tail", "message", "note"] {
+            if let Some(val) = obj.get(key) {
+                let o = match val {
+                    Value::Array(_) => join_strs(val),
+                    Value::String(s) => s.replace('\n', " "),
+                    _ => String::new(),
+                };
+                let o = o.trim();
+                if !o.is_empty() {
+                    return truncate(o, 200);
+                }
+            }
+        }
+        // An execution result that simply produced nothing — don't dump its JSON.
+        if obj.contains_key("outputs") || obj.contains_key("errors") || obj.contains_key("stdout_tail") {
+            return "(no output)".to_string();
+        }
+        // A bare success/ok flag with nothing else to show.
+        if obj.get("success").and_then(|s| s.as_bool()) == Some(true)
+            || obj.get("ok").and_then(|s| s.as_bool()) == Some(true)
+        {
+            return "(ok)".to_string();
         }
     }
-    truncate(detail, 220)
+    compact_json(Some(v), 200)
+}
+
+/// Beautify a raw tool-result string (live path). Parses JSON when possible,
+/// else shows the text truncated.
+fn concise_tool_result(detail: &str) -> String {
+    match serde_json::from_str::<Value>(detail) {
+        Ok(v) => concise_result_value(&v),
+        Err(_) => truncate(detail, 220),
+    }
 }
 
 /// Compact a JSON value to a single-line, length-capped string.

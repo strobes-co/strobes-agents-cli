@@ -351,7 +351,7 @@ fn trim_code_preview(code: &str) -> String {
     }
 }
 
-fn concise_args(tool: &str, v: &Value) -> String {
+pub(crate) fn concise_args(tool: &str, v: &Value) -> String {
     let pick = |k: &str| v.get(k).and_then(|x| x.as_str()).map(|s| s.to_string());
     let chosen = match tool {
         "execute_command" | "workspace_execute_shell_command" => pick("command"),
