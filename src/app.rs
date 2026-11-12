@@ -626,6 +626,8 @@ impl App {
                 self.rule(&label);
             }
             AppEvent::Notice(n) => self.notice(&n),
+            AppEvent::Progress(Some(msg)) => self.set_busy(msg),
+            AppEvent::Progress(None) => self.clear_busy(),
             AppEvent::Error(e) => self.push(Line::from(Span::styled(
                 format!("error: {e}"),
                 Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),

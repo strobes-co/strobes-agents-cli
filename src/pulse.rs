@@ -54,6 +54,10 @@ pub enum AppEvent {
     Interrupt { id: String, title: String, message: String, fields: Vec<Field> },
     /// A non-error informational line (e.g. background workspace sync progress).
     Notice(String),
+    /// Live progress for a long background action (e.g. a multi-file/folder
+    /// upload). `Some(msg)` sets the status-bar spinner message; `None` clears
+    /// it when the action finishes.
+    Progress(Option<String>),
     /// Credit/token usage. `final_run=false` is a live per-call delta
     /// (`credit.update`); `final_run=true` is the authoritative run total
     /// (from `run.completed` metrics).

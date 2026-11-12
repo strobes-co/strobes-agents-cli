@@ -1305,6 +1305,149 @@ async fn upload_one(
     Ok(dest)
 }
 
+/// Max number of files a single drag-and-drop upload will expand to, so an
+/// accidentally-dropped huge tree can't kick off thousands of uploads. Past
+/// this the drop is refused with a hint to narrow it or use `strobes push`.
+const MAX_DRAG_UPLOAD_FILES: usize = 500;
+
+/// Directory/file names skipped when a dropped folder is expanded — VCS
+/// metadata, dependency/build caches and OS cruft that must never be uploaded.
+fn is_ignored_upload_name(name: &str) -> bool {
+    matches!(
+        name,
+        ".git" | ".hg" | ".svn" | "node_modules" | "target" | "__pycache__"
+            | ".venv" | "venv" | ".mypy_cache" | ".pytest_cache" | ".DS_Store"
+            | "dist" | "build" | ".next" | ".idea" | ".vscode" | ".cache"
+    )
+}
+
+/// Expand dropped paths into concrete `(local_file, dest_prefix)` upload
+/// entries. A plain file uploads at the workspace root (empty prefix → dest is
+/// just its name). A dropped folder is walked recursively and each file keeps
+/// its path relative to the folder's PARENT, so dropping `~/proj` yields
+/// `proj/src/main.rs`, `proj/README.md`, … Ignored dirs/files (see
+/// `is_ignored_upload_name`) are skipped. Errors if the total exceeds
+/// `MAX_DRAG_UPLOAD_FILES`.
+fn collect_upload_entries(
+    paths: &[std::path::PathBuf],
+) -> Result<Vec<(std::path::PathBuf, String)>> {
+    let mut out: Vec<(std::path::PathBuf, String)> = Vec::new();
+    for p in paths {
+        if p.is_file() {
+            out.push((p.clone(), String::new()));
+        } else if p.is_dir() {
+            let base = p.parent().unwrap_or_else(|| std::path::Path::new(""));
+            walk_dir_for_upload(p, base, &mut out)?;
+        }
+        if out.len() > MAX_DRAG_UPLOAD_FILES {
+            return Err(anyhow!(
+                "too many files to drop at once (> {MAX_DRAG_UPLOAD_FILES}) — \
+                 narrow the folder or use `strobes push`"
+            ));
+        }
+    }
+    Ok(out)
+}
+
+/// Recursive worker for `collect_upload_entries`. `base` is the ancestor the
+/// dest path is made relative to (the dropped folder's parent), so the folder's
+/// own name is preserved as the top-level prefix in the workspace.
+fn walk_dir_for_upload(
+    dir: &std::path::Path,
+    base: &std::path::Path,
+    out: &mut Vec<(std::path::PathBuf, String)>,
+) -> Result<()> {
+    let rd = std::fs::read_dir(dir).map_err(|e| anyhow!("read dir {}: {e}", dir.display()))?;
+    // Stable order so uploads (and the progress readout) are deterministic.
+    let mut children: Vec<std::path::PathBuf> = rd.filter_map(|e| e.ok().map(|e| e.path())).collect();
+    children.sort();
+    for path in children {
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        if is_ignored_upload_name(&name) {
+            continue;
+        }
+        if path.is_dir() {
+            walk_dir_for_upload(&path, base, out)?;
+        } else if path.is_file() {
+            // dest prefix = the file's parent relative to `base`, '/'-joined
+            // with a trailing '/'. `upload_one` appends the file name.
+            let prefix = path
+                .parent()
+                .and_then(|par| par.strip_prefix(base).ok())
+                .map(|rel| {
+                    let s = rel.to_string_lossy().replace('\\', "/");
+                    if s.is_empty() { String::new() } else { format!("{s}/") }
+                })
+                .unwrap_or_default();
+            out.push((path, prefix));
+        }
+        if out.len() > MAX_DRAG_UPLOAD_FILES {
+            return Err(anyhow!(
+                "too many files to drop at once (> {MAX_DRAG_UPLOAD_FILES}) — \
+                 narrow the folder or use `strobes push`"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Background multi-file/folder upload: uploads each `(file, prefix)` entry,
+/// streaming live progress to the UI via `AppEvent::Progress` (status-bar
+/// spinner) and a final summary via `AppEvent::Notice`. Mirrors each file into
+/// the workspace sync roots (sandbox + bound folder) exactly like a single-file
+/// upload. Runs off the render loop so the UI stays responsive during a big drop.
+async fn upload_entries_task(
+    profile: config::Profile,
+    ws: String,
+    entries: Vec<(std::path::PathBuf, String)>,
+    tx: mpsc::UnboundedSender<pulse::AppEvent>,
+) {
+    let client = match api::ApiClient::new(profile) {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = tx.send(pulse::AppEvent::Progress(None));
+            let _ = tx.send(pulse::AppEvent::Error(format!("upload failed: {e}")));
+            return;
+        }
+    };
+    let sync_roots = workspace_sync_roots(&Config::load(), &ws);
+    let total = entries.len();
+    let (mut ok, mut failed) = (0usize, 0usize);
+    for (i, (path, prefix)) in entries.iter().enumerate() {
+        let shown = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.to_string_lossy().into_owned());
+        let _ = tx.send(pulse::AppEvent::Progress(Some(format!(
+            "uploading {}/{total} — {prefix}{shown}",
+            i + 1
+        ))));
+        let local = path.to_string_lossy().to_string();
+        match upload_one(&client, &ws, &local, prefix, &sync_roots).await {
+            Ok(_) => ok += 1,
+            Err(e) => {
+                failed += 1;
+                let _ = tx.send(pulse::AppEvent::Error(format!("upload failed ({prefix}{shown}): {e}")));
+            }
+        }
+    }
+    let _ = tx.send(pulse::AppEvent::Progress(None));
+    let where_to = match sync_roots.first() {
+        Some(r) => format!(" (synced to {})", r.display()),
+        None => String::new(),
+    };
+    if ok > 0 {
+        let fail_note = if failed > 0 { format!(", {failed} failed") } else { String::new() };
+        let _ = tx.send(pulse::AppEvent::Notice(format!(
+            "✔ uploaded {ok}/{total} file(s) to the workspace{where_to}{fail_note}"
+        )));
+    } else {
+        let _ = tx.send(pulse::AppEvent::Notice(format!(
+            "✗ no files uploaded ({failed} failed)"
+        )));
+    }
+}
+
 /// Local folders that mirror a workspace: the per-workspace sandbox the chat
 /// agent reads from (`config_dir()/workspaces/<ws>`) plus any explicitly bound
 /// folder. Only dirs that already exist are returned, so a stray upload never
@@ -6919,6 +7062,7 @@ fn describe(ev: &pulse::AppEvent) -> String {
         RunStarted => "run started".into(),
         RunFinished(l) => format!("run finished: {l}"),
         Notice(n) => format!("notice: {n}"),
+        Progress(p) => format!("progress: {p:?}"),
         Credits { credits, tokens, final_run } => format!("credits {credits:.4} tokens {tokens} final={final_run}"),
         Error(e) => format!("error: {e}"),
         LocalToolDone { name, ms, exit, err } => {
@@ -7231,10 +7375,12 @@ enum DeferResult {
     Error(String),
 }
 
-/// If the input is one or more existing local file paths (e.g. a file dragged
-/// onto the terminal, which inserts its path), return them — so a plain run can
-/// upload instead of sending the path as a chat message. Returns None for
-/// normal text. Handles `~`, quotes and backslash-escaped spaces.
+/// If the input is one or more existing local paths — files OR directories
+/// (e.g. a file/folder dragged onto the terminal, which inserts its path) —
+/// return them, so a plain run can upload instead of sending the path as a chat
+/// message. Dropped folders are expanded recursively at upload time (see
+/// `collect_upload_entries`). Returns None for normal text. Handles `~`, quotes
+/// and backslash-escaped spaces.
 fn parse_dragged_paths(input: &str) -> Option<Vec<std::path::PathBuf>> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
@@ -7282,7 +7428,9 @@ fn parse_dragged_paths(input: &str) -> Option<Vec<std::path::PathBuf>> {
         } else {
             std::path::PathBuf::from(&t)
         };
-        if !p.is_file() {
+        // Accept existing files AND directories — a dropped folder is expanded
+        // and uploaded recursively (see `collect_upload_entries`).
+        if !p.is_file() && !p.is_dir() {
             return None;
         }
         paths.push(p);
@@ -7817,33 +7965,33 @@ pub async fn run_chat(
                 }
             }
             Some(Defer::UploadFiles(paths)) => {
-                app.clear_busy();
                 match profile.workspace_id.clone() {
-                Some(ws) => {
-                    // Mirror dropped files into the live workspace sandbox (what
-                    // the agent reads) and any bound folder, so local + remote
-                    // stay in sync.
-                    let sync_roots = workspace_sync_roots(&Config::load(), &ws);
-                    let mut ok = 0usize;
-                    for path in &paths {
-                        let p = path.to_string_lossy().to_string();
-                        match upload_one(&client, &ws, &p, "", &sync_roots).await {
-                            Ok(dest) => {
-                                ok += 1;
-                                app.notice(&format!("⬆ uploaded {dest}"));
-                            }
-                            Err(e) => app.on_app_event(pulse::AppEvent::Error(format!("upload failed: {e}"))),
+                    None => {
+                        app.clear_busy();
+                        app.notice("bind a workspace first, then drop files or folders to upload");
+                    }
+                    // Expand files/folders into concrete upload entries, then run
+                    // the (possibly large) upload OFF the render loop so the UI
+                    // stays live and shows per-file progress in the status bar.
+                    Some(ws) => match collect_upload_entries(&paths) {
+                        Err(e) => {
+                            app.clear_busy();
+                            app.on_app_event(pulse::AppEvent::Error(e.to_string()));
                         }
-                    }
-                    if ok > 0 {
-                        let where_to = match sync_roots.first() {
-                            Some(r) => format!(" (synced to {})", r.display()),
-                            None => String::new(),
-                        };
-                        app.notice(&format!("✔ {ok} file(s) uploaded to the workspace{where_to}"));
-                    }
-                }
-                None => app.notice("bind a workspace first, then drop files to upload"),
+                        Ok(entries) if entries.is_empty() => {
+                            app.clear_busy();
+                            app.notice("nothing to upload (empty folder, or every file was ignored)");
+                        }
+                        Ok(entries) => {
+                            let total = entries.len();
+                            app.set_busy(format!("uploading 0/{total}…"));
+                            let profile = profile.clone();
+                            let tx = app_tx.clone();
+                            tokio::spawn(async move {
+                                upload_entries_task(profile, ws, entries, tx).await;
+                            });
+                        }
+                    },
                 }
             }
             Some(Defer::BindWorkspace(sel)) if sel == "__new_ws__" => {
@@ -8736,6 +8884,58 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio_tungstenite::accept_async;
     use tokio_tungstenite::tungstenite::Message;
+
+    #[test]
+    fn parse_dragged_paths_accepts_a_directory() {
+        let root = std::env::temp_dir().join(format!("strobes-drag-dir-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&root).unwrap();
+        let got = parse_dragged_paths(&root.to_string_lossy());
+        assert_eq!(got, Some(vec![root.clone()]), "a dropped folder path should parse as an upload target");
+        // A non-path word is still treated as a normal message.
+        assert!(parse_dragged_paths("hello world").is_none());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn collect_upload_entries_expands_folder_with_prefixes_and_skips_ignored() {
+        let root = std::env::temp_dir().join(format!("strobes-drag-walk-{}", uuid::Uuid::new_v4().simple()));
+        let proj = root.join("proj");
+        std::fs::create_dir_all(proj.join("src")).unwrap();
+        std::fs::create_dir_all(proj.join("node_modules/pkg")).unwrap(); // must be skipped
+        std::fs::create_dir_all(proj.join(".git")).unwrap();              // must be skipped
+        std::fs::write(proj.join("README.md"), b"r").unwrap();
+        std::fs::write(proj.join("src/main.rs"), b"m").unwrap();
+        std::fs::write(proj.join("node_modules/pkg/index.js"), b"x").unwrap();
+        std::fs::write(proj.join(".git/config"), b"c").unwrap();
+
+        let entries = collect_upload_entries(&[proj.clone()]).unwrap();
+        // Build dest strings the way upload_one would: prefix + file_name.
+        let mut dests: Vec<String> = entries
+            .iter()
+            .map(|(p, prefix)| format!("{prefix}{}", p.file_name().unwrap().to_string_lossy()))
+            .collect();
+        dests.sort();
+        assert_eq!(dests, vec!["proj/README.md".to_string(), "proj/src/main.rs".to_string()]);
+
+        // A plain file drops at the root with no prefix.
+        let file_entries = collect_upload_entries(&[proj.join("README.md")]).unwrap();
+        assert_eq!(file_entries.len(), 1);
+        assert_eq!(file_entries[0].1, "", "a plain file uploads at the workspace root");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn collect_upload_entries_rejects_oversized_drop() {
+        let root = std::env::temp_dir().join(format!("strobes-drag-cap-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&root).unwrap();
+        for i in 0..(MAX_DRAG_UPLOAD_FILES + 5) {
+            std::fs::write(root.join(format!("f{i}.txt")), b"x").unwrap();
+        }
+        let err = collect_upload_entries(&[root.clone()]).expect_err("should refuse an oversized drop");
+        assert!(err.to_string().contains("too many files"), "got: {err}");
+        std::fs::remove_dir_all(&root).ok();
+    }
 
     #[test]
     fn notify_gating_and_payload() {
