@@ -49,60 +49,82 @@ const SAUCER_MSGS: [&str; 16] = [
     "Plotting a course through the asteroid belt",
 ];
 
-/// The saucer's four glyph lines for a given frame: blinking dome lights and a
-/// pulsing tractor beam. Center-aligned by the caller, so no horizontal jitter.
-fn saucer_lines(frame: usize) -> [String; 4] {
-    // Dome lights blink between dim/bright in a little pattern.
-    let lights = match frame % 4 {
-        0 => "o O o",
-        1 => "O o O",
-        2 => "o o O",
-        _ => "O O o",
+/// Render the saucer as styled lines for `frame`: a glass dome with a sliding
+/// glint, a block-glyph disc, a row of running (marquee) under-lights, and a
+/// pulsing tractor beam. Built from Unicode block/triangle glyphs so it reads as
+/// a real craft rather than plain ASCII. Center-aligned by the caller.
+fn saucer_render(frame: usize) -> Vec<Line<'static>> {
+    let glass = Style::default().fg(Color::White).add_modifier(Modifier::BOLD);
+    let dome = Style::default().fg(Color::LightCyan).add_modifier(Modifier::BOLD);
+    let disc = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+    let rim = Style::default().fg(Color::Cyan);
+    let on = Style::default().fg(Color::LightYellow).add_modifier(Modifier::BOLD);
+    let off = Style::default().fg(Color::DarkGray);
+    let beam = Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD);
+
+    // Dome top: a single bright glint slides across the glass.
+    let glint_pos = (frame / 2) % 5;
+    let dome_top: String = (0..5).map(|i| if i == glint_pos { '▀' } else { '▄' }).collect();
+
+    // Under-lights run like a marquee: each light brightens in a moving wave.
+    let mut light_spans: Vec<Span<'static>> = vec![Span::styled("◥", rim)];
+    for i in 0..6 {
+        let bright = (frame / 2 + i) % 3 == 0;
+        light_spans.push(Span::styled("●", if bright { on } else { off }));
+        if i < 5 {
+            light_spans.push(Span::styled("═", rim));
+        }
+    }
+    light_spans.push(Span::styled("◤", rim));
+
+    // Tractor beam pulses underneath the craft.
+    let beam_str = match frame % 4 {
+        0 => "╹  ╎  ╹",
+        1 => " ╎ ╏ ╎ ",
+        2 => "  ╏╹╏  ",
+        _ => " ╹ ╎ ╹ ",
     };
-    // Tractor beam pulses underneath.
-    let beam = match frame % 4 {
-        0 => ".  :  .",
-        1 => " . : . ",
-        2 => "  : :  ",
-        _ => " : . : ",
-    };
-    [
-        "   .-\"\"\"-.   ".to_string(),
-        format!("  ( {lights} )  "),
-        "   `~-...-~'   ".to_string(),
-        format!("     {beam}     "),
+
+    vec![
+        Line::from(Span::styled(dome_top, glass)),
+        Line::from(Span::styled("◢█████◣".to_string(), dome)),
+        Line::from(Span::styled("◢███████████◣".to_string(), disc)),
+        Line::from(light_spans),
+        Line::from(Span::styled(beam_str.to_string(), beam)),
     ]
+}
+
+/// A per-appearance random seed, so each loader starts on a different flavor
+/// message instead of always the same one. Cheap (no `rand` dep): derived from
+/// the wall clock at the moment the loader opens.
+pub fn loader_seed() -> usize {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as usize)
+        .unwrap_or(0)
 }
 
 /// Draw the centered animated flying-saucer loader on top of whatever is on
 /// screen. `label` is the real action (shown dimmed on the subtitle); `frame`
-/// drives the blinking lights, the pulsing beam, the spinner, and the slowly
-/// rotating flavor message.
-pub fn draw_loader(f: &mut ratatui::Frame, label: &str, frame: usize) {
+/// drives the blinking lights, the pulsing beam and the spinner; `seed` (chosen
+/// once per appearance) picks the starting flavor message so it varies run to
+/// run. The message rotates slowly, so a short wait shows just one or two.
+pub fn draw_loader(f: &mut ratatui::Frame, label: &str, frame: usize, seed: usize) {
     let area = f.area();
-    let saucer = saucer_lines(frame);
-    let msg = SAUCER_MSGS[(frame / 18) % SAUCER_MSGS.len()];
+    // Rotate ~every 40 frames (~3.2s at 80ms) so a brief loader shows 1–2 lines.
+    let msg = SAUCER_MSGS[(seed.wrapping_add(frame / 40)) % SAUCER_MSGS.len()];
     let spin = LOADER_SPIN[frame % LOADER_SPIN.len()];
     let dots = ".".repeat(1 + (frame / 3) % 3);
     let subtitle = format!("{spin} {label}{dots:<3}");
 
-    // Build the styled content lines (centered as a block).
     let cyan = Style::default().fg(Color::Cyan);
-    let dome = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
-    let lights = Style::default().fg(Color::LightYellow).add_modifier(Modifier::BOLD);
-    let beam = Style::default().fg(Color::Magenta);
     let msg_style = Style::default().fg(Color::White).add_modifier(Modifier::BOLD);
     let sub_style = Style::default().fg(Color::DarkGray);
 
-    let lines: Vec<Line> = vec![
-        Line::from(Span::styled(saucer[0].clone(), dome)),
-        Line::from(Span::styled(saucer[1].clone(), lights)),
-        Line::from(Span::styled(saucer[2].clone(), dome)),
-        Line::from(Span::styled(saucer[3].clone(), beam)),
-        Line::default(),
-        Line::from(Span::styled(format!("👽  {msg}…"), msg_style)),
-        Line::from(Span::styled(subtitle, sub_style)),
-    ];
+    let mut lines: Vec<Line> = saucer_render(frame);
+    lines.push(Line::default());
+    lines.push(Line::from(Span::styled(format!("👽  {msg}…"), msg_style)));
+    lines.push(Line::from(Span::styled(subtitle, sub_style)));
 
     // Size the box to the widest content line (+ padding + borders), clamped.
     let widest = lines
@@ -138,11 +160,12 @@ where
     tokio::pin!(fut);
     let mut ticker = tokio::time::interval(std::time::Duration::from_millis(80));
     let mut frame = 0usize;
+    let seed = loader_seed();
     loop {
         tokio::select! {
             out = &mut fut => return out,
             _ = ticker.tick() => {
-                let _ = terminal.draw(|f| draw_loader(f, label, frame));
+                let _ = terminal.draw(|f| draw_loader(f, label, frame, seed));
                 frame = frame.wrapping_add(1);
             }
         }
@@ -504,4 +527,31 @@ fn move_sel(state: &mut ListState, len: usize, delta: i32) {
     let cur = state.selected().unwrap_or(0) as i32;
     let next = (cur + delta).rem_euclid(len as i32) as usize;
     state.select(Some(next));
+}
+
+#[cfg(test)]
+mod loader_tests {
+    use super::*;
+    use ratatui::{backend::TestBackend, Terminal};
+
+    /// The saucer renders without panic across animation frames, fits its box,
+    /// and actually paints the craft + label glyphs.
+    #[test]
+    fn saucer_renders() {
+        for frame in [0usize, 3, 6, 9, 40, 80] {
+            let mut t = Terminal::new(TestBackend::new(48, 14)).unwrap();
+            t.draw(|f| draw_loader(f, "Loading workspaces", frame, 2)).unwrap();
+            let buf = t.backend().buffer().clone();
+            let mut screen = String::new();
+            for y in 0..buf.area.height {
+                for x in 0..buf.area.width {
+                    screen.push_str(buf[(x, y)].symbol());
+                }
+                screen.push('\n');
+            }
+            assert!(screen.contains('█'), "saucer disc missing at frame {frame}");
+            assert!(screen.contains('●'), "saucer lights missing at frame {frame}");
+            assert!(screen.contains("Loading workspaces"), "label missing at frame {frame}");
+        }
+    }
 }

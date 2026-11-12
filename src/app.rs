@@ -275,6 +275,8 @@ pub struct App {
     /// or switching threads). Distinct from `busy`, which is the bottom
     /// status-bar spinner used for lighter/inline waits and upload progress.
     loading: Option<String>,
+    /// Per-appearance seed so the loader's flavor message varies each time.
+    loading_seed: usize,
     overlay: Option<Overlay>,
     pub has_workspace: bool,
     // Shown top-right in the transcript: where work is running.
@@ -352,6 +354,7 @@ impl App {
             todo_state: HashMap::new(),
             busy: None,
             loading: None,
+            loading_seed: 0,
             overlay: None,
             has_workspace: false,
             workspace_name: None,
@@ -1163,7 +1166,7 @@ impl App {
         // Centered animated loader, drawn LAST so it floats on top of the chat
         // UI during an in-chat fetch (overlay open, thread switch, …).
         if let Some(label) = &self.loading {
-            crate::picker::draw_loader(f, label, self.spinner);
+            crate::picker::draw_loader(f, label, self.spinner, self.loading_seed);
         }
     }
 
@@ -2075,6 +2078,7 @@ impl App {
     /// fetches). Cleared with `clear_loading` when the result arrives.
     pub fn set_loading(&mut self, msg: impl Into<String>) {
         self.loading = Some(msg.into());
+        self.loading_seed = crate::picker::loader_seed();
     }
 
     pub fn clear_loading(&mut self) {
