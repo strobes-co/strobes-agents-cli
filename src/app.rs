@@ -825,7 +825,7 @@ impl App {
                 // Result rendered as a dim child line under the tool call.
                 let ms = item.status.map(|s| format!("  ·{s}")).unwrap_or_default();
                 let d = item.detail.unwrap_or_default();
-                let body = if d.is_empty() { "(ok)".to_string() } else { truncate(&d, 220) };
+                let body = if d.is_empty() { "(ok)".to_string() } else { concise_tool_result(&d) };
                 self.flush_stream();
                 self.finish_last_tool(&agent, true); // dot → green
                 self.blocks.push(Block::Plain(Line::from(Span::styled(
@@ -2330,6 +2330,37 @@ fn truncate(s: &str, n: usize) -> String {
     }
 }
 
+/// Beautify a tool result for the dim "⎿ …" child line: when it's a JSON
+/// object (as code-exec tools return), surface just the outcome — errors if
+/// any, else the program output — and drop the repetitive `edit_hint` /
+/// `environment` / `script_id` boilerplate the agent needs but the reader
+/// doesn't. Non-JSON results are shown as-is (truncated).
+fn concise_tool_result(detail: &str) -> String {
+    if let Ok(Value::Object(obj)) = serde_json::from_str::<Value>(detail) {
+        let join_strs = |v: &Value| -> String {
+            v.as_array()
+                .map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(" "))
+                .unwrap_or_default()
+                .replace('\n', " ")
+        };
+        if let Some(errs) = obj.get("errors") {
+            let e = join_strs(errs);
+            if !e.trim().is_empty() {
+                return format!("✗ {}", truncate(e.trim(), 200));
+            }
+        }
+        if let Some(outs) = obj.get("outputs") {
+            let o = join_strs(outs);
+            return if o.trim().is_empty() {
+                "(no output)".to_string()
+            } else {
+                truncate(o.trim(), 200)
+            };
+        }
+    }
+    truncate(detail, 220)
+}
+
 /// Compact a JSON value to a single-line, length-capped string.
 pub fn compact_json(v: Option<&Value>, limit: usize) -> String {
     let s = match v {
@@ -2342,6 +2373,29 @@ pub fn compact_json(v: Option<&Value>, limit: usize) -> String {
         format!("{}…", s.chars().take(limit).collect::<String>())
     } else {
         s
+    }
+}
+
+#[cfg(test)]
+mod tool_render_tests {
+    use super::concise_tool_result;
+
+    #[test]
+    fn concise_tool_result_surfaces_outcome_not_boilerplate() {
+        // The code-exec result shape: outputs + the agent-facing edit_hint noise.
+        let r = concise_tool_result(
+            r#"{"edit_hint":"To fix or tweak this script, call workspace_edit_code with script_id='scr_x' …","environment":"bedrock","errors":[],"outputs":["S4 expiry: 2026-05-22"]}"#,
+        );
+        assert_eq!(r, "S4 expiry: 2026-05-22");
+        assert!(!r.contains("edit_hint") && !r.contains("bedrock"));
+
+        // Errors take priority and are flagged.
+        let e = concise_tool_result(r#"{"errors":["Traceback: NameError"],"outputs":[]}"#);
+        assert_eq!(e, "✗ Traceback: NameError");
+
+        // Empty output reads clearly; non-JSON passes through unchanged.
+        assert_eq!(concise_tool_result(r#"{"errors":[],"outputs":[]}"#), "(no output)");
+        assert_eq!(concise_tool_result("plain text"), "plain text");
     }
 }
 

@@ -329,13 +329,46 @@ fn sval(v: &Value, key: &str) -> Option<String> {
 }
 
 /// A concise, human-readable summary of a tool's arguments for the call line.
+/// One-line preview of a code blob: skip leading blank lines, imports and the
+/// stock `base=os.path.expanduser(...)` setup so the line that does the actual
+/// work shows first; append "…" if more lines follow.
+fn trim_code_preview(code: &str) -> String {
+    let nonempty: Vec<&str> = code.lines().map(|l| l.trim()).filter(|l| !l.is_empty()).collect();
+    if nonempty.is_empty() {
+        return String::new();
+    }
+    let is_boiler = |l: &str| {
+        l.starts_with("import ")
+            || l.starts_with("from ")
+            || l.replace(' ', "").starts_with("base=os.path.expanduser")
+    };
+    let idx = nonempty.iter().position(|l| !is_boiler(l)).unwrap_or(0);
+    let first = nonempty[idx];
+    if nonempty.len() > idx + 1 {
+        format!("{first} …")
+    } else {
+        first.to_string()
+    }
+}
+
 fn concise_args(tool: &str, v: &Value) -> String {
     let pick = |k: &str| v.get(k).and_then(|x| x.as_str()).map(|s| s.to_string());
     let chosen = match tool {
-        "execute_command" => pick("command"),
-        "execute_code" => {
-            let lang = pick("language").unwrap_or_else(|| "python".into());
-            pick("code").map(|c| format!("{lang}: {c}"))
+        "execute_command" | "workspace_execute_shell_command" => pick("command"),
+        // Code-execution tools: show the actual code, not the JSON wrapper. The
+        // common leading boilerplate (a blank line + os/base setup) is trimmed
+        // so the meaningful line surfaces first.
+        "execute_code" | "workspace_execute_code" => {
+            pick("code").map(|c| trim_code_preview(&c))
+        }
+        // Script edits: identify the script + show the new snippet, not a full
+        // re-send of the source.
+        "workspace_edit_code" => {
+            let sid = pick("script_id").unwrap_or_default();
+            match pick("new_string") {
+                Some(ns) => Some(format!("{sid}: {}", ns.replace('\n', " "))),
+                None => Some(sid),
+            }
         }
         t if t.starts_with("browser_") => pick("url").or_else(|| pick("selector")).or_else(|| pick("script")),
         "spawn_subagent" => pick("agent_id").or_else(|| pick("task")),
@@ -673,8 +706,31 @@ fn handle_frame(v: Value, app_tx: &mpsc::UnboundedSender<AppEvent>, out_tx: &mps
 
 #[cfg(test)]
 mod concise_args_tests {
-    use super::concise_args;
+    use super::{concise_args, trim_code_preview};
     use serde_json::json;
+
+    #[test]
+    fn code_tool_shows_code_not_json_wrapper() {
+        let args = json!({
+            "code": "\nimport os,subprocess\nbase=os.path.expanduser(\"~/.strobes/workspace\")\nr=subprocess.run([\"bash\",\"-lc\",\"id\"])",
+            "environment": "bedrock",
+        });
+        let out = concise_args("workspace_execute_code", &args);
+        // Surfaces the meaningful line, not the import/base boilerplate or JSON.
+        assert!(out.starts_with("r=subprocess.run"), "got: {out}");
+        assert!(!out.contains("\"code\""), "should not dump the JSON wrapper");
+        assert!(!out.contains("import os"), "boilerplate import should be skipped");
+    }
+
+    #[test]
+    fn trim_code_preview_skips_boilerplate_and_marks_more() {
+        // Imports/base setup are skipped so real work shows first.
+        assert_eq!(trim_code_preview("\nimport os\nbase=os.path.expanduser('~')\nx=1"), "x=1");
+        assert_eq!(trim_code_preview("import os\nx=1\ny=2"), "x=1 …");
+        // All-boilerplate falls back to the first line (with … since more follow).
+        assert_eq!(trim_code_preview("import os\nbase=os.path.expanduser('~')"), "import os …");
+        assert_eq!(trim_code_preview(""), "");
+    }
 
     #[test]
     fn summarizes_dynamic_harness_instead_of_dumping_raw_dag() {
