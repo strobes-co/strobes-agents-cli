@@ -54,6 +54,10 @@ pub enum AppEvent {
     Interrupt { id: String, title: String, message: String, fields: Vec<Field> },
     /// A non-error informational line (e.g. background workspace sync progress).
     Notice(String),
+    /// Live progress for a long background action (e.g. a multi-file/folder
+    /// upload). `Some(msg)` sets the status-bar spinner message; `None` clears
+    /// it when the action finishes.
+    Progress(Option<String>),
     /// Credit/token usage. `final_run=false` is a live per-call delta
     /// (`credit.update`); `final_run=true` is the authoritative run total
     /// (from `run.completed` metrics).
@@ -325,13 +329,170 @@ fn sval(v: &Value, key: &str) -> Option<String> {
 }
 
 /// A concise, human-readable summary of a tool's arguments for the call line.
-fn concise_args(tool: &str, v: &Value) -> String {
+/// One-line preview of a code blob: skip leading blank lines, imports and the
+/// stock `base=os.path.expanduser(...)` setup so the line that does the actual
+/// work shows first; append "…" if more lines follow.
+fn trim_code_preview(code: &str) -> String {
+    let nonempty: Vec<&str> = code.lines().map(|l| l.trim()).filter(|l| !l.is_empty()).collect();
+    if nonempty.is_empty() {
+        return String::new();
+    }
+    let is_boiler = |l: &str| {
+        l.starts_with("import ")
+            || l.starts_with("from ")
+            || l.replace(' ', "").starts_with("base=os.path.expanduser")
+    };
+    let idx = nonempty.iter().position(|l| !is_boiler(l)).unwrap_or(0);
+    let first = nonempty[idx];
+    if nonempty.len() > idx + 1 {
+        format!("{first} …")
+    } else {
+        first.to_string()
+    }
+}
+
+/// Tools whose primary argument is code or a shell command we render verbatim
+/// (multi-line, up to a cap) rather than as a flattened one-line summary.
+pub(crate) fn is_verbatim_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "execute_code" | "workspace_execute_code" | "execute_command" | "workspace_execute_shell_command"
+    )
+}
+
+/// The detail string for a tool call: the raw code/command with newlines kept
+/// (for verbatim tools), else the concise one-line summary.
+pub(crate) fn tool_detail(tool: &str, v: &Value) -> String {
+    if is_verbatim_tool(tool) {
+        let key = if tool.contains("command") { "command" } else { "code" };
+        if let Some(s) = v.get(key).and_then(|x| x.as_str()) {
+            return s.trim_matches('\n').to_string();
+        }
+    }
+    concise_args(tool, v)
+}
+
+/// Summarize an arbitrary tool-arg object into a readable one-liner instead of
+/// dumping raw JSON: a headline field (title/name/description/…) if present,
+/// then a few compact `key=value` extras (severity, category, limit, a `fields`
+/// list, …). Falls back to the key names when nothing descriptive is found.
+fn generic_summary(obj: &serde_json::Map<String, Value>) -> String {
+    // A short, human-readable form of one value.
+    let short = |val: &Value| -> String {
+        match val {
+            Value::String(s) => s.replace('\n', " "),
+            Value::Bool(b) => b.to_string(),
+            Value::Number(n) => n.to_string(),
+            Value::Array(a) => {
+                let items: Vec<String> = a
+                    .iter()
+                    .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                    .collect();
+                if items.is_empty() { format!("[{} items]", a.len()) } else { items.join(",") }
+            }
+            Value::Object(o) => format!("{{{} fields}}", o.len()),
+            Value::Null => String::new(),
+        }
+    };
+
+    let mut parts: Vec<String> = Vec::new();
+
+    // Headline: the first descriptive field present, shown as a bare value.
+    const HEADLINE: &[&str] = &[
+        "title", "name", "description", "summary", "query", "command", "url",
+        "path", "label", "objective", "message", "slug", "prompt", "component", "view",
+    ];
+    if let Some(h) = HEADLINE.iter().find_map(|k| obj.get(*k).and_then(|v| v.as_str())) {
+        parts.push(h.replace('\n', " "));
+    }
+
+    // A compact `fields:` list when the tool is a query over named fields.
+    if let Some(Value::Array(a)) = obj.get("fields") {
+        let names: Vec<&str> = a.iter().filter_map(|x| x.as_str()).collect();
+        if !names.is_empty() {
+            parts.push(format!("fields: {}", names.join(",")));
+        }
+    }
+
+    // A few qualifier fields as key=value.
+    for k in ["severity", "category", "type", "action", "status", "limit", "id"] {
+        if parts.len() >= 4 {
+            break;
+        }
+        if let Some(val) = obj.get(k) {
+            let s = short(val);
+            if !s.is_empty() && s != "null" {
+                parts.push(format!("{k}={s}"));
+            }
+        }
+    }
+
+    if parts.is_empty() {
+        // Nothing recognizable — list the argument keys so it's at least legible.
+        let keys: Vec<String> = obj.keys().take(6).cloned().collect();
+        keys.join(", ")
+    } else {
+        parts.join(" · ")
+    }
+}
+
+/// Summarize a render_ui/init_ui node array (and the ui_block result carries
+/// the same shape): widget count + the distinct node types, plus the first
+/// heading/title text for context. e.g. "3 widgets: heading, stat, table —
+/// Findings overview".
+pub(crate) fn summarize_ui_nodes(nodes: Option<&Value>) -> String {
+    let arr = match nodes.and_then(|n| n.as_array()) {
+        Some(a) if !a.is_empty() => a,
+        _ => return "empty UI".to_string(),
+    };
+    // Distinct node types, order-preserving.
+    let mut types: Vec<String> = Vec::new();
+    for n in arr {
+        if let Some(t) = n.get("type").and_then(|t| t.as_str()) {
+            if !types.iter().any(|x| x == t) {
+                types.push(t.to_string());
+            }
+        }
+    }
+    // First human-readable label among the nodes.
+    let headline = arr.iter().find_map(|n| {
+        for k in ["title", "heading", "content", "label"] {
+            if let Some(s) = n.get(k).and_then(|x| x.as_str()) {
+                let s = s.trim();
+                if !s.is_empty() {
+                    return Some(s.replace('\n', " "));
+                }
+            }
+        }
+        None
+    });
+    let count = arr.len();
+    let plural = if count == 1 { "widget" } else { "widgets" };
+    let kinds = if types.is_empty() { String::new() } else { format!(": {}", types.join(", ")) };
+    match headline {
+        Some(h) => format!("{count} {plural}{kinds} — {h}"),
+        None => format!("{count} {plural}{kinds}"),
+    }
+}
+
+pub(crate) fn concise_args(tool: &str, v: &Value) -> String {
     let pick = |k: &str| v.get(k).and_then(|x| x.as_str()).map(|s| s.to_string());
     let chosen = match tool {
-        "execute_command" => pick("command"),
-        "execute_code" => {
-            let lang = pick("language").unwrap_or_else(|| "python".into());
-            pick("code").map(|c| format!("{lang}: {c}"))
+        "execute_command" | "workspace_execute_shell_command" => pick("command"),
+        // Code-execution tools: show the actual code, not the JSON wrapper. The
+        // common leading boilerplate (a blank line + os/base setup) is trimmed
+        // so the meaningful line surfaces first.
+        "execute_code" | "workspace_execute_code" => {
+            pick("code").map(|c| trim_code_preview(&c))
+        }
+        // Script edits: identify the script + show the new snippet, not a full
+        // re-send of the source.
+        "workspace_edit_code" => {
+            let sid = pick("script_id").unwrap_or_default();
+            match pick("new_string") {
+                Some(ns) => Some(format!("{sid}: {}", ns.replace('\n', " "))),
+                None => Some(sid),
+            }
         }
         t if t.starts_with("browser_") => pick("url").or_else(|| pick("selector")).or_else(|| pick("script")),
         "spawn_subagent" => pick("agent_id").or_else(|| pick("task")),
@@ -345,13 +506,21 @@ fn concise_args(tool: &str, v: &Value) -> String {
             let nodes = v.get("nodes").and_then(|n| n.as_array()).map(|a| a.len()).unwrap_or(0);
             Some(format!("objective={objective:?}, {nodes} node(s)"))
         }
+        // render_ui/init_ui carry an array of UI nodes ({type, …}). Summarize as
+        // "N widgets: <types>" plus the first heading/title for context, instead
+        // of dumping the whole node tree.
+        "render_ui" | "init_ui" => Some(summarize_ui_nodes(v.get("nodes"))),
         _ => None,
     };
     let s = chosen.unwrap_or_else(|| {
-        if v.is_null() || (v.is_object() && v.as_object().map(|o| o.is_empty()).unwrap_or(false)) {
-            String::new()
-        } else {
-            v.to_string()
+        match v {
+            Value::Null => String::new(),
+            Value::Object(obj) if obj.is_empty() => String::new(),
+            // Any other tool (create_finding, fetch_strobes_assets, init_ui,
+            // render_ui, create_learning, …): summarize the object instead of
+            // dumping its raw JSON.
+            Value::Object(obj) => generic_summary(obj),
+            other => other.to_string(),
         }
     });
     let s = s.replace('\n', " ");
@@ -441,7 +610,7 @@ fn handle_frame(v: Value, app_tx: &mpsc::UnboundedSender<AppEvent>, out_tx: &mps
         if let Some(ws) = ws_any {
             input["_workspace_id"] = json!(ws);
         }
-        let arg_summary = concise_args(&tool_name, &input);
+        let arg_summary = tool_detail(&tool_name, &input);
         let _ = app_tx.send(AppEvent::Stream(StreamItem {
             kind: "tool_start".into(),
             agent,
@@ -588,7 +757,7 @@ fn handle_frame(v: Value, app_tx: &mpsc::UnboundedSender<AppEvent>, out_tx: &mps
             let name = sval(&b, "toolName");
             match status.as_deref() {
                 Some("start") => {
-                    let detail = concise_args(name.as_deref().unwrap_or(""), b.get("arguments").unwrap_or(&Value::Null));
+                    let detail = tool_detail(name.as_deref().unwrap_or(""), b.get("arguments").unwrap_or(&Value::Null));
                     Some(StreamItem {
                         kind: "tool_start".into(), agent, text: None, tool_name: name,
                         detail: Some(detail), status: Some("start".into()), local: false, task_id: None,
@@ -669,8 +838,31 @@ fn handle_frame(v: Value, app_tx: &mpsc::UnboundedSender<AppEvent>, out_tx: &mps
 
 #[cfg(test)]
 mod concise_args_tests {
-    use super::concise_args;
+    use super::{concise_args, trim_code_preview};
     use serde_json::json;
+
+    #[test]
+    fn code_tool_shows_code_not_json_wrapper() {
+        let args = json!({
+            "code": "\nimport os,subprocess\nbase=os.path.expanduser(\"~/.strobes/workspace\")\nr=subprocess.run([\"bash\",\"-lc\",\"id\"])",
+            "environment": "bedrock",
+        });
+        let out = concise_args("workspace_execute_code", &args);
+        // Surfaces the meaningful line, not the import/base boilerplate or JSON.
+        assert!(out.starts_with("r=subprocess.run"), "got: {out}");
+        assert!(!out.contains("\"code\""), "should not dump the JSON wrapper");
+        assert!(!out.contains("import os"), "boilerplate import should be skipped");
+    }
+
+    #[test]
+    fn trim_code_preview_skips_boilerplate_and_marks_more() {
+        // Imports/base setup are skipped so real work shows first.
+        assert_eq!(trim_code_preview("\nimport os\nbase=os.path.expanduser('~')\nx=1"), "x=1");
+        assert_eq!(trim_code_preview("import os\nx=1\ny=2"), "x=1 …");
+        // All-boilerplate falls back to the first line (with … since more follow).
+        assert_eq!(trim_code_preview("import os\nbase=os.path.expanduser('~')"), "import os …");
+        assert_eq!(trim_code_preview(""), "");
+    }
 
     #[test]
     fn summarizes_dynamic_harness_instead_of_dumping_raw_dag() {

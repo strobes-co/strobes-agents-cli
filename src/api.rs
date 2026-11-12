@@ -3,11 +3,11 @@
 //! `Authorization: token <key>` — matches strobes/app/authentication.py.
 
 use anyhow::{anyhow, Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::config::Profile;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Workspace {
     pub id: String,
     #[serde(default)]
@@ -44,7 +44,7 @@ pub struct WorkspaceCredits {
 }
 
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Thread {
     pub id: String,
     #[serde(default)]
@@ -345,7 +345,17 @@ impl ApiClient {
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            return Err(anyhow!("upload failed: HTTP {}: {}", status.as_u16(), trunc(&body, 200)));
+            let reason = html_error_reason(&body);
+            // A bare 400 on this endpoint is almost always the server's request
+            // body-size limit (Django DATA_UPLOAD_MAX_MEMORY_SIZE, ~2.5 MB by
+            // default) rejecting a large file — surface that instead of a wall
+            // of HTML.
+            let hint = if status.as_u16() == 400 {
+                " — the file may exceed the server's upload size limit"
+            } else {
+                ""
+            };
+            return Err(anyhow!("HTTP {} ({reason}){hint}", status.as_u16()));
         }
         Ok(())
     }
@@ -896,9 +906,37 @@ fn trunc(s: &str, n: usize) -> String {
     }
 }
 
+/// Turn an error response body into one concise line. HTML error pages (e.g.
+/// Django's "Bad Request (400)") collapse to their <title>; anything else is
+/// just trimmed/truncated. Keeps a wall of HTML out of the UI.
+fn html_error_reason(body: &str) -> String {
+    let b = body.trim();
+    let lower = b.to_ascii_lowercase();
+    if let (Some(s), Some(e)) = (lower.find("<title>"), lower.find("</title>")) {
+        let inner = b[s + 7..e].trim();
+        if !inner.is_empty() {
+            return inner.to_string();
+        }
+    }
+    if b.is_empty() {
+        "no response body".to_string()
+    } else {
+        trunc(b, 120)
+    }
+}
+
 #[cfg(test)]
 mod trunc_tests {
-    use super::trunc;
+    use super::{html_error_reason, trunc};
+
+    #[test]
+    fn html_error_reason_extracts_title() {
+        let body = "<!doctype html><html lang=\"en\"><head>  <title>Bad Request (400)</title></head><body><h1>Bad Request (400)</h1></body></html>";
+        assert_eq!(html_error_reason(body), "Bad Request (400)");
+        assert_eq!(html_error_reason(""), "no response body");
+        assert_eq!(html_error_reason("plain text error"), "plain text error");
+    }
+
 
     #[test]
     fn leaves_short_strings_untouched() {

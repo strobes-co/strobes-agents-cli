@@ -9,6 +9,7 @@ mod analyzer_registry;
 mod api;
 mod app;
 mod browser;
+mod cache;
 mod config;
 mod local;
 mod pack;
@@ -29,14 +30,25 @@ use tokio::sync::mpsc;
 use app::App;
 use config::Config;
 
-/// Capture mouse events so trackpad/wheel scroll reaches the transcript.
+/// Capture mouse events so trackpad/wheel scroll reaches the transcript, and
+/// enable bracketed paste so a file/folder dragged onto the terminal arrives as
+/// a single `Event::Paste` we can act on immediately (auto-upload) instead of
+/// waiting for the user to press Enter.
 /// (Native click-drag selection still works while holding Option/Shift.)
 pub fn enable_mouse() {
-    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture);
+    let _ = crossterm::execute!(
+        std::io::stdout(),
+        crossterm::event::EnableMouseCapture,
+        crossterm::event::EnableBracketedPaste,
+    );
 }
 
 pub fn disable_mouse() {
-    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
+    let _ = crossterm::execute!(
+        std::io::stdout(),
+        crossterm::event::DisableBracketedPaste,
+        crossterm::event::DisableMouseCapture,
+    );
 }
 
 /// Alert the user that a response finished, by writing terminal escape codes the
@@ -1031,6 +1043,52 @@ fn auth_line(p: &config::Profile, tenant: &str) -> String {
     format!("✔ authenticated · tenant: {tenant} · {} · org {org}", p.base_url)
 }
 
+/// Order workspaces most-opened then most-recent (never-opened keep server order).
+fn sort_ws_by_recency(workspaces: &mut [api::Workspace], cfg: &Config) {
+    workspaces.sort_by(|a, b| {
+        cfg.workspace_open_count(&b.id)
+            .cmp(&cfg.workspace_open_count(&a.id))
+            .then(cfg.workspace_last_opened(&b.id).cmp(&cfg.workspace_last_opened(&a.id)))
+    });
+}
+
+/// Build the workspace picker's live snapshot: two fixed rows ("New" /
+/// "No workspace") then one row per workspace, with ids + has-workflow flags
+/// parallel to the labels. `wf_states` may be empty (cache render, no badges yet).
+fn build_ws_live_list(
+    workspaces: &[api::Workspace],
+    wf_states: &[Option<api::WorkflowState>],
+    cur: Option<&str>,
+    cfg: &Config,
+    auth: &str,
+) -> picker::LiveList {
+    let mut labels = vec![
+        "➕  New workspace".to_string(),
+        "↪  No workspace (all threads)".to_string(),
+    ];
+    let mut ids = vec!["__new__".to_string(), "__none__".to_string()];
+    let mut flags = vec![false, false];
+    for (idx, w) in workspaces.iter().enumerate() {
+        let wf = wf_states.get(idx).and_then(|s| s.as_ref());
+        let name = if w.name.is_empty() { "(unnamed)" } else { &w.name };
+        let mark = if Some(w.id.as_str()) == cur { "  ✓" } else { "" };
+        let count = cfg.workspace_open_count(&w.id);
+        let recent = if count > 0 { format!("  · ↻ ×{count}") } else { String::new() };
+        let wf_badge = match wf.map(|s| s.status.as_str()) {
+            Some("running") => "  ⚙ running",
+            Some("paused") => "  ⚙ paused",
+            Some("pending") => "  ⚙ pending",
+            Some("failed") => "  ⚙ failed",
+            Some("completed") => "  ⚙ done",
+            _ => "",
+        };
+        labels.push(format!("{name}   [{}]{mark}{recent}{wf_badge}", w.status));
+        ids.push(w.id.clone());
+        flags.push(wf.is_some());
+    }
+    picker::LiveList { labels, ids, flags, auth: auth.to_string() }
+}
+
 async fn resolve_workspace_interactive(
     terminal: &mut ratatui::DefaultTerminal,
     tenant: &str,
@@ -1040,86 +1098,81 @@ async fn resolve_workspace_interactive(
     require_complete(profile)?;
     let auth = auth_line(profile, tenant);
     let client = api::ApiClient::new(profile.clone())?;
-    let mut workspaces = client.list_workspaces().await.unwrap_or_default();
-    // Surface frequently-opened workspaces first (most opens, then most recent).
-    // Stable sort keeps never-opened ones in the server's order below.
-    workspaces.sort_by(|a, b| {
-        cfg.workspace_open_count(&b.id)
-            .cmp(&cfg.workspace_open_count(&a.id))
-            .then(cfg.workspace_last_opened(&b.id).cmp(&cfg.workspace_last_opened(&a.id)))
-    });
+    // Tab hint shown as a context line below the auth banner.
+    let auth_with_hint = format!("{auth}\n↹ Tab on a workspace: open live workflow TUI");
+    let cur = profile.workspace_id.clone();
 
-    // Fetch workflow state for every workspace concurrently so we can badge rows.
-    let wf_states: Vec<Option<api::WorkflowState>> = {
-        let futs: Vec<_> = workspaces.iter().map(|w| client.workspace_workflow(&w.id)).collect();
-        futures_util::future::join_all(futs)
-            .await
-            .into_iter()
-            .map(|r| r.ok().flatten())
-            .collect()
+    // Seed the picker from cache so it's actionable INSTANTLY (cold cache → just
+    // the New / No-workspace rows). Badges (workflow state) fill in after the
+    // background refetch.
+    let initial = {
+        let mut cached = cache::load_workspaces(tenant).unwrap_or_default();
+        sort_ws_by_recency(&mut cached, cfg);
+        build_ws_live_list(&cached, &[], cur.as_deref(), cfg, &auth_with_hint)
     };
+    let (tx, rx) = tokio::sync::watch::channel(initial);
 
-    let cur = profile.workspace_id.as_deref();
-    // Item 0 = create new, item 1 = no workspace, then existing workspaces (offset 2).
-    let mut labels = vec![
-        "➕  New workspace".to_string(),
-        "↪  No workspace (all threads)".to_string(),
-    ];
-    for (w, wf) in workspaces.iter().zip(wf_states.iter()) {
-        let name = if w.name.is_empty() { "(unnamed)" } else { &w.name };
-        let mark = if Some(w.id.as_str()) == cur { "  ✓" } else { "" };
-        let count = cfg.workspace_open_count(&w.id);
-        let recent = if count > 0 { format!("  · ↻ ×{count}") } else { String::new() };
-        let wf_badge = match wf.as_ref().map(|s| s.status.as_str()) {
-            Some("running") => "  ⚙ running",
-            Some("paused") => "  ⚙ paused",
-            Some("pending") => "  ⚙ pending",
-            Some("failed") => "  ⚙ failed",
-            Some("completed") => "  ⚙ done",
-            _ => "",
-        };
-        labels.push(format!("{name}   [{}]{mark}{recent}{wf_badge}", w.status));
+    // Refetch in the BACKGROUND — never blocks the user. Pull the live list +
+    // per-workspace workflow badges, publish them to the picker, and refresh the
+    // on-disk cache. If the user has already selected, the picker has returned
+    // and this send is simply dropped (no UI rewrite).
+    {
+        let profile = profile.clone();
+        let tenant = tenant.to_string();
+        let auth = auth_with_hint.clone();
+        let cur = cur.clone();
+        tokio::spawn(async move {
+            let client = match api::ApiClient::new(profile) { Ok(c) => c, Err(_) => return };
+            let mut workspaces = match client.list_workspaces().await { Ok(w) => w, Err(_) => return };
+            let cfg = Config::load();
+            sort_ws_by_recency(&mut workspaces, &cfg);
+            cache::save_workspaces(&tenant, &workspaces);
+            let wf_states: Vec<Option<api::WorkflowState>> = {
+                let futs: Vec<_> = workspaces.iter().map(|w| client.workspace_workflow(&w.id)).collect();
+                futures_util::future::join_all(futs).await.into_iter().map(|r| r.ok().flatten()).collect()
+            };
+            let list = build_ws_live_list(&workspaces, &wf_states, cur.as_deref(), &cfg, &auth);
+            let _ = tx.send(list);
+        });
     }
 
-    // Add Tab hint as a context line below the auth banner.
-    let auth_with_hint = format!("{auth}\n↹ Tab on a workspace: open live workflow TUI");
-
     loop {
-        match picker::select_with(terminal, "Select a workspace", &labels, &auth_with_hint).await? {
-            picker::Nav::Item(0) => {
-                // Ask for a name and an optional setup prompt; Esc on the name
-                // cancels back to the picker.
-                let name = match picker::prompt_text(terminal, "New workspace — name", "", &auth).await? {
-                    Some(n) => n.trim().to_string(),
-                    None => continue,
-                };
-                let name = if name.is_empty() { "CLI Workspace".to_string() } else { name };
-                let prompt = picker::prompt_text(
-                    terminal,
-                    "Setup prompt — what should this workspace do? (optional)",
-                    "",
-                    &auth,
-                )
-                .await?
-                .map(|p| p.trim().to_string())
-                .filter(|p| !p.is_empty());
-                let (id, setup_thread) = client.create_workspace(&name).await?;
-                return Ok(WsChoice::Created { id, setup_thread, prompt });
-            }
-            picker::Nav::Item(1) => return Ok(WsChoice::Pick(None)),
-            picker::Nav::Item(i) => return Ok(WsChoice::Pick(Some(workspaces[i - 2].id.clone()))),
-            // Tab on a workspace row → open the Watch TUI inline if a workflow exists.
-            picker::Nav::Shortcut(i) if i >= 2 => {
-                let ws = &workspaces[i - 2];
-                if wf_states[i - 2].is_some() {
-                    let _ = remote_wf_tui::run(terminal, &client, ws.id.clone(), profile.clone(), tenant.to_string()).await;
+        match picker::select_live(terminal, "Select a workspace", rx.clone()).await? {
+            picker::LiveNav::Item { id, .. } => match id.as_str() {
+                "__new__" => {
+                    // Ask for a name + optional setup prompt; Esc on the name
+                    // cancels back to the picker.
+                    let name = match picker::prompt_text(terminal, "New workspace — name", "", &auth).await? {
+                        Some(n) => n.trim().to_string(),
+                        None => continue,
+                    };
+                    let name = if name.is_empty() { "CLI Workspace".to_string() } else { name };
+                    let prompt = picker::prompt_text(
+                        terminal,
+                        "Setup prompt — what should this workspace do? (optional)",
+                        "",
+                        &auth,
+                    )
+                    .await?
+                    .map(|p| p.trim().to_string())
+                    .filter(|p| !p.is_empty());
+                    let (id, setup_thread) =
+                        picker::with_loader(terminal, "Creating workspace", client.create_workspace(&name)).await?;
+                    return Ok(WsChoice::Created { id, setup_thread, prompt });
+                }
+                "__none__" => return Ok(WsChoice::Pick(None)),
+                other => return Ok(WsChoice::Pick(Some(other.to_string()))),
+            },
+            // Tab on a workspace row with a live workflow → open the Watch TUI.
+            picker::LiveNav::Shortcut { id, flag } => {
+                if flag && id != "__new__" && id != "__none__" {
+                    let _ = remote_wf_tui::run(terminal, &client, id, profile.clone(), tenant.to_string()).await;
                     terminal.clear()?;
                 }
-                // Fall through to re-show the workspace picker.
+                // else: Tab on New / No-workspace / a workflow-less row — ignore.
             }
-            picker::Nav::Shortcut(_) => {} // Tab on "New" / "No workspace" — ignore.
             // Esc on the first screen quits cleanly (no prior screen to return to).
-            picker::Nav::Back | picker::Nav::Quit => return Ok(WsChoice::Quit),
+            picker::LiveNav::Back | picker::LiveNav::Quit => return Ok(WsChoice::Quit),
         }
     }
 }
@@ -1133,6 +1186,26 @@ enum ThreadChoice {
 
 /// Show a thread picker (with a "new thread" option) and return the chosen
 /// thread id, creating one via REST if requested.
+/// Build the thread picker's live snapshot: a "New thread" row then one row per
+/// thread, with thread ids parallel to the labels.
+fn build_threads_live_list(threads: &[api::Thread], auth: &str) -> picker::LiveList {
+    let mut labels = vec!["➕  New thread".to_string()];
+    let mut ids = vec!["__new__".to_string()];
+    let mut flags = vec![false];
+    for t in threads {
+        let title = if t.title.is_empty() { "(untitled)".to_string() } else { t.title.clone() };
+        let last = if t.last_message.is_empty() {
+            String::new()
+        } else {
+            format!("  — {}", trunc(&t.last_message, 50))
+        };
+        labels.push(format!("{title}   [{}]{last}", t.status));
+        ids.push(t.id.clone());
+        flags.push(false);
+    }
+    picker::LiveList { labels, ids, flags, auth: auth.to_string() }
+}
+
 async fn resolve_thread_interactive(
     terminal: &mut ratatui::DefaultTerminal,
     tenant: &str,
@@ -1141,50 +1214,72 @@ async fn resolve_thread_interactive(
     require_complete(profile)?;
     let auth = auth_line(profile, tenant);
     let client = api::ApiClient::new(profile.clone())?;
-    // Scope to the bound workspace if there is one.
-    let threads = client
-        .list_threads(profile.workspace_id.as_deref())
-        .await
-        .unwrap_or_default();
+    let ws_scope = profile.workspace_id.clone();
 
-    // Context lines under the ASCII art: which workspace these threads belong
-    // to, plus its headline counts (threads · credits · findings · files).
-    let auth = match profile.workspace_id.as_deref() {
-        Some(id) => {
-            // Resolve the name and the stats counts concurrently.
-            let (workspaces, (credits, findings, files)) =
-                tokio::join!(client.list_workspaces(), fetch_workspace_stats(&client, id));
-            let name = workspaces
-                .ok()
-                .and_then(|ws| ws.into_iter().find(|w| w.id.as_str() == id).map(|w| w.name))
-                .filter(|n| !n.is_empty())
-                .unwrap_or_else(|| format!("{}…", &id[..8.min(id.len())]));
-            let stats = format!(
-                "{} threads  ·  ◈ {credits:.2} credits  ·  ⚠ {findings} findings  ·  {files} files",
-                threads.len()
-            );
-            format!("{auth}\n⊞ workspace: {name}\n{stats}")
-        }
-        None => format!("{auth}\n⊞ workspace: (none — all threads)"),
+    // Instant paint from cached threads (and the workspace name, if cached) so
+    // the user can act right away; the fresh list + full stats subtitle land via
+    // the background refetch below.
+    let initial = {
+        let cached = cache::load_threads(tenant, ws_scope.as_deref()).unwrap_or_default();
+        let subtitle = match ws_scope.as_deref() {
+            Some(id) => {
+                let name = cache::load_workspaces(tenant)
+                    .and_then(|ws| ws.into_iter().find(|w| w.id == id).map(|w| w.name))
+                    .filter(|n| !n.is_empty())
+                    .unwrap_or_else(|| format!("{}…", &id[..8.min(id.len())]));
+                format!("{auth}\n⊞ workspace: {name}")
+            }
+            None => format!("{auth}\n⊞ workspace: (none — all threads)"),
+        };
+        build_threads_live_list(&cached, &subtitle)
     };
+    let (tx, rx) = tokio::sync::watch::channel(initial);
 
-    let mut labels = vec!["➕  New thread".to_string()];
-    for t in &threads {
-        let title = if t.title.is_empty() { "(untitled)".into() } else { t.title.clone() };
-        let last = if t.last_message.is_empty() { String::new() } else { format!("  — {}", trunc(&t.last_message, 50)) };
-        labels.push(format!("{title}   [{}]{last}", t.status));
+    // Background refetch — never blocks. Pulls threads (+ the workspace's name
+    // and headline stats), publishes to the picker, and refreshes the cache.
+    {
+        let profile = profile.clone();
+        let tenant = tenant.to_string();
+        let auth = auth.clone();
+        let ws_scope = ws_scope.clone();
+        tokio::spawn(async move {
+            let client = match api::ApiClient::new(profile) { Ok(c) => c, Err(_) => return };
+            let threads = match client.list_threads(ws_scope.as_deref()).await { Ok(t) => t, Err(_) => return };
+            cache::save_threads(&tenant, ws_scope.as_deref(), &threads);
+            let subtitle = match ws_scope.as_deref() {
+                Some(id) => {
+                    let (workspaces, (credits, findings, files)) =
+                        tokio::join!(client.list_workspaces(), fetch_workspace_stats(&client, id));
+                    let name = workspaces
+                        .ok()
+                        .and_then(|ws| ws.into_iter().find(|w| w.id.as_str() == id).map(|w| w.name))
+                        .filter(|n| !n.is_empty())
+                        .unwrap_or_else(|| format!("{}…", &id[..8.min(id.len())]));
+                    let stats = format!(
+                        "{} threads  ·  ◈ {credits:.2} credits  ·  ⚠ {findings} findings  ·  {files} files",
+                        threads.len()
+                    );
+                    format!("{auth}\n⊞ workspace: {name}\n{stats}")
+                }
+                None => format!("{auth}\n⊞ workspace: (none — all threads)"),
+            };
+            let _ = tx.send(build_threads_live_list(&threads, &subtitle));
+        });
     }
 
-    match picker::select_with(terminal, "Select a thread", &labels, &auth).await? {
-        picker::Nav::Item(0) => {
-            let id = client
-                .create_thread("CLI session", profile.workspace_id.as_deref(), None)
-                .await?;
+    match picker::select_live(terminal, "Select a thread", rx.clone()).await? {
+        picker::LiveNav::Item { id, .. } if id == "__new__" => {
+            let id = picker::with_loader(
+                terminal,
+                "Creating thread",
+                client.create_thread("CLI session", profile.workspace_id.as_deref(), None),
+            )
+            .await?;
             Ok(ThreadChoice::Pick(id))
         }
-        picker::Nav::Item(i) => Ok(ThreadChoice::Pick(threads[i - 1].id.clone())),
-        picker::Nav::Back | picker::Nav::Shortcut(_) => Ok(ThreadChoice::Back),
-        picker::Nav::Quit => Ok(ThreadChoice::Quit),
+        picker::LiveNav::Item { id, .. } => Ok(ThreadChoice::Pick(id)),
+        picker::LiveNav::Back | picker::LiveNav::Shortcut { .. } => Ok(ThreadChoice::Back),
+        picker::LiveNav::Quit => Ok(ThreadChoice::Quit),
     }
 }
 
@@ -1303,6 +1398,188 @@ async fn upload_one(
         mirror_into_folder(root, &dest, path, &bytes);
     }
     Ok(dest)
+}
+
+/// Max number of files a single drag-and-drop upload will expand to, so an
+/// accidentally-dropped huge tree can't kick off thousands of uploads. Past
+/// this the drop is refused with a hint to narrow it or use `strobes push`.
+const MAX_DRAG_UPLOAD_FILES: usize = 500;
+
+/// Directory/file names skipped when a dropped folder is expanded — VCS
+/// metadata, dependency/build caches and OS cruft that must never be uploaded.
+fn is_ignored_upload_name(name: &str) -> bool {
+    matches!(
+        name,
+        ".git" | ".hg" | ".svn" | "node_modules" | "target" | "__pycache__"
+            | ".venv" | "venv" | ".mypy_cache" | ".pytest_cache" | ".DS_Store"
+            | "dist" | "build" | ".next" | ".idea" | ".vscode" | ".cache"
+    )
+}
+
+/// Expand dropped paths into concrete `(local_file, dest_prefix)` upload
+/// entries. A plain file uploads at the workspace root (empty prefix → dest is
+/// just its name). A dropped folder is walked recursively and each file keeps
+/// its path relative to the folder's PARENT, so dropping `~/proj` yields
+/// `proj/src/main.rs`, `proj/README.md`, … Ignored dirs/files (see
+/// `is_ignored_upload_name`) are skipped. Errors if the total exceeds
+/// `MAX_DRAG_UPLOAD_FILES`.
+fn collect_upload_entries(
+    paths: &[std::path::PathBuf],
+) -> Result<Vec<(std::path::PathBuf, String)>> {
+    let mut out: Vec<(std::path::PathBuf, String)> = Vec::new();
+    for p in paths {
+        if p.is_file() {
+            out.push((p.clone(), String::new()));
+        } else if p.is_dir() {
+            let base = p.parent().unwrap_or_else(|| std::path::Path::new(""));
+            walk_dir_for_upload(p, base, &mut out)?;
+        }
+        if out.len() > MAX_DRAG_UPLOAD_FILES {
+            return Err(anyhow!(
+                "too many files to drop at once (> {MAX_DRAG_UPLOAD_FILES}) — \
+                 narrow the folder or use `strobes push`"
+            ));
+        }
+    }
+    Ok(out)
+}
+
+/// Recursive worker for `collect_upload_entries`. `base` is the ancestor the
+/// dest path is made relative to (the dropped folder's parent), so the folder's
+/// own name is preserved as the top-level prefix in the workspace.
+fn walk_dir_for_upload(
+    dir: &std::path::Path,
+    base: &std::path::Path,
+    out: &mut Vec<(std::path::PathBuf, String)>,
+) -> Result<()> {
+    let rd = std::fs::read_dir(dir).map_err(|e| anyhow!("read dir {}: {e}", dir.display()))?;
+    // Stable order so uploads (and the progress readout) are deterministic.
+    let mut children: Vec<std::path::PathBuf> = rd.filter_map(|e| e.ok().map(|e| e.path())).collect();
+    children.sort();
+    for path in children {
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        if is_ignored_upload_name(&name) {
+            continue;
+        }
+        if path.is_dir() {
+            walk_dir_for_upload(&path, base, out)?;
+        } else if path.is_file() {
+            // dest prefix = the file's parent relative to `base`, '/'-joined
+            // with a trailing '/'. `upload_one` appends the file name.
+            let prefix = path
+                .parent()
+                .and_then(|par| par.strip_prefix(base).ok())
+                .map(|rel| {
+                    let s = rel.to_string_lossy().replace('\\', "/");
+                    if s.is_empty() { String::new() } else { format!("{s}/") }
+                })
+                .unwrap_or_default();
+            out.push((path, prefix));
+        }
+        if out.len() > MAX_DRAG_UPLOAD_FILES {
+            return Err(anyhow!(
+                "too many files to drop at once (> {MAX_DRAG_UPLOAD_FILES}) — \
+                 narrow the folder or use `strobes push`"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Background multi-file/folder upload: uploads each `(file, prefix)` entry,
+/// streaming live progress to the UI via `AppEvent::Progress` (status-bar
+/// spinner) and a final summary via `AppEvent::Notice`. Mirrors each file into
+/// the workspace sync roots (sandbox + bound folder) exactly like a single-file
+/// upload. Runs off the render loop so the UI stays responsive during a big drop.
+async fn upload_entries_task(
+    profile: config::Profile,
+    ws: String,
+    entries: Vec<(std::path::PathBuf, String)>,
+    tx: mpsc::UnboundedSender<pulse::AppEvent>,
+) {
+    let client = match api::ApiClient::new(profile) {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = tx.send(pulse::AppEvent::Progress(None));
+            let _ = tx.send(pulse::AppEvent::Error(format!("upload failed: {e}")));
+            return;
+        }
+    };
+    let sync_roots = workspace_sync_roots(&Config::load(), &ws);
+    let total = entries.len();
+    // Pre-measure each file so the progress line can show bytes + a true %.
+    let sizes: Vec<u64> = entries
+        .iter()
+        .map(|(p, _)| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0))
+        .collect();
+    let total_bytes: u64 = sizes.iter().sum();
+    let mut done_bytes: u64 = 0;
+    let (mut ok, mut failed) = (0usize, 0usize);
+    for (i, (path, prefix)) in entries.iter().enumerate() {
+        let shown = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.to_string_lossy().into_owned());
+        // % reflects bytes completed so far (not counting the in-flight file),
+        // so it only ever moves forward as each file finishes.
+        let pct = if total_bytes > 0 {
+            (done_bytes as f64 / total_bytes as f64 * 100.0).round() as u64
+        } else {
+            (i as f64 / total.max(1) as f64 * 100.0).round() as u64
+        };
+        let _ = tx.send(pulse::AppEvent::Progress(Some(format!(
+            "⬆ {}/{total} · {}/{} ({pct}%) — {prefix}{shown}",
+            i + 1,
+            fmt_bytes(done_bytes),
+            fmt_bytes(total_bytes),
+        ))));
+        let local = path.to_string_lossy().to_string();
+        match upload_one(&client, &ws, &local, prefix, &sync_roots).await {
+            Ok(_) => ok += 1,
+            Err(e) => {
+                failed += 1;
+                let _ = tx.send(pulse::AppEvent::Error(format!(
+                    "upload failed ({prefix}{shown}, {}): {e}",
+                    fmt_bytes(sizes[i])
+                )));
+            }
+        }
+        // Count the file's bytes toward progress whether it succeeded or not, so
+        // the bar can still reach ~100% on a partial batch.
+        done_bytes += sizes[i];
+    }
+    let _ = tx.send(pulse::AppEvent::Progress(None));
+    let where_to = match sync_roots.first() {
+        Some(r) => format!(" (synced to {})", r.display()),
+        None => String::new(),
+    };
+    if ok > 0 {
+        let fail_note = if failed > 0 { format!(", {failed} failed") } else { String::new() };
+        let _ = tx.send(pulse::AppEvent::Notice(format!(
+            "✔ uploaded {ok}/{total} file(s) · {} to the workspace{where_to}{fail_note}",
+            fmt_bytes(total_bytes)
+        )));
+    } else {
+        let _ = tx.send(pulse::AppEvent::Notice(format!(
+            "✗ no files uploaded ({failed} failed)"
+        )));
+    }
+}
+
+/// Human-readable byte count (B / KB / MB / GB, 1024-based).
+fn fmt_bytes(n: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
+    let mut v = n as f64;
+    let mut u = 0;
+    while v >= 1024.0 && u < UNITS.len() - 1 {
+        v /= 1024.0;
+        u += 1;
+    }
+    if u == 0 {
+        format!("{n} B")
+    } else {
+        format!("{v:.1} {}", UNITS[u])
+    }
 }
 
 /// Local folders that mirror a workspace: the per-workspace sandbox the chat
@@ -6919,6 +7196,7 @@ fn describe(ev: &pulse::AppEvent) -> String {
         RunStarted => "run started".into(),
         RunFinished(l) => format!("run finished: {l}"),
         Notice(n) => format!("notice: {n}"),
+        Progress(p) => format!("progress: {p:?}"),
         Credits { credits, tokens, final_run } => format!("credits {credits:.4} tokens {tokens} final={final_run}"),
         Error(e) => format!("error: {e}"),
         LocalToolDone { name, ms, exit, err } => {
@@ -7231,10 +7509,12 @@ enum DeferResult {
     Error(String),
 }
 
-/// If the input is one or more existing local file paths (e.g. a file dragged
-/// onto the terminal, which inserts its path), return them — so a plain run can
-/// upload instead of sending the path as a chat message. Returns None for
-/// normal text. Handles `~`, quotes and backslash-escaped spaces.
+/// If the input is one or more existing local paths — files OR directories
+/// (e.g. a file/folder dragged onto the terminal, which inserts its path) —
+/// return them, so a plain run can upload instead of sending the path as a chat
+/// message. Dropped folders are expanded recursively at upload time (see
+/// `collect_upload_entries`). Returns None for normal text. Handles `~`, quotes
+/// and backslash-escaped spaces.
 fn parse_dragged_paths(input: &str) -> Option<Vec<std::path::PathBuf>> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
@@ -7282,7 +7562,9 @@ fn parse_dragged_paths(input: &str) -> Option<Vec<std::path::PathBuf>> {
         } else {
             std::path::PathBuf::from(&t)
         };
-        if !p.is_file() {
+        // Accept existing files AND directories — a dropped folder is expanded
+        // and uploaded recursively (see `collect_upload_entries`).
+        if !p.is_file() && !p.is_dir() {
             return None;
         }
         paths.push(p);
@@ -7362,15 +7644,22 @@ pub async fn run_chat(
     // their result back here instead.
     let (defer_tx, mut defer_rx) = mpsc::unbounded_channel::<DeferResult>();
     let ws_scope = profile.workspace_id.clone();
-    let (conn, events_res, threads_res, cmds_res, run_res, ws_res, credits_res) = tokio::join!(
-        pulse::connect(&profile, &thread_id, tx, model, reasoning.clone()),
-        client.get_thread_events(&thread_id, 0, 2000),
-        client.list_threads(ws_scope.as_deref()),
-        client.list_slash_commands(),
-        client.get_thread_history(&thread_id, 1),
-        client.list_workspaces(),
-        client.get_credits(None, Some(&thread_id)),
-    );
+    // Open the connection and prime the thread (events, threads, commands,
+    // history, workspaces, credits) concurrently — under a centered animated
+    // loader so entering a chat doesn't sit on a blank screen.
+    let (conn, events_res, threads_res, cmds_res, run_res, ws_res, credits_res) =
+        picker::with_loader(terminal, "Loading chat", async {
+            tokio::join!(
+                pulse::connect(&profile, &thread_id, tx, model, reasoning.clone()),
+                client.get_thread_events(&thread_id, 0, 2000),
+                client.list_threads(ws_scope.as_deref()),
+                client.list_slash_commands(),
+                client.get_thread_history(&thread_id, 1),
+                client.list_workspaces(),
+                client.get_credits(None, Some(&thread_id)),
+            )
+        })
+        .await;
     let mut handle = conn?;
     // Resolve the bound workspace's name for the top-right indicator.
     if let (Some(wid), Ok(wss)) = (ws_scope.as_deref(), &ws_res) {
@@ -7565,7 +7854,7 @@ pub async fn run_chat(
                                     if app.select_mode { disable_mouse(); } else { enable_mouse(); }
                                 }
                                 KeyCode::Char('w') if ctrl => defer = Some(Defer::Workspaces),
-                                KeyCode::Char('o') if ctrl => defer = Some(Defer::Threads),
+                                KeyCode::Char('o') if ctrl => app.show_full_code = !app.show_full_code,
                                 KeyCode::Char('p') if ctrl => defer = Some(Defer::Models),
                                 KeyCode::Char('f') if ctrl => defer = Some(Defer::Findings),
                                 KeyCode::Char('a') if ctrl => defer = Some(Defer::Approvals),
@@ -7628,6 +7917,25 @@ pub async fn run_chat(
                         MouseEventKind::ScrollDown => if app.overlay_active() { app.overlay_move(false) } else { app.scroll_lines(false, 3) },
                         _ => {}
                     },
+                    // A file/folder dragged onto the terminal arrives here as a
+                    // bracketed paste. If it's existing path(s) and a workspace
+                    // is bound, start the upload IMMEDIATELY (no Enter) — the
+                    // defer handler reports "uploading N file(s)" + progress.
+                    // Anything else is a normal paste: drop it into the input.
+                    Some(Ok(Event::Paste(data))) => {
+                        match parse_dragged_paths(&data) {
+                            Some(paths) if app.has_workspace => {
+                                defer = Some(Defer::UploadFiles(paths));
+                            }
+                            Some(_) => {
+                                // Looks like a dropped path but nothing to upload
+                                // into — show it and tell the user what to do.
+                                app.input_insert_str(data.trim());
+                                app.notice("bind a workspace first, then drop files or folders to upload");
+                            }
+                            None => app.input_insert_str(&data),
+                        }
+                    }
                     // A transient parse error (e.g. a stray escape byte) must NOT
                     // kill the session — just ignore it. Only a closed stream quits.
                     Some(Err(_)) => {}
@@ -7652,6 +7960,7 @@ pub async fn run_chat(
             }
             maybe_defer = defer_rx.recv() => {
                 app.clear_busy();
+                app.clear_loading();
                 match maybe_defer {
                     Some(DeferResult::OpenOverlay(kind, title, items)) => app.open_overlay(kind, title, items),
                     Some(DeferResult::Notice(s)) => app.notice(&s),
@@ -7663,7 +7972,7 @@ pub async fn run_chat(
                 // Advance the spinner while running OR waiting on a
                 // non-agent request (busy) — idle otherwise, since
                 // ratatui's diff means an idle redraw writes nothing.
-                if app.running || app.is_busy() {
+                if app.running || app.is_busy() || app.is_loading() {
                     app.tick();
                 }
             }
@@ -7680,12 +7989,15 @@ pub async fn run_chat(
         // identical to a frozen app — nothing changed on screen until it
         // either finished or (before the timeout fixes above) never did.
         match &defer {
-            Some(Defer::Workspaces) => app.set_busy("loading workspaces…"),
-            Some(Defer::Threads) => app.set_busy("loading threads…"),
-            Some(Defer::Findings) => app.set_busy("loading findings…"),
-            Some(Defer::Approvals) => app.set_busy("loading approvals…"),
-            Some(Defer::SwitchThread(_)) => app.set_busy("switching thread…"),
-            Some(Defer::BindWorkspace(_)) => app.set_busy("binding workspace…"),
+            // These fetches get the centered preloader overlay (on top of the
+            // chat UI), not the bottom status-bar spinner.
+            Some(Defer::Workspaces) => app.set_loading("Loading workspaces"),
+            Some(Defer::Threads) => app.set_loading("Loading threads"),
+            Some(Defer::Findings) => app.set_loading("Loading findings"),
+            Some(Defer::Approvals) => app.set_loading("Loading approvals"),
+            Some(Defer::SwitchThread(_)) => app.set_loading("Switching thread"),
+            Some(Defer::BindWorkspace(_)) => app.set_loading("Binding workspace"),
+            // Upload keeps the bottom status-bar progress ("uploading N/M …").
             Some(Defer::UploadFiles(_)) => app.set_busy("uploading…"),
             _ => {}
         }
@@ -7817,33 +8129,42 @@ pub async fn run_chat(
                 }
             }
             Some(Defer::UploadFiles(paths)) => {
-                app.clear_busy();
                 match profile.workspace_id.clone() {
-                Some(ws) => {
-                    // Mirror dropped files into the live workspace sandbox (what
-                    // the agent reads) and any bound folder, so local + remote
-                    // stay in sync.
-                    let sync_roots = workspace_sync_roots(&Config::load(), &ws);
-                    let mut ok = 0usize;
-                    for path in &paths {
-                        let p = path.to_string_lossy().to_string();
-                        match upload_one(&client, &ws, &p, "", &sync_roots).await {
-                            Ok(dest) => {
-                                ok += 1;
-                                app.notice(&format!("⬆ uploaded {dest}"));
-                            }
-                            Err(e) => app.on_app_event(pulse::AppEvent::Error(format!("upload failed: {e}"))),
+                    None => {
+                        app.clear_busy();
+                        app.notice("bind a workspace first, then drop files or folders to upload");
+                    }
+                    // Expand files/folders into concrete upload entries, then run
+                    // the (possibly large) upload OFF the render loop so the UI
+                    // stays live and shows per-file progress in the status bar.
+                    Some(ws) => match collect_upload_entries(&paths) {
+                        Err(e) => {
+                            app.clear_busy();
+                            app.on_app_event(pulse::AppEvent::Error(e.to_string()));
                         }
-                    }
-                    if ok > 0 {
-                        let where_to = match sync_roots.first() {
-                            Some(r) => format!(" (synced to {})", r.display()),
-                            None => String::new(),
-                        };
-                        app.notice(&format!("✔ {ok} file(s) uploaded to the workspace{where_to}"));
-                    }
-                }
-                None => app.notice("bind a workspace first, then drop files to upload"),
+                        Ok(entries) if entries.is_empty() => {
+                            app.clear_busy();
+                            app.notice("nothing to upload (empty folder, or every file was ignored)");
+                        }
+                        Ok(entries) => {
+                            let total = entries.len();
+                            let total_bytes: u64 = entries
+                                .iter()
+                                .map(|(p, _)| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0))
+                                .sum();
+                            app.notice(&format!(
+                                "⬆ uploading {total} file{} · {}…",
+                                if total == 1 { "" } else { "s" },
+                                fmt_bytes(total_bytes)
+                            ));
+                            app.set_busy(format!("uploading 0/{total} · 0%…"));
+                            let profile = profile.clone();
+                            let tx = app_tx.clone();
+                            tokio::spawn(async move {
+                                upload_entries_task(profile, ws, entries, tx).await;
+                            });
+                        }
+                    },
                 }
             }
             Some(Defer::BindWorkspace(sel)) if sel == "__new_ws__" => {
@@ -7853,6 +8174,7 @@ pub async fn run_chat(
                 // the prompt dialogs below are their own interactive step,
                 // not a network wait.
                 app.clear_busy();
+                app.clear_loading();
                 let auth = auth_line(&profile, tenant);
                 let name = match picker::prompt_text(terminal, "New workspace — name", "", &auth).await {
                     Ok(Some(n)) => {
@@ -7921,6 +8243,9 @@ pub async fn run_chat(
                 }
             }
             Some(Defer::BindWorkspace(id)) => {
+                // Paint the centered loader once before the blocking binds/fetches
+                // below (they .await inline, so there's no redraw until they return).
+                let _ = terminal.draw(|f| app.draw(f));
                 profile.workspace_id = Some(id.clone());
                 handle.set_workspace(Some(id.clone()));
                 app.has_workspace = true;
@@ -7943,6 +8268,7 @@ pub async fn run_chat(
                 // for this workspace.
                 let threads_res = client.list_threads(Some(&id)).await;
                 app.clear_busy();
+                app.clear_loading();
                 match threads_res {
                     Ok(ts) => app.open_overlay(
                         app::OverlayKind::Threads,
@@ -7953,6 +8279,9 @@ pub async fn run_chat(
                 }
             }
             Some(Defer::SwitchThread(sel)) => {
+                // Paint the centered loader once before the blocking reconnect +
+                // thread-data reload below (all .await inline, no redraw until done).
+                let _ = terminal.draw(|f| app.draw(f));
                 // "__new__" means create a fresh thread (in the bound workspace).
                 let target = if sel == "__new__" {
                     match client.create_thread("CLI session", profile.workspace_id.as_deref(), None).await {
@@ -7980,6 +8309,7 @@ pub async fn run_chat(
                     }
                 }
                 app.clear_busy();
+                app.clear_loading();
             }
             None => {}
         }
@@ -8736,6 +9066,68 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio_tungstenite::accept_async;
     use tokio_tungstenite::tungstenite::Message;
+
+    #[test]
+    fn fmt_bytes_scales_units() {
+        assert_eq!(fmt_bytes(0), "0 B");
+        assert_eq!(fmt_bytes(512), "512 B");
+        assert_eq!(fmt_bytes(1024), "1.0 KB");
+        assert_eq!(fmt_bytes(1536), "1.5 KB");
+        assert_eq!(fmt_bytes(1024 * 1024), "1.0 MB");
+        assert_eq!(fmt_bytes(3 * 1024 * 1024 * 1024), "3.0 GB");
+    }
+
+    #[test]
+    fn parse_dragged_paths_accepts_a_directory() {
+        let root = std::env::temp_dir().join(format!("strobes-drag-dir-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&root).unwrap();
+        let got = parse_dragged_paths(&root.to_string_lossy());
+        assert_eq!(got, Some(vec![root.clone()]), "a dropped folder path should parse as an upload target");
+        // A non-path word is still treated as a normal message.
+        assert!(parse_dragged_paths("hello world").is_none());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn collect_upload_entries_expands_folder_with_prefixes_and_skips_ignored() {
+        let root = std::env::temp_dir().join(format!("strobes-drag-walk-{}", uuid::Uuid::new_v4().simple()));
+        let proj = root.join("proj");
+        std::fs::create_dir_all(proj.join("src")).unwrap();
+        std::fs::create_dir_all(proj.join("node_modules/pkg")).unwrap(); // must be skipped
+        std::fs::create_dir_all(proj.join(".git")).unwrap();              // must be skipped
+        std::fs::write(proj.join("README.md"), b"r").unwrap();
+        std::fs::write(proj.join("src/main.rs"), b"m").unwrap();
+        std::fs::write(proj.join("node_modules/pkg/index.js"), b"x").unwrap();
+        std::fs::write(proj.join(".git/config"), b"c").unwrap();
+
+        let entries = collect_upload_entries(&[proj.clone()]).unwrap();
+        // Build dest strings the way upload_one would: prefix + file_name.
+        let mut dests: Vec<String> = entries
+            .iter()
+            .map(|(p, prefix)| format!("{prefix}{}", p.file_name().unwrap().to_string_lossy()))
+            .collect();
+        dests.sort();
+        assert_eq!(dests, vec!["proj/README.md".to_string(), "proj/src/main.rs".to_string()]);
+
+        // A plain file drops at the root with no prefix.
+        let file_entries = collect_upload_entries(&[proj.join("README.md")]).unwrap();
+        assert_eq!(file_entries.len(), 1);
+        assert_eq!(file_entries[0].1, "", "a plain file uploads at the workspace root");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn collect_upload_entries_rejects_oversized_drop() {
+        let root = std::env::temp_dir().join(format!("strobes-drag-cap-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&root).unwrap();
+        for i in 0..(MAX_DRAG_UPLOAD_FILES + 5) {
+            std::fs::write(root.join(format!("f{i}.txt")), b"x").unwrap();
+        }
+        let err = collect_upload_entries(&[root.clone()]).expect_err("should refuse an oversized drop");
+        assert!(err.to_string().contains("too many files"), "got: {err}");
+        std::fs::remove_dir_all(&root).ok();
+    }
 
     #[test]
     fn notify_gating_and_payload() {

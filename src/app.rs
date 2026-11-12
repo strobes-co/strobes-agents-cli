@@ -76,6 +76,9 @@ enum ToolStatus {
 }
 
 /// One transcript entry.
+/// Max lines of a code/command tool call shown before a "ctrl+o" hint.
+const CODE_PREVIEW_LINES: usize = 5;
+
 enum Block {
     User(String),
     Assistant { agent: String, md: String },
@@ -241,6 +244,9 @@ pub struct App {
     pub running: bool,
     pub show_thinking: bool,
     pub markdown: bool,
+    /// When true, code/command tool calls render their full source; otherwise
+    /// they show up to CODE_PREVIEW_LINES with a "ctrl+o" hint. Toggled by ^O.
+    pub show_full_code: bool,
     pub scroll: u16,
     pub max_scroll: u16,
     pub follow: bool,
@@ -270,6 +276,13 @@ pub struct App {
     /// the agent-turn case already; this covers everything else that used
     /// to give no feedback at all while it awaited a response.
     busy: Option<String>,
+    /// When set, a centered animated "Loading…" overlay is drawn on top of the
+    /// chat UI (for in-chat fetches like opening the Threads/Workspaces overlay
+    /// or switching threads). Distinct from `busy`, which is the bottom
+    /// status-bar spinner used for lighter/inline waits and upload progress.
+    loading: Option<String>,
+    /// Per-appearance seed so the loader's flavor message varies each time.
+    loading_seed: usize,
     overlay: Option<Overlay>,
     pub has_workspace: bool,
     // Shown top-right in the transcript: where work is running.
@@ -310,17 +323,39 @@ pub struct App {
 
 /// ASCII banner shown at the top of a fresh chat transcript and the pickers.
 /// The subtitle carries the build version (via `concat!` + `env!`).
-pub const BANNER: &str = concat!(
-    " ███████╗████████╗██████╗  ██████╗ ██████╗ ███████╗███████╗\n",
-    " ██╔════╝╚══██╔══╝██╔══██╗██╔═══██╗██╔══██╗██╔════╝██╔════╝\n",
-    " ███████╗   ██║   ██████╔╝██║   ██║██████╔╝█████╗  ███████╗\n",
-    " ╚════██║   ██║   ██╔══██╗██║   ██║██╔══██╗██╔══╝  ╚════██║\n",
-    " ███████║   ██║   ██║  ██║╚██████╔╝██████╔╝███████╗███████║\n",
-    " ╚══════╝   ╚═╝   ╚═╝  ╚═╝ ╚═════╝ ╚═════╝ ╚══════╝╚══════╝\n",
-    "            A G E N T S   A I  ·  v",
-    env!("CARGO_PKG_VERSION"),
-    "  ·  terminal client",
-);
+/// The Strobes "strobes" wordmark in white (+ ™) with a dim tagline underneath.
+/// Each returned line is already indented by `indent`. Used by the chat banner
+/// and every picker page so the brand is consistent.
+pub fn banner_spans(indent: &str) -> Vec<Line<'static>> {
+    // "strobes" in a lowercase block font (5 rows), matching the logo wordmark.
+    const WORD: [&str; 5] = [
+        "      _             _               ",
+        "  ___| |_ _ __ ___ | |__   ___  ___ ",
+        " / __| __| '__/ _ \\| '_ \\ / _ \\/ __|",
+        " \\__ \\ |_| | | (_) | |_) |  __/\\__ \\",
+        " |___/\\__|_|  \\___/|_.__/ \\___||___/",
+    ];
+    let white = Style::default().fg(Color::White).add_modifier(Modifier::BOLD);
+    let tm = Style::default().fg(Color::DarkGray);
+    let dim = Style::default().fg(Color::DarkGray);
+
+    let mut out: Vec<Line<'static>> = Vec::with_capacity(6);
+    for i in 0..5 {
+        let mut spans = vec![
+            Span::raw(indent.to_string()),
+            Span::styled(WORD[i], white),
+        ];
+        if i == 0 {
+            spans.push(Span::styled(" ™", tm));
+        }
+        out.push(Line::from(spans));
+    }
+    out.push(Line::from(Span::styled(
+        format!("{indent} agents ai · v{} · terminal client", env!("CARGO_PKG_VERSION")),
+        dim,
+    )));
+    out
+}
 
 impl App {
     pub fn new(thread_id: String, base: String, tenant: String, org_id: String) -> Self {
@@ -334,6 +369,7 @@ impl App {
             running: false,
             show_thinking: false,
             markdown: true,
+            show_full_code: false,
             scroll: 0,
             max_scroll: 0,
             follow: true,
@@ -346,6 +382,8 @@ impl App {
             last_tool: None,
             todo_state: HashMap::new(),
             busy: None,
+            loading: None,
+            loading_seed: 0,
             overlay: None,
             has_workspace: false,
             workspace_name: None,
@@ -371,14 +409,11 @@ impl App {
             // first draw does one harmless extra rebuild.
             lines_fingerprint: 0,
         };
-        // Banner (cyan) + the authenticated tenant on top, indented to match
-        // the picker pages.
+        // Brand banner (green bolt + white wordmark) + the authenticated tenant
+        // on top, indented to match the picker pages.
         const LEFT: &str = "   ";
-        for line in BANNER.lines() {
-            app.blocks.push(Block::Plain(Line::from(Span::styled(
-                format!("{LEFT}{line}"),
-                Style::default().fg(Color::Cyan),
-            ))));
+        for line in banner_spans(LEFT) {
+            app.blocks.push(Block::Plain(line));
         }
         let org = if org_id.len() > 8 { &org_id[..8] } else { &org_id };
         app.auth_line = format!("✔ authenticated · tenant: {tenant} · {} · org {org}", app.base);
@@ -386,7 +421,7 @@ impl App {
             format!("{LEFT}{}", app.auth_line),
             Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
         ))));
-        app.sys("Enter: send · Ctrl-C: cancel/quit · Esc: quit · PgUp/PgDn: scroll · Ctrl-T: thinking · Ctrl-R: markdown");
+        app.sys("Enter: send · Ctrl-C: cancel/quit · Esc: quit · PgUp/PgDn: scroll · Ctrl-T: thinking · Ctrl-R: markdown · Ctrl-O: full code");
         app
     }
 
@@ -626,6 +661,8 @@ impl App {
                 self.rule(&label);
             }
             AppEvent::Notice(n) => self.notice(&n),
+            AppEvent::Progress(Some(msg)) => self.set_busy(msg),
+            AppEvent::Progress(None) => self.clear_busy(),
             AppEvent::Error(e) => self.push(Line::from(Span::styled(
                 format!("error: {e}"),
                 Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
@@ -795,7 +832,7 @@ impl App {
                 // Result rendered as a dim child line under the tool call.
                 let ms = item.status.map(|s| format!("  ·{s}")).unwrap_or_default();
                 let d = item.detail.unwrap_or_default();
-                let body = if d.is_empty() { "(ok)".to_string() } else { truncate(&d, 220) };
+                let body = if d.is_empty() { "(ok)".to_string() } else { concise_tool_result(&d) };
                 self.flush_stream();
                 self.finish_last_tool(&agent, true); // dot → green
                 self.blocks.push(Block::Plain(Line::from(Span::styled(
@@ -895,9 +932,11 @@ impl App {
     /// Markdown. Must stay defensive: anything `build_lines()`/`render_md`/
     /// `render_thinking` read has to be reflected here, or the cache goes
     /// stale and the transcript stops updating.
-    fn content_fingerprint(&self) -> u64 {
+    fn content_fingerprint(&self, width: u16) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
+        // Width changes rewrap the code boxes, so it must bust the cache.
+        width.hash(&mut h);
         for b in &self.blocks {
             match b {
                 Block::User(t) => {
@@ -962,10 +1001,11 @@ impl App {
         }
         self.show_thinking.hash(&mut h);
         self.markdown.hash(&mut h);
+        self.show_full_code.hash(&mut h);
         h.finish()
     }
 
-    fn build_lines(&self) -> Vec<Line<'static>> {
+    fn build_lines(&self, width: u16) -> Vec<Line<'static>> {
         let mut out: Vec<Line<'static>> = Vec::new();
         // Track the agent currently "speaking" so we only print the agent
         // header when it changes (not on every segment or after every tool).
@@ -1008,20 +1048,33 @@ impl App {
                             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
                         }
                     };
-                    let mut spans = vec![
-                        Span::styled("⏺ ".to_string(), dot_style),
-                        Span::styled(
-                            name.clone(),
-                            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-                        ),
-                    ];
-                    if !detail.is_empty() {
-                        spans.push(Span::styled(
-                            format!("({detail})"),
-                            Style::default().fg(Color::DarkGray),
-                        ));
+                    let name_span = Span::styled(
+                        name.clone(),
+                        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    );
+                    let dot = Span::styled("⏺ ".to_string(), dot_style);
+                    let code_style = Style::default().fg(Color::Gray);
+                    let dim = Style::default().fg(Color::DarkGray);
+
+                    if crate::pulse::is_verbatim_tool(name) && !detail.trim().is_empty() {
+                        // Code / shell-command calls render their source in a box:
+                        // the tool name on its own line, then up to
+                        // CODE_PREVIEW_LINES source lines wrapped INSIDE the box
+                        // (never overflowing), in a code-style color, with a
+                        // "+N more · ctrl+o" hint in the bottom border. ^O expands.
+                        out.push(Line::from(vec![dot, name_span]));
+                        out.extend(code_box_lines(detail, width, self.show_full_code));
+                    } else {
+                        // Other tools: "⏺ name(args)" on one line, args in a
+                        // readable gray with dim parens.
+                        let mut spans = vec![dot, name_span];
+                        if !detail.is_empty() {
+                            spans.push(Span::styled("(".to_string(), dim));
+                            spans.push(Span::styled(detail.clone(), code_style));
+                            spans.push(Span::styled(")".to_string(), dim));
+                        }
+                        out.push(Line::from(spans));
                     }
-                    out.push(Line::from(spans));
                 }
                 Block::Rule(label) => {
                     cur_agent = None;
@@ -1152,6 +1205,11 @@ impl App {
         self.draw_input(f, chunks[1]);
         self.draw_hint(f, chunks[2]);
         self.draw_status(f, chunks[3]);
+        // Centered animated loader, drawn LAST so it floats on top of the chat
+        // UI during an in-chat fetch (overlay open, thread switch, …).
+        if let Some(label) = &self.loading {
+            crate::picker::draw_loader(f, label, self.spinner, self.loading_seed);
+        }
     }
 
     fn draw_overlay(&self, f: &mut Frame, area: Rect) {
@@ -1222,9 +1280,7 @@ impl App {
                 // Left indent + a blank top line so the art isn't in the corner.
                 const LEFT: &str = "   ";
                 let mut banner: Vec<Line<'static>> = vec![Line::default()];
-                banner.extend(BANNER.lines().map(|l| {
-                    Line::from(Span::styled(format!("{LEFT}{l}"), Style::default().fg(Color::Cyan)))
-                }));
+                banner.extend(banner_spans(LEFT));
                 if !self.auth_line.is_empty() {
                     banner.push(Line::from(Span::styled(
                         format!("{LEFT}{}", self.auth_line),
@@ -1310,9 +1366,11 @@ impl App {
         // 1-char left/right indent so messages don't run to the terminal edge.
         const PAD_X: u16 = 1;
         const PAD_Y: u16 = 1;
-        let fp = self.content_fingerprint();
+        // Width available to the transcript text (no side borders, just padding).
+        let text_w = area.width.saturating_sub(2 * PAD_X);
+        let fp = self.content_fingerprint(text_w);
         if fp != self.lines_fingerprint || self.lines_cache.is_empty() {
-            self.lines_cache = self.build_lines();
+            self.lines_cache = self.build_lines(text_w);
             self.lines_fingerprint = fp;
         }
         let lines = self.lines_cache.clone();
@@ -1364,6 +1422,12 @@ impl App {
     pub fn input_insert_char(&mut self, c: char) {
         self.input.insert(self.input_cursor, c);
         self.input_cursor += c.len_utf8();
+    }
+
+    /// Insert a block of text (e.g. a bracketed paste) at the cursor.
+    pub fn input_insert_str(&mut self, s: &str) {
+        self.input.insert_str(self.input_cursor, s);
+        self.input_cursor += s.len();
     }
 
     /// Insert a newline (Alt/Shift+Enter) for composing a multiline message.
@@ -1585,9 +1649,10 @@ impl App {
         let model_label = crate::api::model_name(self.current_model);
         let select_indicator = if self.select_mode { "  ⊙ SELECT" } else { "" };
         let left = format!(
-            " {dot} {chat}  ·  {status}  ·  md:{}  think:{}  ⚙ {}{}",
+            " {dot} {chat}  ·  {status}  ·  md:{}  think:{}  code:{}  ⚙ {}{}",
             if self.markdown { "on" } else { "off" },
             if self.show_thinking { "on" } else { "off" },
+            if self.show_full_code { "full" } else { "5" },
             model_label,
             select_indicator,
         );
@@ -1711,17 +1776,22 @@ impl App {
                 }
                 "tool.start" => {
                     // Historical calls are already complete → Done (green dot);
-                    // a following tool.failed downgrades it to Failed.
+                    // a following tool.failed downgrades it to Failed. Summarize
+                    // the args the same way the live path does (code/command,
+                    // not a raw JSON dump).
                     let name = pstr("toolName");
-                    let args = compact_json(p.get("arguments"), 120);
+                    let args = crate::pulse::tool_detail(&name, p.get("arguments").unwrap_or(&Value::Null));
                     self.flush_stream();
                     self.blocks.push(Block::Tool { name, detail: args, status: ToolStatus::Done, agent: agent.clone() });
                 }
                 "tool.output" => {
                     let dur = p.get("durationMs").and_then(|d| d.as_i64())
                         .map(|d| format!("  ·{d}ms")).unwrap_or_default();
-                    let res = compact_json(p.get("result"), 220);
-                    let body = if res.is_empty() { "(ok)".to_string() } else { res };
+                    let body = match p.get("result") {
+                        Some(v) => concise_result_value(v),
+                        None => "(ok)".to_string(),
+                    };
+                    let body = if body.is_empty() { "(ok)".to_string() } else { body };
                     self.push(Line::from(Span::styled(
                         format!("  ⎿ {body}{dur}"), Style::default().fg(Color::DarkGray))));
                 }
@@ -2052,6 +2122,21 @@ impl App {
         self.busy.is_some()
     }
 
+    /// Show the centered "Loading…" overlay on top of the chat UI (for in-chat
+    /// fetches). Cleared with `clear_loading` when the result arrives.
+    pub fn set_loading(&mut self, msg: impl Into<String>) {
+        self.loading = Some(msg.into());
+        self.loading_seed = crate::picker::loader_seed();
+    }
+
+    pub fn clear_loading(&mut self) {
+        self.loading = None;
+    }
+
+    pub fn is_loading(&self) -> bool {
+        self.loading.is_some()
+    }
+
     /// A non-error informational line (workspace bound, hints, etc.).
     pub fn notice(&mut self, text: &str) {
         self.push(Line::from(Span::styled(
@@ -2276,6 +2361,130 @@ fn truncate(s: &str, n: usize) -> String {
     }
 }
 
+/// Split a string into `w`-character chunks (character-based, since it's code —
+/// not word-wrapped). Always returns at least one (possibly empty) segment.
+fn wrap_chars(s: &str, w: usize) -> Vec<String> {
+    if w == 0 {
+        return vec![s.to_string()];
+    }
+    let chars: Vec<char> = s.chars().collect();
+    if chars.is_empty() {
+        return vec![String::new()];
+    }
+    chars.chunks(w).map(|c| c.iter().collect()).collect()
+}
+
+/// Render a code/command blob as a bordered box, wrapping each source line to
+/// fit INSIDE the box (so nothing ever overflows the transcript width). Shows up
+/// to `CODE_PREVIEW_LINES` source lines unless `show_full`, with a
+/// "+N more · ctrl+o" hint in the bottom border. `width` is the transcript's
+/// text width.
+fn code_box_lines(detail: &str, width: u16, show_full: bool) -> Vec<Line<'static>> {
+    const INDENT: usize = 2;
+    // Code-ish foreground (soft green) + dim box borders.
+    let code_style = Style::default().fg(Color::Rgb(126, 192, 128));
+    let border = Style::default().fg(Color::DarkGray);
+
+    // Keep a 1-col safety margin so an exactly-full line never wraps.
+    let box_w = (width as usize).saturating_sub(INDENT + 1).max(12);
+    let inner = box_w.saturating_sub(4); // "│ " + " │"
+    let pad = " ".repeat(INDENT);
+
+    let src: Vec<&str> = detail.lines().collect();
+    let total = src.len();
+    let shown = if show_full { total } else { CODE_PREVIEW_LINES.min(total) };
+    let more = total.saturating_sub(shown);
+
+    let mut out: Vec<Line<'static>> = Vec::new();
+    // Top border.
+    out.push(Line::from(Span::styled(
+        format!("{pad}┌{}┐", "─".repeat(box_w.saturating_sub(2))),
+        border,
+    )));
+    // Wrapped code lines.
+    for line in src.iter().take(shown) {
+        for seg in wrap_chars(line, inner) {
+            let gap = inner.saturating_sub(seg.chars().count());
+            out.push(Line::from(vec![
+                Span::styled(format!("{pad}│ "), border),
+                Span::styled(seg, code_style),
+                Span::styled(format!("{} │", " ".repeat(gap)), border),
+            ]));
+        }
+    }
+    // Bottom border, carrying the truncation hint when collapsed.
+    let bottom = if more > 0 && !show_full {
+        let label = format!("─ +{more} more · ctrl+o ");
+        let dashes = box_w.saturating_sub(2).saturating_sub(label.chars().count());
+        format!("{pad}└{label}{}┘", "─".repeat(dashes))
+    } else {
+        format!("{pad}└{}┘", "─".repeat(box_w.saturating_sub(2)))
+    };
+    out.push(Line::from(Span::styled(bottom, border)));
+    out
+}
+
+/// Beautify a parsed tool-result value for the dim "⎿ …" child line: when it's
+/// a JSON object (as code-exec / shell tools return), surface just the outcome
+/// — errors if any, else the program output — and drop the repetitive
+/// `edit_hint` / `environment` / `script_id` / `note` boilerplate the agent
+/// needs but the reader doesn't. Anything else is compacted as-is.
+fn concise_result_value(v: &Value) -> String {
+    if let Value::Object(obj) = v {
+        // render_ui result: {display_type:"ui_block", ui_id, nodes:[…]} — show a
+        // widget summary rather than the whole node tree.
+        if obj.get("display_type").and_then(|d| d.as_str()) == Some("ui_block") {
+            return format!("⛶ rendered {}", crate::pulse::summarize_ui_nodes(obj.get("nodes")));
+        }
+        let join_strs = |val: &Value| -> String {
+            val.as_array()
+                .map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(" "))
+                .unwrap_or_default()
+                .replace('\n', " ")
+        };
+        if let Some(errs) = obj.get("errors") {
+            let e = join_strs(errs);
+            if !e.trim().is_empty() {
+                return format!("✗ {}", truncate(e.trim(), 200));
+            }
+        }
+        // Output-bearing results (outputs/stdout_tail/message/note) → show that.
+        for key in ["outputs", "stdout_tail", "message", "note"] {
+            if let Some(val) = obj.get(key) {
+                let o = match val {
+                    Value::Array(_) => join_strs(val),
+                    Value::String(s) => s.replace('\n', " "),
+                    _ => String::new(),
+                };
+                let o = o.trim();
+                if !o.is_empty() {
+                    return truncate(o, 200);
+                }
+            }
+        }
+        // An execution result that simply produced nothing — don't dump its JSON.
+        if obj.contains_key("outputs") || obj.contains_key("errors") || obj.contains_key("stdout_tail") {
+            return "(no output)".to_string();
+        }
+        // A bare success/ok flag with nothing else to show.
+        if obj.get("success").and_then(|s| s.as_bool()) == Some(true)
+            || obj.get("ok").and_then(|s| s.as_bool()) == Some(true)
+        {
+            return "(ok)".to_string();
+        }
+    }
+    compact_json(Some(v), 200)
+}
+
+/// Beautify a raw tool-result string (live path). Parses JSON when possible,
+/// else shows the text truncated.
+fn concise_tool_result(detail: &str) -> String {
+    match serde_json::from_str::<Value>(detail) {
+        Ok(v) => concise_result_value(&v),
+        Err(_) => truncate(detail, 220),
+    }
+}
+
 /// Compact a JSON value to a single-line, length-capped string.
 pub fn compact_json(v: Option<&Value>, limit: usize) -> String {
     let s = match v {
@@ -2288,6 +2497,29 @@ pub fn compact_json(v: Option<&Value>, limit: usize) -> String {
         format!("{}…", s.chars().take(limit).collect::<String>())
     } else {
         s
+    }
+}
+
+#[cfg(test)]
+mod tool_render_tests {
+    use super::concise_tool_result;
+
+    #[test]
+    fn concise_tool_result_surfaces_outcome_not_boilerplate() {
+        // The code-exec result shape: outputs + the agent-facing edit_hint noise.
+        let r = concise_tool_result(
+            r#"{"edit_hint":"To fix or tweak this script, call workspace_edit_code with script_id='scr_x' …","environment":"bedrock","errors":[],"outputs":["S4 expiry: 2026-05-22"]}"#,
+        );
+        assert_eq!(r, "S4 expiry: 2026-05-22");
+        assert!(!r.contains("edit_hint") && !r.contains("bedrock"));
+
+        // Errors take priority and are flagged.
+        let e = concise_tool_result(r#"{"errors":["Traceback: NameError"],"outputs":[]}"#);
+        assert_eq!(e, "✗ Traceback: NameError");
+
+        // Empty output reads clearly; non-JSON passes through unchanged.
+        assert_eq!(concise_tool_result(r#"{"errors":[],"outputs":[]}"#), "(no output)");
+        assert_eq!(concise_tool_result("plain text"), "plain text");
     }
 }
 
