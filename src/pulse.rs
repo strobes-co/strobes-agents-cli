@@ -436,6 +436,45 @@ fn generic_summary(obj: &serde_json::Map<String, Value>) -> String {
     }
 }
 
+/// Summarize a render_ui/init_ui node array (and the ui_block result carries
+/// the same shape): widget count + the distinct node types, plus the first
+/// heading/title text for context. e.g. "3 widgets: heading, stat, table —
+/// Findings overview".
+pub(crate) fn summarize_ui_nodes(nodes: Option<&Value>) -> String {
+    let arr = match nodes.and_then(|n| n.as_array()) {
+        Some(a) if !a.is_empty() => a,
+        _ => return "empty UI".to_string(),
+    };
+    // Distinct node types, order-preserving.
+    let mut types: Vec<String> = Vec::new();
+    for n in arr {
+        if let Some(t) = n.get("type").and_then(|t| t.as_str()) {
+            if !types.iter().any(|x| x == t) {
+                types.push(t.to_string());
+            }
+        }
+    }
+    // First human-readable label among the nodes.
+    let headline = arr.iter().find_map(|n| {
+        for k in ["title", "heading", "content", "label"] {
+            if let Some(s) = n.get(k).and_then(|x| x.as_str()) {
+                let s = s.trim();
+                if !s.is_empty() {
+                    return Some(s.replace('\n', " "));
+                }
+            }
+        }
+        None
+    });
+    let count = arr.len();
+    let plural = if count == 1 { "widget" } else { "widgets" };
+    let kinds = if types.is_empty() { String::new() } else { format!(": {}", types.join(", ")) };
+    match headline {
+        Some(h) => format!("{count} {plural}{kinds} — {h}"),
+        None => format!("{count} {plural}{kinds}"),
+    }
+}
+
 pub(crate) fn concise_args(tool: &str, v: &Value) -> String {
     let pick = |k: &str| v.get(k).and_then(|x| x.as_str()).map(|s| s.to_string());
     let chosen = match tool {
@@ -467,6 +506,10 @@ pub(crate) fn concise_args(tool: &str, v: &Value) -> String {
             let nodes = v.get("nodes").and_then(|n| n.as_array()).map(|a| a.len()).unwrap_or(0);
             Some(format!("objective={objective:?}, {nodes} node(s)"))
         }
+        // render_ui/init_ui carry an array of UI nodes ({type, …}). Summarize as
+        // "N widgets: <types>" plus the first heading/title for context, instead
+        // of dumping the whole node tree.
+        "render_ui" | "init_ui" => Some(summarize_ui_nodes(v.get("nodes"))),
         _ => None,
     };
     let s = chosen.unwrap_or_else(|| {

@@ -2431,6 +2431,11 @@ fn code_box_lines(detail: &str, width: u16, show_full: bool) -> Vec<Line<'static
 /// needs but the reader doesn't. Anything else is compacted as-is.
 fn concise_result_value(v: &Value) -> String {
     if let Value::Object(obj) = v {
+        // render_ui result: {display_type:"ui_block", ui_id, nodes:[…]} — show a
+        // widget summary rather than the whole node tree.
+        if obj.get("display_type").and_then(|d| d.as_str()) == Some("ui_block") {
+            return format!("⛶ rendered {}", crate::pulse::summarize_ui_nodes(obj.get("nodes")));
+        }
         let join_strs = |val: &Value| -> String {
             val.as_array()
                 .map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(" "))
