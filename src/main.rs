@@ -7222,13 +7222,7 @@ async fn verify_access(p: &config::Profile) -> Result<()> {
     api::ApiClient::new(p.clone())?
         .ping()
         .await
-        .map_err(|e| {
-            anyhow!(
-                "access check failed — cannot reach Strobes with the current profile: {e}\n\
-                 Verify your base URL, org ID and master key, then run `strobes login` \
-                 (or `strobes status` to test the connection)."
-            )
-        })?;
+        .map_err(|_| anyhow!("authentication failed — run `strobes login` to sign in again."))?;
     Ok(())
 }
 
