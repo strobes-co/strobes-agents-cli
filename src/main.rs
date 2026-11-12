@@ -1507,15 +1507,31 @@ async fn upload_entries_task(
     };
     let sync_roots = workspace_sync_roots(&Config::load(), &ws);
     let total = entries.len();
+    // Pre-measure each file so the progress line can show bytes + a true %.
+    let sizes: Vec<u64> = entries
+        .iter()
+        .map(|(p, _)| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0))
+        .collect();
+    let total_bytes: u64 = sizes.iter().sum();
+    let mut done_bytes: u64 = 0;
     let (mut ok, mut failed) = (0usize, 0usize);
     for (i, (path, prefix)) in entries.iter().enumerate() {
         let shown = path
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.to_string_lossy().into_owned());
+        // % reflects bytes completed so far (not counting the in-flight file),
+        // so it only ever moves forward as each file finishes.
+        let pct = if total_bytes > 0 {
+            (done_bytes as f64 / total_bytes as f64 * 100.0).round() as u64
+        } else {
+            (i as f64 / total.max(1) as f64 * 100.0).round() as u64
+        };
         let _ = tx.send(pulse::AppEvent::Progress(Some(format!(
-            "uploading {}/{total} — {prefix}{shown}",
-            i + 1
+            "⬆ {}/{total} · {}/{} ({pct}%) — {prefix}{shown}",
+            i + 1,
+            fmt_bytes(done_bytes),
+            fmt_bytes(total_bytes),
         ))));
         let local = path.to_string_lossy().to_string();
         match upload_one(&client, &ws, &local, prefix, &sync_roots).await {
@@ -1525,6 +1541,9 @@ async fn upload_entries_task(
                 let _ = tx.send(pulse::AppEvent::Error(format!("upload failed ({prefix}{shown}): {e}")));
             }
         }
+        // Count the file's bytes toward progress whether it succeeded or not, so
+        // the bar can still reach ~100% on a partial batch.
+        done_bytes += sizes[i];
     }
     let _ = tx.send(pulse::AppEvent::Progress(None));
     let where_to = match sync_roots.first() {
@@ -1534,12 +1553,29 @@ async fn upload_entries_task(
     if ok > 0 {
         let fail_note = if failed > 0 { format!(", {failed} failed") } else { String::new() };
         let _ = tx.send(pulse::AppEvent::Notice(format!(
-            "✔ uploaded {ok}/{total} file(s) to the workspace{where_to}{fail_note}"
+            "✔ uploaded {ok}/{total} file(s) · {} to the workspace{where_to}{fail_note}",
+            fmt_bytes(total_bytes)
         )));
     } else {
         let _ = tx.send(pulse::AppEvent::Notice(format!(
             "✗ no files uploaded ({failed} failed)"
         )));
+    }
+}
+
+/// Human-readable byte count (B / KB / MB / GB, 1024-based).
+fn fmt_bytes(n: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
+    let mut v = n as f64;
+    let mut u = 0;
+    while v >= 1024.0 && u < UNITS.len() - 1 {
+        v /= 1024.0;
+        u += 1;
+    }
+    if u == 0 {
+        format!("{n} B")
+    } else {
+        format!("{v:.1} {}", UNITS[u])
     }
 }
 
@@ -8109,11 +8145,16 @@ pub async fn run_chat(
                         }
                         Ok(entries) => {
                             let total = entries.len();
+                            let total_bytes: u64 = entries
+                                .iter()
+                                .map(|(p, _)| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0))
+                                .sum();
                             app.notice(&format!(
-                                "⬆ uploading {total} file{}…",
-                                if total == 1 { "" } else { "s" }
+                                "⬆ uploading {total} file{} · {}…",
+                                if total == 1 { "" } else { "s" },
+                                fmt_bytes(total_bytes)
                             ));
-                            app.set_busy(format!("uploading 0/{total}…"));
+                            app.set_busy(format!("uploading 0/{total} · 0%…"));
                             let profile = profile.clone();
                             let tx = app_tx.clone();
                             tokio::spawn(async move {
@@ -9022,6 +9063,16 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio_tungstenite::accept_async;
     use tokio_tungstenite::tungstenite::Message;
+
+    #[test]
+    fn fmt_bytes_scales_units() {
+        assert_eq!(fmt_bytes(0), "0 B");
+        assert_eq!(fmt_bytes(512), "512 B");
+        assert_eq!(fmt_bytes(1024), "1.0 KB");
+        assert_eq!(fmt_bytes(1536), "1.5 KB");
+        assert_eq!(fmt_bytes(1024 * 1024), "1.0 MB");
+        assert_eq!(fmt_bytes(3 * 1024 * 1024 * 1024), "3.0 GB");
+    }
 
     #[test]
     fn parse_dragged_paths_accepts_a_directory() {
