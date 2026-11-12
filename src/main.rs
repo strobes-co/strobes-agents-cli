@@ -1121,7 +1121,8 @@ async fn resolve_workspace_interactive(
                 .await?
                 .map(|p| p.trim().to_string())
                 .filter(|p| !p.is_empty());
-                let (id, setup_thread) = client.create_workspace(&name).await?;
+                let (id, setup_thread) =
+                    picker::with_loader(terminal, "Creating workspace", client.create_workspace(&name)).await?;
                 return Ok(WsChoice::Created { id, setup_thread, prompt });
             }
             picker::Nav::Item(1) => return Ok(WsChoice::Pick(None)),
@@ -1201,9 +1202,12 @@ async fn resolve_thread_interactive(
 
     match picker::select_with(terminal, "Select a thread", &labels, &auth).await? {
         picker::Nav::Item(0) => {
-            let id = client
-                .create_thread("CLI session", profile.workspace_id.as_deref(), None)
-                .await?;
+            let id = picker::with_loader(
+                terminal,
+                "Creating thread",
+                client.create_thread("CLI session", profile.workspace_id.as_deref(), None),
+            )
+            .await?;
             Ok(ThreadChoice::Pick(id))
         }
         picker::Nav::Item(i) => Ok(ThreadChoice::Pick(threads[i - 1].id.clone())),
