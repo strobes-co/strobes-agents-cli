@@ -372,6 +372,70 @@ pub(crate) fn tool_detail(tool: &str, v: &Value) -> String {
     concise_args(tool, v)
 }
 
+/// Summarize an arbitrary tool-arg object into a readable one-liner instead of
+/// dumping raw JSON: a headline field (title/name/description/…) if present,
+/// then a few compact `key=value` extras (severity, category, limit, a `fields`
+/// list, …). Falls back to the key names when nothing descriptive is found.
+fn generic_summary(obj: &serde_json::Map<String, Value>) -> String {
+    // A short, human-readable form of one value.
+    let short = |val: &Value| -> String {
+        match val {
+            Value::String(s) => s.replace('\n', " "),
+            Value::Bool(b) => b.to_string(),
+            Value::Number(n) => n.to_string(),
+            Value::Array(a) => {
+                let items: Vec<String> = a
+                    .iter()
+                    .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                    .collect();
+                if items.is_empty() { format!("[{} items]", a.len()) } else { items.join(",") }
+            }
+            Value::Object(o) => format!("{{{} fields}}", o.len()),
+            Value::Null => String::new(),
+        }
+    };
+
+    let mut parts: Vec<String> = Vec::new();
+
+    // Headline: the first descriptive field present, shown as a bare value.
+    const HEADLINE: &[&str] = &[
+        "title", "name", "description", "summary", "query", "command", "url",
+        "path", "label", "objective", "message", "slug", "prompt", "component", "view",
+    ];
+    if let Some(h) = HEADLINE.iter().find_map(|k| obj.get(*k).and_then(|v| v.as_str())) {
+        parts.push(h.replace('\n', " "));
+    }
+
+    // A compact `fields:` list when the tool is a query over named fields.
+    if let Some(Value::Array(a)) = obj.get("fields") {
+        let names: Vec<&str> = a.iter().filter_map(|x| x.as_str()).collect();
+        if !names.is_empty() {
+            parts.push(format!("fields: {}", names.join(",")));
+        }
+    }
+
+    // A few qualifier fields as key=value.
+    for k in ["severity", "category", "type", "action", "status", "limit", "id"] {
+        if parts.len() >= 4 {
+            break;
+        }
+        if let Some(val) = obj.get(k) {
+            let s = short(val);
+            if !s.is_empty() && s != "null" {
+                parts.push(format!("{k}={s}"));
+            }
+        }
+    }
+
+    if parts.is_empty() {
+        // Nothing recognizable — list the argument keys so it's at least legible.
+        let keys: Vec<String> = obj.keys().take(6).cloned().collect();
+        keys.join(", ")
+    } else {
+        parts.join(" · ")
+    }
+}
+
 pub(crate) fn concise_args(tool: &str, v: &Value) -> String {
     let pick = |k: &str| v.get(k).and_then(|x| x.as_str()).map(|s| s.to_string());
     let chosen = match tool {
@@ -406,10 +470,14 @@ pub(crate) fn concise_args(tool: &str, v: &Value) -> String {
         _ => None,
     };
     let s = chosen.unwrap_or_else(|| {
-        if v.is_null() || (v.is_object() && v.as_object().map(|o| o.is_empty()).unwrap_or(false)) {
-            String::new()
-        } else {
-            v.to_string()
+        match v {
+            Value::Null => String::new(),
+            Value::Object(obj) if obj.is_empty() => String::new(),
+            // Any other tool (create_finding, fetch_strobes_assets, init_ui,
+            // render_ui, create_learning, …): summarize the object instead of
+            // dumping its raw JSON.
+            Value::Object(obj) => generic_summary(obj),
+            other => other.to_string(),
         }
     });
     let s = s.replace('\n', " ");
