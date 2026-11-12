@@ -877,6 +877,10 @@ async fn main() -> Result<()> {
         Cmd::Push { files, workspace, dir } => cmd_push(&cfg, &profile, files, workspace, dir).await,
         Cmd::Chat { thread, workspace, model, reasoning, new } => {
             let reasoning = reasoning;
+            // Verify profile config + live API access BEFORE entering the
+            // alternate screen. A bad/missing key must error here on the normal
+            // terminal rather than opening the TUI onto an empty picker.
+            verify_access(&profile).await?;
             // Enter the alternate screen ONCE for the whole interactive flow
             // (pickers + chat) and restore ONCE, so switching between workspace,
             // thread, and chat never flashes the normal terminal.
@@ -7207,6 +7211,21 @@ fn require_complete(p: &config::Profile) -> Result<()> {
     Ok(())
 }
 
+/// Preflight for any interactive TUI: confirm the active profile is both fully
+/// configured AND has working API access, BEFORE the alternate screen is
+/// entered. A missing or invalid key must fail loudly on the normal terminal
+/// instead of dropping the user into an empty picker inside the TUI (which is
+/// what happened when workspace listing swallowed the auth error with
+/// `unwrap_or_default()`). On failure the UI is never opened.
+async fn verify_access(p: &config::Profile) -> Result<()> {
+    require_complete(p)?;
+    api::ApiClient::new(p.clone())?
+        .ping()
+        .await
+        .map_err(|_| anyhow!("authentication failed — run `strobes login` to sign in again."))?;
+    Ok(())
+}
+
 /// What a keypress deferred to after the select block (these need `.await`
 /// and/or to reassign `rx`, which can't happen while select borrows it).
 enum Defer {
@@ -8694,6 +8713,9 @@ async fn cmd_workflow(profile: config::Profile, sub: WorkflowCmd, tenant: &str) 
                 Some(w) => w,
                 None => return Ok(()),
             };
+            // A workspace supplied by flag/profile skips any API call above, so
+            // verify access before opening the TUI (bad key → error, no UI).
+            verify_access(&profile).await?;
             let mut terminal = ratatui::init();
             enable_mouse();
             let r = remote_wf_tui::run(&mut terminal, &client, ws, profile.clone(), tenant.to_string()).await;
@@ -8736,6 +8758,19 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio_tungstenite::accept_async;
     use tokio_tungstenite::tungstenite::Message;
+
+    #[tokio::test]
+    async fn verify_access_rejects_incomplete_profile() {
+        // A default/empty profile has no base_url/org_id/master_key, so the
+        // preflight must fail at the require_complete stage — before any network
+        // call — so the TUI is never opened.
+        let p = config::Profile::default();
+        let err = verify_access(&p).await.expect_err("incomplete profile must fail");
+        assert!(
+            err.to_string().contains("profile incomplete"),
+            "expected the incomplete-profile error, got: {err}"
+        );
+    }
 
     #[test]
     fn notify_gating_and_payload() {
