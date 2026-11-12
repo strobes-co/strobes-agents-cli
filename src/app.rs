@@ -932,9 +932,11 @@ impl App {
     /// Markdown. Must stay defensive: anything `build_lines()`/`render_md`/
     /// `render_thinking` read has to be reflected here, or the cache goes
     /// stale and the transcript stops updating.
-    fn content_fingerprint(&self) -> u64 {
+    fn content_fingerprint(&self, width: u16) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
+        // Width changes rewrap the code boxes, so it must bust the cache.
+        width.hash(&mut h);
         for b in &self.blocks {
             match b {
                 Block::User(t) => {
@@ -1003,7 +1005,7 @@ impl App {
         h.finish()
     }
 
-    fn build_lines(&self) -> Vec<Line<'static>> {
+    fn build_lines(&self, width: u16) -> Vec<Line<'static>> {
         let mut out: Vec<Line<'static>> = Vec::new();
         // Track the agent currently "speaking" so we only print the agent
         // header when it changes (not on every segment or after every tool).
@@ -1055,24 +1057,13 @@ impl App {
                     let dim = Style::default().fg(Color::DarkGray);
 
                     if crate::pulse::is_verbatim_tool(name) && !detail.trim().is_empty() {
-                        // Code / shell-command calls render their source verbatim:
+                        // Code / shell-command calls render their source in a box:
                         // the tool name on its own line, then up to
-                        // CODE_PREVIEW_LINES indented code lines (preserving
-                        // newlines + indentation), with a "ctrl+o" hint when
-                        // there's more. ^O expands to the full source.
+                        // CODE_PREVIEW_LINES source lines wrapped INSIDE the box
+                        // (never overflowing), in a code-style color, with a
+                        // "+N more · ctrl+o" hint in the bottom border. ^O expands.
                         out.push(Line::from(vec![dot, name_span]));
-                        let lines: Vec<&str> = detail.lines().collect();
-                        let show = if self.show_full_code { lines.len() } else { CODE_PREVIEW_LINES.min(lines.len()) };
-                        for l in lines.iter().take(show) {
-                            out.push(Line::from(Span::styled(format!("    {l}"), code_style)));
-                        }
-                        if !self.show_full_code && lines.len() > CODE_PREVIEW_LINES {
-                            let more = lines.len() - CODE_PREVIEW_LINES;
-                            out.push(Line::from(Span::styled(
-                                format!("    … (+{more} more line{} · ctrl+o to view full)", if more == 1 { "" } else { "s" }),
-                                dim,
-                            )));
-                        }
+                        out.extend(code_box_lines(detail, width, self.show_full_code));
                     } else {
                         // Other tools: "⏺ name(args)" on one line, args in a
                         // readable gray with dim parens.
@@ -1375,9 +1366,11 @@ impl App {
         // 1-char left/right indent so messages don't run to the terminal edge.
         const PAD_X: u16 = 1;
         const PAD_Y: u16 = 1;
-        let fp = self.content_fingerprint();
+        // Width available to the transcript text (no side borders, just padding).
+        let text_w = area.width.saturating_sub(2 * PAD_X);
+        let fp = self.content_fingerprint(text_w);
         if fp != self.lines_fingerprint || self.lines_cache.is_empty() {
-            self.lines_cache = self.build_lines();
+            self.lines_cache = self.build_lines(text_w);
             self.lines_fingerprint = fp;
         }
         let lines = self.lines_cache.clone();
@@ -2366,6 +2359,69 @@ fn truncate(s: &str, n: usize) -> String {
     } else {
         s.to_string()
     }
+}
+
+/// Split a string into `w`-character chunks (character-based, since it's code —
+/// not word-wrapped). Always returns at least one (possibly empty) segment.
+fn wrap_chars(s: &str, w: usize) -> Vec<String> {
+    if w == 0 {
+        return vec![s.to_string()];
+    }
+    let chars: Vec<char> = s.chars().collect();
+    if chars.is_empty() {
+        return vec![String::new()];
+    }
+    chars.chunks(w).map(|c| c.iter().collect()).collect()
+}
+
+/// Render a code/command blob as a bordered box, wrapping each source line to
+/// fit INSIDE the box (so nothing ever overflows the transcript width). Shows up
+/// to `CODE_PREVIEW_LINES` source lines unless `show_full`, with a
+/// "+N more · ctrl+o" hint in the bottom border. `width` is the transcript's
+/// text width.
+fn code_box_lines(detail: &str, width: u16, show_full: bool) -> Vec<Line<'static>> {
+    const INDENT: usize = 2;
+    // Code-ish foreground (soft green) + dim box borders.
+    let code_style = Style::default().fg(Color::Rgb(126, 192, 128));
+    let border = Style::default().fg(Color::DarkGray);
+
+    // Keep a 1-col safety margin so an exactly-full line never wraps.
+    let box_w = (width as usize).saturating_sub(INDENT + 1).max(12);
+    let inner = box_w.saturating_sub(4); // "│ " + " │"
+    let pad = " ".repeat(INDENT);
+
+    let src: Vec<&str> = detail.lines().collect();
+    let total = src.len();
+    let shown = if show_full { total } else { CODE_PREVIEW_LINES.min(total) };
+    let more = total.saturating_sub(shown);
+
+    let mut out: Vec<Line<'static>> = Vec::new();
+    // Top border.
+    out.push(Line::from(Span::styled(
+        format!("{pad}┌{}┐", "─".repeat(box_w.saturating_sub(2))),
+        border,
+    )));
+    // Wrapped code lines.
+    for line in src.iter().take(shown) {
+        for seg in wrap_chars(line, inner) {
+            let gap = inner.saturating_sub(seg.chars().count());
+            out.push(Line::from(vec![
+                Span::styled(format!("{pad}│ "), border),
+                Span::styled(seg, code_style),
+                Span::styled(format!("{} │", " ".repeat(gap)), border),
+            ]));
+        }
+    }
+    // Bottom border, carrying the truncation hint when collapsed.
+    let bottom = if more > 0 && !show_full {
+        let label = format!("─ +{more} more · ctrl+o ");
+        let dashes = box_w.saturating_sub(2).saturating_sub(label.chars().count());
+        format!("{pad}└{label}{}┘", "─".repeat(dashes))
+    } else {
+        format!("{pad}└{}┘", "─".repeat(box_w.saturating_sub(2)))
+    };
+    out.push(Line::from(Span::styled(bottom, border)));
+    out
 }
 
 /// Beautify a parsed tool-result value for the dim "⎿ …" child line: when it's
