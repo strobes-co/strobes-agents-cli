@@ -1538,7 +1538,10 @@ async fn upload_entries_task(
             Ok(_) => ok += 1,
             Err(e) => {
                 failed += 1;
-                let _ = tx.send(pulse::AppEvent::Error(format!("upload failed ({prefix}{shown}): {e}")));
+                let _ = tx.send(pulse::AppEvent::Error(format!(
+                    "upload failed ({prefix}{shown}, {}): {e}",
+                    fmt_bytes(sizes[i])
+                )));
             }
         }
         // Count the file's bytes toward progress whether it succeeded or not, so
