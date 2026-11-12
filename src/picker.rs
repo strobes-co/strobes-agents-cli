@@ -25,36 +25,105 @@ pub enum Nav {
     Shortcut(usize),
 }
 
-/// Braille spinner frames for the loading overlay.
+/// Braille spinner frames for the loading overlay's subtitle.
 const LOADER_SPIN: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
-/// Draw a centered, animated "Loading…" overlay on top of whatever is already
-/// on screen. `frame` advances the spinner and the growing dots. The box width
-/// is fixed (dots are padded) so it never jitters as it animates.
+/// Rotating flavor text for the loading overlay — cycles slowly while the
+/// saucer animates. The real action is shown (dimmed) on the subtitle line.
+const SAUCER_MSGS: [&str; 16] = [
+    "Calling the mothership for supplies",
+    "Beaming your data aboard",
+    "Negotiating with space customs",
+    "Warming up the tractor beam",
+    "Abducting a few stray threads",
+    "Charging the hyperdrive",
+    "Reticulating alien splines",
+    "Scanning for intelligent life",
+    "Downloading from the actual clouds",
+    "Translating from Martian",
+    "Polishing the flux capacitor",
+    "Bribing the orbital gatekeeper",
+    "Decrypting transmissions from Sector 7",
+    "Refueling on cosmic rays",
+    "Convincing the AI to cooperate",
+    "Plotting a course through the asteroid belt",
+];
+
+/// The saucer's four glyph lines for a given frame: blinking dome lights and a
+/// pulsing tractor beam. Center-aligned by the caller, so no horizontal jitter.
+fn saucer_lines(frame: usize) -> [String; 4] {
+    // Dome lights blink between dim/bright in a little pattern.
+    let lights = match frame % 4 {
+        0 => "o O o",
+        1 => "O o O",
+        2 => "o o O",
+        _ => "O O o",
+    };
+    // Tractor beam pulses underneath.
+    let beam = match frame % 4 {
+        0 => ".  :  .",
+        1 => " . : . ",
+        2 => "  : :  ",
+        _ => " : . : ",
+    };
+    [
+        "   .-\"\"\"-.   ".to_string(),
+        format!("  ( {lights} )  "),
+        "   `~-...-~'   ".to_string(),
+        format!("     {beam}     "),
+    ]
+}
+
+/// Draw the centered animated flying-saucer loader on top of whatever is on
+/// screen. `label` is the real action (shown dimmed on the subtitle); `frame`
+/// drives the blinking lights, the pulsing beam, the spinner, and the slowly
+/// rotating flavor message.
 pub fn draw_loader(f: &mut ratatui::Frame, label: &str, frame: usize) {
     let area = f.area();
+    let saucer = saucer_lines(frame);
+    let msg = SAUCER_MSGS[(frame / 18) % SAUCER_MSGS.len()];
     let spin = LOADER_SPIN[frame % LOADER_SPIN.len()];
-    let dots = ".".repeat(1 + (frame / 3) % 3); // 1..=3 dots
-    // Left-justify the dots to a fixed width of 3 so the line length is stable.
-    let body = format!("{spin}  {label}{dots:<3}");
-    let inner_w = body.chars().count() as u16 + 2; // one space padding each side
-    let w = inner_w
-        .saturating_add(2) // borders
-        .min(area.width.saturating_sub(2))
-        .max(18);
-    let h = 3u16;
+    let dots = ".".repeat(1 + (frame / 3) % 3);
+    let subtitle = format!("{spin} {label}{dots:<3}");
+
+    // Build the styled content lines (centered as a block).
+    let cyan = Style::default().fg(Color::Cyan);
+    let dome = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+    let lights = Style::default().fg(Color::LightYellow).add_modifier(Modifier::BOLD);
+    let beam = Style::default().fg(Color::Magenta);
+    let msg_style = Style::default().fg(Color::White).add_modifier(Modifier::BOLD);
+    let sub_style = Style::default().fg(Color::DarkGray);
+
+    let lines: Vec<Line> = vec![
+        Line::from(Span::styled(saucer[0].clone(), dome)),
+        Line::from(Span::styled(saucer[1].clone(), lights)),
+        Line::from(Span::styled(saucer[2].clone(), dome)),
+        Line::from(Span::styled(saucer[3].clone(), beam)),
+        Line::default(),
+        Line::from(Span::styled(format!("👽  {msg}…"), msg_style)),
+        Line::from(Span::styled(subtitle, sub_style)),
+    ];
+
+    // Size the box to the widest content line (+ padding + borders), clamped.
+    let widest = lines
+        .iter()
+        .map(|l| l.width())
+        .chain(std::iter::once(msg.chars().count() + 4))
+        .max()
+        .unwrap_or(24) as u16;
+    let w = widest.saturating_add(4).min(area.width.saturating_sub(2)).max(24);
+    let h = (lines.len() as u16 + 2).min(area.height.max(3));
     let x = area.x + area.width.saturating_sub(w) / 2;
     let y = area.y + area.height.saturating_sub(h) / 2;
     let rect = Rect { x, y, width: w, height: h };
+
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan));
-    let para = Paragraph::new(Line::from(Span::styled(
-        format!(" {body} "),
-        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-    )))
-    .block(block)
-    .alignment(ratatui::layout::Alignment::Center);
+        .title(" 🛸 incoming transmission ")
+        .border_style(cyan);
+    let para = Paragraph::new(lines)
+        .block(block)
+        .alignment(ratatui::layout::Alignment::Center);
     f.render_widget(Clear, rect);
     f.render_widget(para, rect);
 }
