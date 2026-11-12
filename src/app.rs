@@ -317,17 +317,39 @@ pub struct App {
 
 /// ASCII banner shown at the top of a fresh chat transcript and the pickers.
 /// The subtitle carries the build version (via `concat!` + `env!`).
-pub const BANNER: &str = concat!(
-    " ███████╗████████╗██████╗  ██████╗ ██████╗ ███████╗███████╗\n",
-    " ██╔════╝╚══██╔══╝██╔══██╗██╔═══██╗██╔══██╗██╔════╝██╔════╝\n",
-    " ███████╗   ██║   ██████╔╝██║   ██║██████╔╝█████╗  ███████╗\n",
-    " ╚════██║   ██║   ██╔══██╗██║   ██║██╔══██╗██╔══╝  ╚════██║\n",
-    " ███████║   ██║   ██║  ██║╚██████╔╝██████╔╝███████╗███████║\n",
-    " ╚══════╝   ╚═╝   ╚═╝  ╚═╝ ╚═════╝ ╚═════╝ ╚══════╝╚══════╝\n",
-    "            A G E N T S   A I  ·  v",
-    env!("CARGO_PKG_VERSION"),
-    "  ·  terminal client",
-);
+/// The Strobes "strobes" wordmark in white (+ ™) with a dim tagline underneath.
+/// Each returned line is already indented by `indent`. Used by the chat banner
+/// and every picker page so the brand is consistent.
+pub fn banner_spans(indent: &str) -> Vec<Line<'static>> {
+    // "strobes" in a lowercase block font (5 rows), matching the logo wordmark.
+    const WORD: [&str; 5] = [
+        "      _             _               ",
+        "  ___| |_ _ __ ___ | |__   ___  ___ ",
+        " / __| __| '__/ _ \\| '_ \\ / _ \\/ __|",
+        " \\__ \\ |_| | | (_) | |_) |  __/\\__ \\",
+        " |___/\\__|_|  \\___/|_.__/ \\___||___/",
+    ];
+    let white = Style::default().fg(Color::White).add_modifier(Modifier::BOLD);
+    let tm = Style::default().fg(Color::DarkGray);
+    let dim = Style::default().fg(Color::DarkGray);
+
+    let mut out: Vec<Line<'static>> = Vec::with_capacity(6);
+    for i in 0..5 {
+        let mut spans = vec![
+            Span::raw(indent.to_string()),
+            Span::styled(WORD[i], white),
+        ];
+        if i == 0 {
+            spans.push(Span::styled(" ™", tm));
+        }
+        out.push(Line::from(spans));
+    }
+    out.push(Line::from(Span::styled(
+        format!("{indent} agents ai · v{} · terminal client", env!("CARGO_PKG_VERSION")),
+        dim,
+    )));
+    out
+}
 
 impl App {
     pub fn new(thread_id: String, base: String, tenant: String, org_id: String) -> Self {
@@ -380,14 +402,11 @@ impl App {
             // first draw does one harmless extra rebuild.
             lines_fingerprint: 0,
         };
-        // Banner (cyan) + the authenticated tenant on top, indented to match
-        // the picker pages.
+        // Brand banner (green bolt + white wordmark) + the authenticated tenant
+        // on top, indented to match the picker pages.
         const LEFT: &str = "   ";
-        for line in BANNER.lines() {
-            app.blocks.push(Block::Plain(Line::from(Span::styled(
-                format!("{LEFT}{line}"),
-                Style::default().fg(Color::Cyan),
-            ))));
+        for line in banner_spans(LEFT) {
+            app.blocks.push(Block::Plain(line));
         }
         let org = if org_id.len() > 8 { &org_id[..8] } else { &org_id };
         app.auth_line = format!("✔ authenticated · tenant: {tenant} · {} · org {org}", app.base);
@@ -1238,9 +1257,7 @@ impl App {
                 // Left indent + a blank top line so the art isn't in the corner.
                 const LEFT: &str = "   ";
                 let mut banner: Vec<Line<'static>> = vec![Line::default()];
-                banner.extend(BANNER.lines().map(|l| {
-                    Line::from(Span::styled(format!("{LEFT}{l}"), Style::default().fg(Color::Cyan)))
-                }));
+                banner.extend(banner_spans(LEFT));
                 if !self.auth_line.is_empty() {
                     banner.push(Line::from(Span::styled(
                         format!("{LEFT}{}", self.auth_line),

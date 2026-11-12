@@ -452,9 +452,7 @@ fn banner_lines(auth: &str) -> Vec<Line<'static>> {
     // Left indent + a blank top line so the art isn't jammed into the corner.
     const LEFT: &str = "   ";
     let mut v: Vec<Line<'static>> = vec![Line::default()];
-    v.extend(crate::app::BANNER.lines().map(|l| {
-        Line::from(Span::styled(format!("{LEFT}{l}"), Style::default().fg(Color::Cyan)))
-    }));
+    v.extend(crate::app::banner_spans(LEFT));
     // `auth` may carry extra context lines (e.g. the selected workspace) joined
     // with '\n'; the first is the auth line (green), the rest are cyan context.
     for (i, line) in auth.split('\n').filter(|l| !l.is_empty()).enumerate() {
