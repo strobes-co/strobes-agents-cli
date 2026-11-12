@@ -1051,24 +1051,31 @@ async fn resolve_workspace_interactive(
     require_complete(profile)?;
     let auth = auth_line(profile, tenant);
     let client = api::ApiClient::new(profile.clone())?;
-    let mut workspaces = client.list_workspaces().await.unwrap_or_default();
-    // Surface frequently-opened workspaces first (most opens, then most recent).
-    // Stable sort keeps never-opened ones in the server's order below.
-    workspaces.sort_by(|a, b| {
-        cfg.workspace_open_count(&b.id)
-            .cmp(&cfg.workspace_open_count(&a.id))
-            .then(cfg.workspace_last_opened(&b.id).cmp(&cfg.workspace_last_opened(&a.id)))
-    });
-
-    // Fetch workflow state for every workspace concurrently so we can badge rows.
-    let wf_states: Vec<Option<api::WorkflowState>> = {
-        let futs: Vec<_> = workspaces.iter().map(|w| client.workspace_workflow(&w.id)).collect();
-        futures_util::future::join_all(futs)
-            .await
-            .into_iter()
-            .map(|r| r.ok().flatten())
-            .collect()
-    };
+    // Fetch the workspace list + each workspace's workflow state under a
+    // centered animated loader, so the multi-second launch wait doesn't leave
+    // the screen blank.
+    let (mut workspaces, wf_states): (Vec<api::Workspace>, Vec<Option<api::WorkflowState>>) =
+        picker::with_loader(terminal, "Loading workspaces", async {
+            let mut workspaces = client.list_workspaces().await.unwrap_or_default();
+            // Surface frequently-opened workspaces first (most opens, then most
+            // recent). Stable sort keeps never-opened ones in the server order.
+            workspaces.sort_by(|a, b| {
+                cfg.workspace_open_count(&b.id)
+                    .cmp(&cfg.workspace_open_count(&a.id))
+                    .then(cfg.workspace_last_opened(&b.id).cmp(&cfg.workspace_last_opened(&a.id)))
+            });
+            // Fetch workflow state for every workspace concurrently to badge rows.
+            let wf_states: Vec<Option<api::WorkflowState>> = {
+                let futs: Vec<_> = workspaces.iter().map(|w| client.workspace_workflow(&w.id)).collect();
+                futures_util::future::join_all(futs)
+                    .await
+                    .into_iter()
+                    .map(|r| r.ok().flatten())
+                    .collect()
+            };
+            (workspaces, wf_states)
+        })
+        .await;
 
     let cur = profile.workspace_id.as_deref();
     // Item 0 = create new, item 1 = no workspace, then existing workspaces (offset 2).
@@ -1152,32 +1159,38 @@ async fn resolve_thread_interactive(
     require_complete(profile)?;
     let auth = auth_line(profile, tenant);
     let client = api::ApiClient::new(profile.clone())?;
-    // Scope to the bound workspace if there is one.
-    let threads = client
-        .list_threads(profile.workspace_id.as_deref())
-        .await
-        .unwrap_or_default();
+    // Fetch threads (and, for a bound workspace, its name + headline stats)
+    // under a centered animated loader so the wait doesn't freeze the screen.
+    let (threads, auth) = picker::with_loader(terminal, "Loading threads", async {
+        // Scope to the bound workspace if there is one.
+        let threads = client
+            .list_threads(profile.workspace_id.as_deref())
+            .await
+            .unwrap_or_default();
 
-    // Context lines under the ASCII art: which workspace these threads belong
-    // to, plus its headline counts (threads · credits · findings · files).
-    let auth = match profile.workspace_id.as_deref() {
-        Some(id) => {
-            // Resolve the name and the stats counts concurrently.
-            let (workspaces, (credits, findings, files)) =
-                tokio::join!(client.list_workspaces(), fetch_workspace_stats(&client, id));
-            let name = workspaces
-                .ok()
-                .and_then(|ws| ws.into_iter().find(|w| w.id.as_str() == id).map(|w| w.name))
-                .filter(|n| !n.is_empty())
-                .unwrap_or_else(|| format!("{}…", &id[..8.min(id.len())]));
-            let stats = format!(
-                "{} threads  ·  ◈ {credits:.2} credits  ·  ⚠ {findings} findings  ·  {files} files",
-                threads.len()
-            );
-            format!("{auth}\n⊞ workspace: {name}\n{stats}")
-        }
-        None => format!("{auth}\n⊞ workspace: (none — all threads)"),
-    };
+        // Context lines under the ASCII art: which workspace these threads
+        // belong to, plus its headline counts (threads · credits · findings · files).
+        let auth = match profile.workspace_id.as_deref() {
+            Some(id) => {
+                // Resolve the name and the stats counts concurrently.
+                let (workspaces, (credits, findings, files)) =
+                    tokio::join!(client.list_workspaces(), fetch_workspace_stats(&client, id));
+                let name = workspaces
+                    .ok()
+                    .and_then(|ws| ws.into_iter().find(|w| w.id.as_str() == id).map(|w| w.name))
+                    .filter(|n| !n.is_empty())
+                    .unwrap_or_else(|| format!("{}…", &id[..8.min(id.len())]));
+                let stats = format!(
+                    "{} threads  ·  ◈ {credits:.2} credits  ·  ⚠ {findings} findings  ·  {files} files",
+                    threads.len()
+                );
+                format!("{auth}\n⊞ workspace: {name}\n{stats}")
+            }
+            None => format!("{auth}\n⊞ workspace: (none — all threads)"),
+        };
+        (threads, auth)
+    })
+    .await;
 
     let mut labels = vec!["➕  New thread".to_string()];
     for t in &threads {
@@ -7521,15 +7534,22 @@ pub async fn run_chat(
     // their result back here instead.
     let (defer_tx, mut defer_rx) = mpsc::unbounded_channel::<DeferResult>();
     let ws_scope = profile.workspace_id.clone();
-    let (conn, events_res, threads_res, cmds_res, run_res, ws_res, credits_res) = tokio::join!(
-        pulse::connect(&profile, &thread_id, tx, model, reasoning.clone()),
-        client.get_thread_events(&thread_id, 0, 2000),
-        client.list_threads(ws_scope.as_deref()),
-        client.list_slash_commands(),
-        client.get_thread_history(&thread_id, 1),
-        client.list_workspaces(),
-        client.get_credits(None, Some(&thread_id)),
-    );
+    // Open the connection and prime the thread (events, threads, commands,
+    // history, workspaces, credits) concurrently — under a centered animated
+    // loader so entering a chat doesn't sit on a blank screen.
+    let (conn, events_res, threads_res, cmds_res, run_res, ws_res, credits_res) =
+        picker::with_loader(terminal, "Loading chat", async {
+            tokio::join!(
+                pulse::connect(&profile, &thread_id, tx, model, reasoning.clone()),
+                client.get_thread_events(&thread_id, 0, 2000),
+                client.list_threads(ws_scope.as_deref()),
+                client.list_slash_commands(),
+                client.get_thread_history(&thread_id, 1),
+                client.list_workspaces(),
+                client.get_credits(None, Some(&thread_id)),
+            )
+        })
+        .await;
     let mut handle = conn?;
     // Resolve the bound workspace's name for the top-right indicator.
     if let (Some(wid), Ok(wss)) = (ws_scope.as_deref(), &ws_res) {

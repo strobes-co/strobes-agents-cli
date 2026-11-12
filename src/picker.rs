@@ -25,6 +25,61 @@ pub enum Nav {
     Shortcut(usize),
 }
 
+/// Braille spinner frames for the loading overlay.
+const LOADER_SPIN: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// Draw a centered, animated "Loading…" overlay on top of whatever is already
+/// on screen. `frame` advances the spinner and the growing dots. The box width
+/// is fixed (dots are padded) so it never jitters as it animates.
+pub fn draw_loader(f: &mut ratatui::Frame, label: &str, frame: usize) {
+    let area = f.area();
+    let spin = LOADER_SPIN[frame % LOADER_SPIN.len()];
+    let dots = ".".repeat(1 + (frame / 3) % 3); // 1..=3 dots
+    // Left-justify the dots to a fixed width of 3 so the line length is stable.
+    let body = format!("{spin}  {label}{dots:<3}");
+    let inner_w = body.chars().count() as u16 + 2; // one space padding each side
+    let w = inner_w
+        .saturating_add(2) // borders
+        .min(area.width.saturating_sub(2))
+        .max(18);
+    let h = 3u16;
+    let x = area.x + area.width.saturating_sub(w) / 2;
+    let y = area.y + area.height.saturating_sub(h) / 2;
+    let rect = Rect { x, y, width: w, height: h };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+    let para = Paragraph::new(Line::from(Span::styled(
+        format!(" {body} "),
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+    )))
+    .block(block)
+    .alignment(ratatui::layout::Alignment::Center);
+    f.render_widget(Clear, rect);
+    f.render_widget(para, rect);
+}
+
+/// Run `fut` to completion while showing the centered loading overlay, so a
+/// multi-second fetch animates instead of leaving the screen frozen or blank.
+/// Returns the future's output. Draw errors during the wait are non-fatal.
+pub async fn with_loader<F, T>(terminal: &mut ratatui::DefaultTerminal, label: &str, fut: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    tokio::pin!(fut);
+    let mut ticker = tokio::time::interval(std::time::Duration::from_millis(80));
+    let mut frame = 0usize;
+    loop {
+        tokio::select! {
+            out = &mut fut => return out,
+            _ = ticker.tick() => {
+                let _ = terminal.draw(|f| draw_loader(f, label, frame));
+                frame = frame.wrapping_add(1);
+            }
+        }
+    }
+}
+
 /// Show a selectable list on its own terminal (enters/leaves the alternate
 /// screen). Use this for standalone, one-off pickers.
 pub async fn select(title: &str, items: &[String]) -> Result<Nav> {
