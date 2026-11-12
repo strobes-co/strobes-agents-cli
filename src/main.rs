@@ -9,6 +9,7 @@ mod analyzer_registry;
 mod api;
 mod app;
 mod browser;
+mod cache;
 mod config;
 mod local;
 mod pack;
@@ -1042,6 +1043,52 @@ fn auth_line(p: &config::Profile, tenant: &str) -> String {
     format!("✔ authenticated · tenant: {tenant} · {} · org {org}", p.base_url)
 }
 
+/// Order workspaces most-opened then most-recent (never-opened keep server order).
+fn sort_ws_by_recency(workspaces: &mut [api::Workspace], cfg: &Config) {
+    workspaces.sort_by(|a, b| {
+        cfg.workspace_open_count(&b.id)
+            .cmp(&cfg.workspace_open_count(&a.id))
+            .then(cfg.workspace_last_opened(&b.id).cmp(&cfg.workspace_last_opened(&a.id)))
+    });
+}
+
+/// Build the workspace picker's live snapshot: two fixed rows ("New" /
+/// "No workspace") then one row per workspace, with ids + has-workflow flags
+/// parallel to the labels. `wf_states` may be empty (cache render, no badges yet).
+fn build_ws_live_list(
+    workspaces: &[api::Workspace],
+    wf_states: &[Option<api::WorkflowState>],
+    cur: Option<&str>,
+    cfg: &Config,
+    auth: &str,
+) -> picker::LiveList {
+    let mut labels = vec![
+        "➕  New workspace".to_string(),
+        "↪  No workspace (all threads)".to_string(),
+    ];
+    let mut ids = vec!["__new__".to_string(), "__none__".to_string()];
+    let mut flags = vec![false, false];
+    for (idx, w) in workspaces.iter().enumerate() {
+        let wf = wf_states.get(idx).and_then(|s| s.as_ref());
+        let name = if w.name.is_empty() { "(unnamed)" } else { &w.name };
+        let mark = if Some(w.id.as_str()) == cur { "  ✓" } else { "" };
+        let count = cfg.workspace_open_count(&w.id);
+        let recent = if count > 0 { format!("  · ↻ ×{count}") } else { String::new() };
+        let wf_badge = match wf.map(|s| s.status.as_str()) {
+            Some("running") => "  ⚙ running",
+            Some("paused") => "  ⚙ paused",
+            Some("pending") => "  ⚙ pending",
+            Some("failed") => "  ⚙ failed",
+            Some("completed") => "  ⚙ done",
+            _ => "",
+        };
+        labels.push(format!("{name}   [{}]{mark}{recent}{wf_badge}", w.status));
+        ids.push(w.id.clone());
+        flags.push(wf.is_some());
+    }
+    picker::LiveList { labels, ids, flags, auth: auth.to_string() }
+}
+
 async fn resolve_workspace_interactive(
     terminal: &mut ratatui::DefaultTerminal,
     tenant: &str,
@@ -1051,94 +1098,81 @@ async fn resolve_workspace_interactive(
     require_complete(profile)?;
     let auth = auth_line(profile, tenant);
     let client = api::ApiClient::new(profile.clone())?;
-    // Fetch the workspace list + each workspace's workflow state under a
-    // centered animated loader, so the multi-second launch wait doesn't leave
-    // the screen blank.
-    let (mut workspaces, wf_states): (Vec<api::Workspace>, Vec<Option<api::WorkflowState>>) =
-        picker::with_loader(terminal, "Loading workspaces", async {
-            let mut workspaces = client.list_workspaces().await.unwrap_or_default();
-            // Surface frequently-opened workspaces first (most opens, then most
-            // recent). Stable sort keeps never-opened ones in the server order.
-            workspaces.sort_by(|a, b| {
-                cfg.workspace_open_count(&b.id)
-                    .cmp(&cfg.workspace_open_count(&a.id))
-                    .then(cfg.workspace_last_opened(&b.id).cmp(&cfg.workspace_last_opened(&a.id)))
-            });
-            // Fetch workflow state for every workspace concurrently to badge rows.
+    // Tab hint shown as a context line below the auth banner.
+    let auth_with_hint = format!("{auth}\n↹ Tab on a workspace: open live workflow TUI");
+    let cur = profile.workspace_id.clone();
+
+    // Seed the picker from cache so it's actionable INSTANTLY (cold cache → just
+    // the New / No-workspace rows). Badges (workflow state) fill in after the
+    // background refetch.
+    let initial = {
+        let mut cached = cache::load_workspaces(tenant).unwrap_or_default();
+        sort_ws_by_recency(&mut cached, cfg);
+        build_ws_live_list(&cached, &[], cur.as_deref(), cfg, &auth_with_hint)
+    };
+    let (tx, rx) = tokio::sync::watch::channel(initial);
+
+    // Refetch in the BACKGROUND — never blocks the user. Pull the live list +
+    // per-workspace workflow badges, publish them to the picker, and refresh the
+    // on-disk cache. If the user has already selected, the picker has returned
+    // and this send is simply dropped (no UI rewrite).
+    {
+        let profile = profile.clone();
+        let tenant = tenant.to_string();
+        let auth = auth_with_hint.clone();
+        let cur = cur.clone();
+        tokio::spawn(async move {
+            let client = match api::ApiClient::new(profile) { Ok(c) => c, Err(_) => return };
+            let mut workspaces = match client.list_workspaces().await { Ok(w) => w, Err(_) => return };
+            let cfg = Config::load();
+            sort_ws_by_recency(&mut workspaces, &cfg);
+            cache::save_workspaces(&tenant, &workspaces);
             let wf_states: Vec<Option<api::WorkflowState>> = {
                 let futs: Vec<_> = workspaces.iter().map(|w| client.workspace_workflow(&w.id)).collect();
-                futures_util::future::join_all(futs)
-                    .await
-                    .into_iter()
-                    .map(|r| r.ok().flatten())
-                    .collect()
+                futures_util::future::join_all(futs).await.into_iter().map(|r| r.ok().flatten()).collect()
             };
-            (workspaces, wf_states)
-        })
-        .await;
-
-    let cur = profile.workspace_id.as_deref();
-    // Item 0 = create new, item 1 = no workspace, then existing workspaces (offset 2).
-    let mut labels = vec![
-        "➕  New workspace".to_string(),
-        "↪  No workspace (all threads)".to_string(),
-    ];
-    for (w, wf) in workspaces.iter().zip(wf_states.iter()) {
-        let name = if w.name.is_empty() { "(unnamed)" } else { &w.name };
-        let mark = if Some(w.id.as_str()) == cur { "  ✓" } else { "" };
-        let count = cfg.workspace_open_count(&w.id);
-        let recent = if count > 0 { format!("  · ↻ ×{count}") } else { String::new() };
-        let wf_badge = match wf.as_ref().map(|s| s.status.as_str()) {
-            Some("running") => "  ⚙ running",
-            Some("paused") => "  ⚙ paused",
-            Some("pending") => "  ⚙ pending",
-            Some("failed") => "  ⚙ failed",
-            Some("completed") => "  ⚙ done",
-            _ => "",
-        };
-        labels.push(format!("{name}   [{}]{mark}{recent}{wf_badge}", w.status));
+            let list = build_ws_live_list(&workspaces, &wf_states, cur.as_deref(), &cfg, &auth);
+            let _ = tx.send(list);
+        });
     }
 
-    // Add Tab hint as a context line below the auth banner.
-    let auth_with_hint = format!("{auth}\n↹ Tab on a workspace: open live workflow TUI");
-
     loop {
-        match picker::select_with(terminal, "Select a workspace", &labels, &auth_with_hint).await? {
-            picker::Nav::Item(0) => {
-                // Ask for a name and an optional setup prompt; Esc on the name
-                // cancels back to the picker.
-                let name = match picker::prompt_text(terminal, "New workspace — name", "", &auth).await? {
-                    Some(n) => n.trim().to_string(),
-                    None => continue,
-                };
-                let name = if name.is_empty() { "CLI Workspace".to_string() } else { name };
-                let prompt = picker::prompt_text(
-                    terminal,
-                    "Setup prompt — what should this workspace do? (optional)",
-                    "",
-                    &auth,
-                )
-                .await?
-                .map(|p| p.trim().to_string())
-                .filter(|p| !p.is_empty());
-                let (id, setup_thread) =
-                    picker::with_loader(terminal, "Creating workspace", client.create_workspace(&name)).await?;
-                return Ok(WsChoice::Created { id, setup_thread, prompt });
-            }
-            picker::Nav::Item(1) => return Ok(WsChoice::Pick(None)),
-            picker::Nav::Item(i) => return Ok(WsChoice::Pick(Some(workspaces[i - 2].id.clone()))),
-            // Tab on a workspace row → open the Watch TUI inline if a workflow exists.
-            picker::Nav::Shortcut(i) if i >= 2 => {
-                let ws = &workspaces[i - 2];
-                if wf_states[i - 2].is_some() {
-                    let _ = remote_wf_tui::run(terminal, &client, ws.id.clone(), profile.clone(), tenant.to_string()).await;
+        match picker::select_live(terminal, "Select a workspace", rx.clone()).await? {
+            picker::LiveNav::Item { id, .. } => match id.as_str() {
+                "__new__" => {
+                    // Ask for a name + optional setup prompt; Esc on the name
+                    // cancels back to the picker.
+                    let name = match picker::prompt_text(terminal, "New workspace — name", "", &auth).await? {
+                        Some(n) => n.trim().to_string(),
+                        None => continue,
+                    };
+                    let name = if name.is_empty() { "CLI Workspace".to_string() } else { name };
+                    let prompt = picker::prompt_text(
+                        terminal,
+                        "Setup prompt — what should this workspace do? (optional)",
+                        "",
+                        &auth,
+                    )
+                    .await?
+                    .map(|p| p.trim().to_string())
+                    .filter(|p| !p.is_empty());
+                    let (id, setup_thread) =
+                        picker::with_loader(terminal, "Creating workspace", client.create_workspace(&name)).await?;
+                    return Ok(WsChoice::Created { id, setup_thread, prompt });
+                }
+                "__none__" => return Ok(WsChoice::Pick(None)),
+                other => return Ok(WsChoice::Pick(Some(other.to_string()))),
+            },
+            // Tab on a workspace row with a live workflow → open the Watch TUI.
+            picker::LiveNav::Shortcut { id, flag } => {
+                if flag && id != "__new__" && id != "__none__" {
+                    let _ = remote_wf_tui::run(terminal, &client, id, profile.clone(), tenant.to_string()).await;
                     terminal.clear()?;
                 }
-                // Fall through to re-show the workspace picker.
+                // else: Tab on New / No-workspace / a workflow-less row — ignore.
             }
-            picker::Nav::Shortcut(_) => {} // Tab on "New" / "No workspace" — ignore.
             // Esc on the first screen quits cleanly (no prior screen to return to).
-            picker::Nav::Back | picker::Nav::Quit => return Ok(WsChoice::Quit),
+            picker::LiveNav::Back | picker::LiveNav::Quit => return Ok(WsChoice::Quit),
         }
     }
 }
@@ -1152,6 +1186,26 @@ enum ThreadChoice {
 
 /// Show a thread picker (with a "new thread" option) and return the chosen
 /// thread id, creating one via REST if requested.
+/// Build the thread picker's live snapshot: a "New thread" row then one row per
+/// thread, with thread ids parallel to the labels.
+fn build_threads_live_list(threads: &[api::Thread], auth: &str) -> picker::LiveList {
+    let mut labels = vec!["➕  New thread".to_string()];
+    let mut ids = vec!["__new__".to_string()];
+    let mut flags = vec![false];
+    for t in threads {
+        let title = if t.title.is_empty() { "(untitled)".to_string() } else { t.title.clone() };
+        let last = if t.last_message.is_empty() {
+            String::new()
+        } else {
+            format!("  — {}", trunc(&t.last_message, 50))
+        };
+        labels.push(format!("{title}   [{}]{last}", t.status));
+        ids.push(t.id.clone());
+        flags.push(false);
+    }
+    picker::LiveList { labels, ids, flags, auth: auth.to_string() }
+}
+
 async fn resolve_thread_interactive(
     terminal: &mut ratatui::DefaultTerminal,
     tenant: &str,
@@ -1160,48 +1214,61 @@ async fn resolve_thread_interactive(
     require_complete(profile)?;
     let auth = auth_line(profile, tenant);
     let client = api::ApiClient::new(profile.clone())?;
-    // Fetch threads (and, for a bound workspace, its name + headline stats)
-    // under a centered animated loader so the wait doesn't freeze the screen.
-    let (threads, auth) = picker::with_loader(terminal, "Loading threads", async {
-        // Scope to the bound workspace if there is one.
-        let threads = client
-            .list_threads(profile.workspace_id.as_deref())
-            .await
-            .unwrap_or_default();
+    let ws_scope = profile.workspace_id.clone();
 
-        // Context lines under the ASCII art: which workspace these threads
-        // belong to, plus its headline counts (threads · credits · findings · files).
-        let auth = match profile.workspace_id.as_deref() {
+    // Instant paint from cached threads (and the workspace name, if cached) so
+    // the user can act right away; the fresh list + full stats subtitle land via
+    // the background refetch below.
+    let initial = {
+        let cached = cache::load_threads(tenant, ws_scope.as_deref()).unwrap_or_default();
+        let subtitle = match ws_scope.as_deref() {
             Some(id) => {
-                // Resolve the name and the stats counts concurrently.
-                let (workspaces, (credits, findings, files)) =
-                    tokio::join!(client.list_workspaces(), fetch_workspace_stats(&client, id));
-                let name = workspaces
-                    .ok()
-                    .and_then(|ws| ws.into_iter().find(|w| w.id.as_str() == id).map(|w| w.name))
+                let name = cache::load_workspaces(tenant)
+                    .and_then(|ws| ws.into_iter().find(|w| w.id == id).map(|w| w.name))
                     .filter(|n| !n.is_empty())
                     .unwrap_or_else(|| format!("{}…", &id[..8.min(id.len())]));
-                let stats = format!(
-                    "{} threads  ·  ◈ {credits:.2} credits  ·  ⚠ {findings} findings  ·  {files} files",
-                    threads.len()
-                );
-                format!("{auth}\n⊞ workspace: {name}\n{stats}")
+                format!("{auth}\n⊞ workspace: {name}")
             }
             None => format!("{auth}\n⊞ workspace: (none — all threads)"),
         };
-        (threads, auth)
-    })
-    .await;
+        build_threads_live_list(&cached, &subtitle)
+    };
+    let (tx, rx) = tokio::sync::watch::channel(initial);
 
-    let mut labels = vec!["➕  New thread".to_string()];
-    for t in &threads {
-        let title = if t.title.is_empty() { "(untitled)".into() } else { t.title.clone() };
-        let last = if t.last_message.is_empty() { String::new() } else { format!("  — {}", trunc(&t.last_message, 50)) };
-        labels.push(format!("{title}   [{}]{last}", t.status));
+    // Background refetch — never blocks. Pulls threads (+ the workspace's name
+    // and headline stats), publishes to the picker, and refreshes the cache.
+    {
+        let profile = profile.clone();
+        let tenant = tenant.to_string();
+        let auth = auth.clone();
+        let ws_scope = ws_scope.clone();
+        tokio::spawn(async move {
+            let client = match api::ApiClient::new(profile) { Ok(c) => c, Err(_) => return };
+            let threads = match client.list_threads(ws_scope.as_deref()).await { Ok(t) => t, Err(_) => return };
+            cache::save_threads(&tenant, ws_scope.as_deref(), &threads);
+            let subtitle = match ws_scope.as_deref() {
+                Some(id) => {
+                    let (workspaces, (credits, findings, files)) =
+                        tokio::join!(client.list_workspaces(), fetch_workspace_stats(&client, id));
+                    let name = workspaces
+                        .ok()
+                        .and_then(|ws| ws.into_iter().find(|w| w.id.as_str() == id).map(|w| w.name))
+                        .filter(|n| !n.is_empty())
+                        .unwrap_or_else(|| format!("{}…", &id[..8.min(id.len())]));
+                    let stats = format!(
+                        "{} threads  ·  ◈ {credits:.2} credits  ·  ⚠ {findings} findings  ·  {files} files",
+                        threads.len()
+                    );
+                    format!("{auth}\n⊞ workspace: {name}\n{stats}")
+                }
+                None => format!("{auth}\n⊞ workspace: (none — all threads)"),
+            };
+            let _ = tx.send(build_threads_live_list(&threads, &subtitle));
+        });
     }
 
-    match picker::select_with(terminal, "Select a thread", &labels, &auth).await? {
-        picker::Nav::Item(0) => {
+    match picker::select_live(terminal, "Select a thread", rx.clone()).await? {
+        picker::LiveNav::Item { id, .. } if id == "__new__" => {
             let id = picker::with_loader(
                 terminal,
                 "Creating thread",
@@ -1210,9 +1277,9 @@ async fn resolve_thread_interactive(
             .await?;
             Ok(ThreadChoice::Pick(id))
         }
-        picker::Nav::Item(i) => Ok(ThreadChoice::Pick(threads[i - 1].id.clone())),
-        picker::Nav::Back | picker::Nav::Shortcut(_) => Ok(ThreadChoice::Back),
-        picker::Nav::Quit => Ok(ThreadChoice::Quit),
+        picker::LiveNav::Item { id, .. } => Ok(ThreadChoice::Pick(id)),
+        picker::LiveNav::Back | picker::LiveNav::Shortcut { .. } => Ok(ThreadChoice::Back),
+        picker::LiveNav::Quit => Ok(ThreadChoice::Quit),
     }
 }
 

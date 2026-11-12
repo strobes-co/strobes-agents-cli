@@ -3,11 +3,11 @@
 //! `Authorization: token <key>` — matches strobes/app/authentication.py.
 
 use anyhow::{anyhow, Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::config::Profile;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Workspace {
     pub id: String,
     #[serde(default)]
@@ -44,7 +44,7 @@ pub struct WorkspaceCredits {
 }
 
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Thread {
     pub id: String,
     #[serde(default)]
