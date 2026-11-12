@@ -29,14 +29,25 @@ use tokio::sync::mpsc;
 use app::App;
 use config::Config;
 
-/// Capture mouse events so trackpad/wheel scroll reaches the transcript.
+/// Capture mouse events so trackpad/wheel scroll reaches the transcript, and
+/// enable bracketed paste so a file/folder dragged onto the terminal arrives as
+/// a single `Event::Paste` we can act on immediately (auto-upload) instead of
+/// waiting for the user to press Enter.
 /// (Native click-drag selection still works while holding Option/Shift.)
 pub fn enable_mouse() {
-    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture);
+    let _ = crossterm::execute!(
+        std::io::stdout(),
+        crossterm::event::EnableMouseCapture,
+        crossterm::event::EnableBracketedPaste,
+    );
 }
 
 pub fn disable_mouse() {
-    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
+    let _ = crossterm::execute!(
+        std::io::stdout(),
+        crossterm::event::DisableBracketedPaste,
+        crossterm::event::DisableMouseCapture,
+    );
 }
 
 /// Alert the user that a response finished, by writing terminal escape codes the
@@ -7776,6 +7787,25 @@ pub async fn run_chat(
                         MouseEventKind::ScrollDown => if app.overlay_active() { app.overlay_move(false) } else { app.scroll_lines(false, 3) },
                         _ => {}
                     },
+                    // A file/folder dragged onto the terminal arrives here as a
+                    // bracketed paste. If it's existing path(s) and a workspace
+                    // is bound, start the upload IMMEDIATELY (no Enter) — the
+                    // defer handler reports "uploading N file(s)" + progress.
+                    // Anything else is a normal paste: drop it into the input.
+                    Some(Ok(Event::Paste(data))) => {
+                        match parse_dragged_paths(&data) {
+                            Some(paths) if app.has_workspace => {
+                                defer = Some(Defer::UploadFiles(paths));
+                            }
+                            Some(_) => {
+                                // Looks like a dropped path but nothing to upload
+                                // into — show it and tell the user what to do.
+                                app.input_insert_str(data.trim());
+                                app.notice("bind a workspace first, then drop files or folders to upload");
+                            }
+                            None => app.input_insert_str(&data),
+                        }
+                    }
                     // A transient parse error (e.g. a stray escape byte) must NOT
                     // kill the session — just ignore it. Only a closed stream quits.
                     Some(Err(_)) => {}
@@ -7984,6 +8014,10 @@ pub async fn run_chat(
                         }
                         Ok(entries) => {
                             let total = entries.len();
+                            app.notice(&format!(
+                                "⬆ uploading {total} file{}…",
+                                if total == 1 { "" } else { "s" }
+                            ));
                             app.set_busy(format!("uploading 0/{total}…"));
                             let profile = profile.clone();
                             let tx = app_tx.clone();

@@ -1368,6 +1368,12 @@ impl App {
         self.input_cursor += c.len_utf8();
     }
 
+    /// Insert a block of text (e.g. a bracketed paste) at the cursor.
+    pub fn input_insert_str(&mut self, s: &str) {
+        self.input.insert_str(self.input_cursor, s);
+        self.input_cursor += s.len();
+    }
+
     /// Insert a newline (Alt/Shift+Enter) for composing a multiline message.
     pub fn input_newline(&mut self) {
         self.input.insert(self.input_cursor, '\n');
