@@ -7854,7 +7854,7 @@ pub async fn run_chat(
                                     if app.select_mode { disable_mouse(); } else { enable_mouse(); }
                                 }
                                 KeyCode::Char('w') if ctrl => defer = Some(Defer::Workspaces),
-                                KeyCode::Char('o') if ctrl => defer = Some(Defer::Threads),
+                                KeyCode::Char('o') if ctrl => app.show_full_code = !app.show_full_code,
                                 KeyCode::Char('p') if ctrl => defer = Some(Defer::Models),
                                 KeyCode::Char('f') if ctrl => defer = Some(Defer::Findings),
                                 KeyCode::Char('a') if ctrl => defer = Some(Defer::Approvals),

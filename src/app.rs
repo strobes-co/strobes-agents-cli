@@ -76,6 +76,9 @@ enum ToolStatus {
 }
 
 /// One transcript entry.
+/// Max lines of a code/command tool call shown before a "ctrl+o" hint.
+const CODE_PREVIEW_LINES: usize = 5;
+
 enum Block {
     User(String),
     Assistant { agent: String, md: String },
@@ -241,6 +244,9 @@ pub struct App {
     pub running: bool,
     pub show_thinking: bool,
     pub markdown: bool,
+    /// When true, code/command tool calls render their full source; otherwise
+    /// they show up to CODE_PREVIEW_LINES with a "ctrl+o" hint. Toggled by ^O.
+    pub show_full_code: bool,
     pub scroll: u16,
     pub max_scroll: u16,
     pub follow: bool,
@@ -363,6 +369,7 @@ impl App {
             running: false,
             show_thinking: false,
             markdown: true,
+            show_full_code: false,
             scroll: 0,
             max_scroll: 0,
             follow: true,
@@ -414,7 +421,7 @@ impl App {
             format!("{LEFT}{}", app.auth_line),
             Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
         ))));
-        app.sys("Enter: send · Ctrl-C: cancel/quit · Esc: quit · PgUp/PgDn: scroll · Ctrl-T: thinking · Ctrl-R: markdown");
+        app.sys("Enter: send · Ctrl-C: cancel/quit · Esc: quit · PgUp/PgDn: scroll · Ctrl-T: thinking · Ctrl-R: markdown · Ctrl-O: full code");
         app
     }
 
@@ -992,6 +999,7 @@ impl App {
         }
         self.show_thinking.hash(&mut h);
         self.markdown.hash(&mut h);
+        self.show_full_code.hash(&mut h);
         h.finish()
     }
 
@@ -1038,25 +1046,44 @@ impl App {
                             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
                         }
                     };
-                    let mut spans = vec![
-                        Span::styled("⏺ ".to_string(), dot_style),
-                        Span::styled(
-                            name.clone(),
-                            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-                        ),
-                    ];
-                    if !detail.is_empty() {
-                        // Args/code rendered in a readable gray (not washed-out
-                        // dark gray) so the parsed code/command is legible, with
-                        // the enclosing parens kept dim.
-                        spans.push(Span::styled("(".to_string(), Style::default().fg(Color::DarkGray)));
-                        spans.push(Span::styled(
-                            detail.clone(),
-                            Style::default().fg(Color::Gray),
-                        ));
-                        spans.push(Span::styled(")".to_string(), Style::default().fg(Color::DarkGray)));
+                    let name_span = Span::styled(
+                        name.clone(),
+                        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    );
+                    let dot = Span::styled("⏺ ".to_string(), dot_style);
+                    let code_style = Style::default().fg(Color::Gray);
+                    let dim = Style::default().fg(Color::DarkGray);
+
+                    if crate::pulse::is_verbatim_tool(name) && !detail.trim().is_empty() {
+                        // Code / shell-command calls render their source verbatim:
+                        // the tool name on its own line, then up to
+                        // CODE_PREVIEW_LINES indented code lines (preserving
+                        // newlines + indentation), with a "ctrl+o" hint when
+                        // there's more. ^O expands to the full source.
+                        out.push(Line::from(vec![dot, name_span]));
+                        let lines: Vec<&str> = detail.lines().collect();
+                        let show = if self.show_full_code { lines.len() } else { CODE_PREVIEW_LINES.min(lines.len()) };
+                        for l in lines.iter().take(show) {
+                            out.push(Line::from(Span::styled(format!("    {l}"), code_style)));
+                        }
+                        if !self.show_full_code && lines.len() > CODE_PREVIEW_LINES {
+                            let more = lines.len() - CODE_PREVIEW_LINES;
+                            out.push(Line::from(Span::styled(
+                                format!("    … (+{more} more line{} · ctrl+o to view full)", if more == 1 { "" } else { "s" }),
+                                dim,
+                            )));
+                        }
+                    } else {
+                        // Other tools: "⏺ name(args)" on one line, args in a
+                        // readable gray with dim parens.
+                        let mut spans = vec![dot, name_span];
+                        if !detail.is_empty() {
+                            spans.push(Span::styled("(".to_string(), dim));
+                            spans.push(Span::styled(detail.clone(), code_style));
+                            spans.push(Span::styled(")".to_string(), dim));
+                        }
+                        out.push(Line::from(spans));
                     }
-                    out.push(Line::from(spans));
                 }
                 Block::Rule(label) => {
                     cur_agent = None;
@@ -1629,9 +1656,10 @@ impl App {
         let model_label = crate::api::model_name(self.current_model);
         let select_indicator = if self.select_mode { "  ⊙ SELECT" } else { "" };
         let left = format!(
-            " {dot} {chat}  ·  {status}  ·  md:{}  think:{}  ⚙ {}{}",
+            " {dot} {chat}  ·  {status}  ·  md:{}  think:{}  code:{}  ⚙ {}{}",
             if self.markdown { "on" } else { "off" },
             if self.show_thinking { "on" } else { "off" },
+            if self.show_full_code { "full" } else { "5" },
             model_label,
             select_indicator,
         );
@@ -1759,7 +1787,7 @@ impl App {
                     // the args the same way the live path does (code/command,
                     // not a raw JSON dump).
                     let name = pstr("toolName");
-                    let args = crate::pulse::concise_args(&name, p.get("arguments").unwrap_or(&Value::Null));
+                    let args = crate::pulse::tool_detail(&name, p.get("arguments").unwrap_or(&Value::Null));
                     self.flush_stream();
                     self.blocks.push(Block::Tool { name, detail: args, status: ToolStatus::Done, agent: agent.clone() });
                 }

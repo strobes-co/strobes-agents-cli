@@ -351,6 +351,27 @@ fn trim_code_preview(code: &str) -> String {
     }
 }
 
+/// Tools whose primary argument is code or a shell command we render verbatim
+/// (multi-line, up to a cap) rather than as a flattened one-line summary.
+pub(crate) fn is_verbatim_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "execute_code" | "workspace_execute_code" | "execute_command" | "workspace_execute_shell_command"
+    )
+}
+
+/// The detail string for a tool call: the raw code/command with newlines kept
+/// (for verbatim tools), else the concise one-line summary.
+pub(crate) fn tool_detail(tool: &str, v: &Value) -> String {
+    if is_verbatim_tool(tool) {
+        let key = if tool.contains("command") { "command" } else { "code" };
+        if let Some(s) = v.get(key).and_then(|x| x.as_str()) {
+            return s.trim_matches('\n').to_string();
+        }
+    }
+    concise_args(tool, v)
+}
+
 pub(crate) fn concise_args(tool: &str, v: &Value) -> String {
     let pick = |k: &str| v.get(k).and_then(|x| x.as_str()).map(|s| s.to_string());
     let chosen = match tool {
@@ -478,7 +499,7 @@ fn handle_frame(v: Value, app_tx: &mpsc::UnboundedSender<AppEvent>, out_tx: &mps
         if let Some(ws) = ws_any {
             input["_workspace_id"] = json!(ws);
         }
-        let arg_summary = concise_args(&tool_name, &input);
+        let arg_summary = tool_detail(&tool_name, &input);
         let _ = app_tx.send(AppEvent::Stream(StreamItem {
             kind: "tool_start".into(),
             agent,
@@ -625,7 +646,7 @@ fn handle_frame(v: Value, app_tx: &mpsc::UnboundedSender<AppEvent>, out_tx: &mps
             let name = sval(&b, "toolName");
             match status.as_deref() {
                 Some("start") => {
-                    let detail = concise_args(name.as_deref().unwrap_or(""), b.get("arguments").unwrap_or(&Value::Null));
+                    let detail = tool_detail(name.as_deref().unwrap_or(""), b.get("arguments").unwrap_or(&Value::Null));
                     Some(StreamItem {
                         kind: "tool_start".into(), agent, text: None, tool_name: name,
                         detail: Some(detail), status: Some("start".into()), local: false, task_id: None,
