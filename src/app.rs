@@ -409,20 +409,26 @@ impl App {
             // first draw does one harmless extra rebuild.
             lines_fingerprint: 0,
         };
-        // Brand banner (green bolt + white wordmark) + the authenticated tenant
-        // on top, indented to match the picker pages.
-        const LEFT: &str = "   ";
-        for line in banner_spans(LEFT) {
-            app.blocks.push(Block::Plain(line));
-        }
         let org = if org_id.len() > 8 { &org_id[..8] } else { &org_id };
         app.auth_line = format!("✔ authenticated · tenant: {tenant} · {} · org {org}", app.base);
-        app.blocks.push(Block::Plain(Line::from(Span::styled(
-            format!("{LEFT}{}", app.auth_line),
+        app.push_banner();
+        app
+    }
+
+    /// The head of every transcript: the brand banner, the authenticated
+    /// tenant and the key hints, indented to match the picker pages. Pushed
+    /// when the chat opens and again whenever the transcript is cleared for
+    /// another thread, so the logo is always the very first thing in it.
+    fn push_banner(&mut self) {
+        const LEFT: &str = "   ";
+        for line in banner_spans(LEFT) {
+            self.blocks.push(Block::Plain(line));
+        }
+        self.blocks.push(Block::Plain(Line::from(Span::styled(
+            format!("{LEFT}{}", self.auth_line),
             Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
         ))));
-        app.sys("Enter: send · Ctrl-C: cancel/quit · Esc: quit · PgUp/PgDn: scroll · Ctrl-T: thinking · Ctrl-R: markdown · Ctrl-O: full code");
-        app
+        self.sys("Enter: send · Ctrl-C: cancel/quit · Esc: quit · PgUp/PgDn: scroll · Ctrl-T: thinking · Ctrl-R: markdown · Ctrl-O: full code");
     }
 
     // ---- transcript mutation -------------------------------------------
@@ -1316,7 +1322,8 @@ impl App {
     }
 
     fn draw_tasks_panel(&self, f: &mut Frame, area: Rect) {
-        let inner_w = area.width.saturating_sub(2) as usize;
+        // Borders (2) + one column of padding on each side (2).
+        let inner_w = area.width.saturating_sub(4) as usize;
         let items: Vec<ListItem> = self.tasks.iter().map(|task| {
             let icon = task.status.icon();
             let col  = task.status.color();
@@ -1331,7 +1338,8 @@ impl App {
             .block(TuiBlock::default()
                 .title(Span::styled(" Tasks ", Style::default().fg(Color::DarkGray)))
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::DarkGray)));
+                .border_style(Style::default().fg(Color::DarkGray))
+                .padding(Padding::horizontal(1)));
         f.render_widget(panel, area);
     }
 
@@ -1444,6 +1452,21 @@ impl App {
         let prev = self.input[..self.input_cursor].chars().next_back().unwrap();
         self.input_cursor -= prev.len_utf8();
         self.input.remove(self.input_cursor);
+    }
+
+    /// Delete the word before the cursor: any whitespace directly behind the
+    /// cursor, then the run of non-whitespace before that.
+    pub fn input_backspace_word(&mut self) {
+        let head = &self.input[..self.input_cursor];
+        let word_end = head.trim_end().len();
+        let start = head[..word_end]
+            .char_indices()
+            .rev()
+            .find(|(_, c)| c.is_whitespace())
+            .map(|(i, c)| i + c.len_utf8())
+            .unwrap_or(0);
+        self.input.replace_range(start..self.input_cursor, "");
+        self.input_cursor = start;
     }
 
     /// Delete the char at the cursor (Del key).
@@ -2222,7 +2245,7 @@ impl App {
         self.thread_credits = 0.0;
         self.thread_tokens = 0;
         self.tasks.clear();
-        self.sys("Strobes Agents AI — Ratatui client");
+        self.push_banner();
     }
 
     pub fn echo_user(&mut self, text: &str) {
@@ -2609,6 +2632,24 @@ mod input_editor_tests {
         assert_eq!(a.input_cursor, 1);
         a.input_delete(); // remove 'c' at cursor -> "a"
         assert_eq!(a.input, "a");
+    }
+
+    #[test]
+    fn backspace_word_removes_the_word_before_the_cursor() {
+        let mut a = app();
+        a.input_insert_str("scan héllo wörld  ");
+        a.input_backspace_word(); // trailing spaces + "wörld"
+        assert_eq!(a.input, "scan héllo ");
+        assert_eq!(a.input_cursor, a.input.len());
+        a.input_left(); // "scan héllo| "
+        a.input_backspace_word(); // only the word behind the cursor
+        assert_eq!(a.input, "scan  ");
+        assert_eq!(a.input_cursor, 5);
+        a.input_backspace_word();
+        assert_eq!(a.input, " ");
+        assert_eq!(a.input_cursor, 0);
+        a.input_backspace_word(); // nothing before the cursor: no-op
+        assert_eq!(a.input, " ");
     }
 
     #[test]
