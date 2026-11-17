@@ -7732,17 +7732,59 @@ pub async fn run_chat(
     // Drives the working-spinner animation while a turn is running.
     let mut ticker = tokio::time::interval(std::time::Duration::from_millis(120));
 
+    // A frame re-wraps the whole transcript, so it is far more expensive than
+    // handling an input event. Drawing once per event let a trackpad swipe
+    // (hundreds of scroll events, plus a mouse-move event for every pointer
+    // motion) queue up a full frame each, and keystrokes — which arrive on the
+    // same stream, in order — only showed up after that backlog had drained.
+    // So: draw only when something visible changed (`needs_draw`), and while
+    // more terminal input is already waiting (`stashed`), handle it first and
+    // draw once for the batch — but never go longer than MAX_FRAME_GAP without
+    // a frame, so a long scroll still animates.
+    const MAX_FRAME_GAP: std::time::Duration = std::time::Duration::from_millis(33);
+    let mut needs_draw = true;
+    let mut last_draw = std::time::Instant::now();
+    // A terminal event already read off the stream while deciding whether to
+    // draw; the select below consumes it before reading a new one.
+    let mut stashed: Option<Option<std::io::Result<Event>>> = None;
+
     let res = loop {
-        terminal.draw(|f| {
-            viewport_h = f.area().height.saturating_sub(7).max(1);
-            app.draw(f);
-        })?;
+        if needs_draw {
+            if stashed.is_none() {
+                // Non-blocking peek. Polled with this task's own waker (not
+                // `now_or_never`): EventStream registers only the first waker
+                // it sees after going idle, so a throwaway one would leave the
+                // next keypress unnoticed until some other arm woke the loop.
+                let peek = std::future::poll_fn(|cx| {
+                    std::task::Poll::Ready(events.poll_next_unpin(cx))
+                })
+                .await;
+                if let std::task::Poll::Ready(ev) = peek {
+                    stashed = Some(ev);
+                }
+            }
+            if stashed.is_none() || last_draw.elapsed() >= MAX_FRAME_GAP {
+                terminal.draw(|f| {
+                    viewport_h = f.area().height.saturating_sub(7).max(1);
+                    app.draw(f);
+                })?;
+                needs_draw = false;
+                last_draw = std::time::Instant::now();
+            }
+        }
 
         let mut defer: Option<Defer> = None;
         let mut quit = false;
+        // Cleared by the arms that change nothing on screen.
+        let mut redraw = true;
 
         tokio::select! {
-            maybe_ev = events.next() => {
+            maybe_ev = async {
+                match stashed.take() {
+                    Some(ev) => ev,
+                    None => events.next().await,
+                }
+            } => {
                 match maybe_ev {
                     Some(Ok(Event::Key(k))) if k.kind == KeyEventKind::Press => {
                         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
@@ -7808,6 +7850,11 @@ pub async fn run_chat(
                             match k.code {
                                 KeyCode::Esc => quit = true,
                                 KeyCode::Char(c) if !ctrl => app.input_insert_char(c),
+                                // Word delete — see the matching arms in normal chat.
+                                KeyCode::Backspace if k.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
+                                    app.input_backspace_word();
+                                }
+                                KeyCode::Char('h') if ctrl => app.input_backspace_word(),
                                 KeyCode::Backspace => app.input_backspace(),
                                 KeyCode::Left => app.input_left(),
                                 KeyCode::Right => app.input_right(),
@@ -7894,6 +7941,16 @@ pub async fn run_chat(
                                         }
                                     }
                                 }
+                                // Word delete. Ctrl+Backspace reaches us in one
+                                // of three forms depending on the terminal: a
+                                // modified Backspace, ^H (0x08, which crossterm
+                                // reports as Ctrl+H), or — on terminals that
+                                // send plain DEL for it — not at all, which is
+                                // why Alt/Option+Backspace is accepted too.
+                                KeyCode::Backspace if k.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
+                                    app.input_backspace_word();
+                                }
+                                KeyCode::Char('h') if ctrl => app.input_backspace_word(),
                                 KeyCode::Backspace => app.input_backspace(),
                                 KeyCode::Delete => app.input_delete(),
                                 KeyCode::Left => app.input_left(),
@@ -7915,7 +7972,9 @@ pub async fn run_chat(
                     Some(Ok(Event::Mouse(m))) => match m.kind {
                         MouseEventKind::ScrollUp => if app.overlay_active() { app.overlay_move(true) } else { app.scroll_lines(true, 3) },
                         MouseEventKind::ScrollDown => if app.overlay_active() { app.overlay_move(false) } else { app.scroll_lines(false, 3) },
-                        _ => {}
+                        // Mouse capture reports every pointer motion, click
+                        // and drag; none of them change anything here.
+                        _ => redraw = false,
                     },
                     // A file/folder dragged onto the terminal arrives here as a
                     // bracketed paste. If it's existing path(s) and a workspace
@@ -7974,9 +8033,12 @@ pub async fn run_chat(
                 // ratatui's diff means an idle redraw writes nothing.
                 if app.running || app.is_busy() || app.is_loading() {
                     app.tick();
+                } else {
+                    redraw = false;
                 }
             }
         }
+        needs_draw |= redraw;
 
         if quit {
             break Ok(());
