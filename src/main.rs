@@ -74,6 +74,24 @@ fn notify_response_done(secs: u64) {
     }
 }
 
+/// The agent is blocked on the user (a question or an approval): notify
+/// right away — this is exactly when someone who stepped away needs a ping.
+fn notify_needs_you(what: &str) {
+    let disabled = std::env::var("STROBES_AI_NOTIFY")
+        .map(|v| v.eq_ignore_ascii_case("off") || v == "0")
+        .unwrap_or(false);
+    if disabled {
+        return;
+    }
+    use std::io::Write;
+    let what: String = what.chars().filter(|c| !c.is_control()).take(80).collect();
+    let mut out = std::io::stdout();
+    let _ = out.write_all(
+        format!("\x07\x1b]9;Strobes Agents — {what}\x07\x1b]777;notify;Strobes Agents;{what}\x07").as_bytes(),
+    );
+    let _ = out.flush();
+}
+
 /// The escape bytes for a done-notification, or None when suppressed (disabled,
 /// or the run was shorter than `min` seconds). BEL = universal attention;
 /// OSC 9 = desktop notification (iTerm2/WezTerm/Windows Terminal); OSC 777 =
@@ -9050,6 +9068,11 @@ pub async fn run_chat(
                 match maybe_app {
                     Some(ev) => {
                         let finished = matches!(ev, pulse::AppEvent::RunFinished(_));
+                        match &ev {
+                            pulse::AppEvent::Interrupt { title, .. } => notify_needs_you(&format!("question: {title}")),
+                            pulse::AppEvent::ApprovalRequest { .. } => notify_needs_you("approval needed"),
+                            _ => {}
+                        }
                         // An interrupt pressed before the server had started the
                         // run was dropped by it — send it again now that it exists.
                         if matches!(ev, pulse::AppEvent::RunStarted) && app.cancel_requested {
