@@ -713,6 +713,12 @@ impl App {
         if md.trim().is_empty() {
             return;
         }
+        // The server's cancel receipt reads like the agent talking; show it
+        // as a quiet status line instead.
+        if is_cancel_receipt(&md) {
+            self.push_interrupted();
+            return;
+        }
         if let Some(Block::Assistant { agent: prev_agent, md: prev_md }) = self.blocks.last_mut() {
             if *prev_agent == agent {
                 prev_md.push_str("\n\n");
@@ -849,11 +855,13 @@ impl App {
                 self.status = format!("idle ({label}){took}");
                 if label != "completed" {
                     self.flush_stream();
-                    let msg = match label.as_str() {
-                        "cancelled" | "canceled" | "interrupted" => "  ⎿  Interrupted · what should I do instead?".to_string(),
-                        other => format!("  ⎿  Run {other}"),
-                    };
-                    self.blocks.push(Block::Plain(Line::from(Span::styled(msg, Style::default().fg(Color::Red)))));
+                    match label.as_str() {
+                        "cancelled" | "canceled" | "interrupted" => self.push_interrupted(),
+                        other => self.blocks.push(Block::Plain(Line::from(Span::styled(
+                            format!("  ⎿  Run {other}"),
+                            Style::default().fg(Color::Red),
+                        )))),
+                    }
                 }
                 self.follow = true;
             }
@@ -3049,6 +3057,19 @@ impl App {
         self.last_elapsed = None;
     }
 
+    /// "⎿ Interrupted · …" — once per interrupt.
+    fn push_interrupted(&mut self) {
+        let already = matches!(self.blocks.last(), Some(Block::Plain(l))
+            if l.spans.iter().any(|s| s.content.contains("Interrupted")));
+        if !already {
+            self.blocks.push(Block::Plain(Line::from(Span::styled(
+                "  ⎿  Interrupted · what should the agent do instead?".to_string(),
+                Style::default().fg(Color::Red),
+            ))));
+        }
+        self.follow = true;
+    }
+
     /// True when nobody has written in this chat yet (so `/new` can reuse it).
     pub fn chat_is_empty(&self) -> bool {
         !self.running && !self.blocks.iter().any(|b| matches!(b, Block::User(_) | Block::Assistant { .. }))
@@ -3291,6 +3312,13 @@ pub fn set_terminal_title(title: &str) {
         format!("✻ {}", truncate(title.trim(), 40))
     };
     let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::SetTitle(t));
+}
+
+/// The server's "──── Run cancelled. Completed N operations…" message.
+fn is_cancel_receipt(md: &str) -> bool {
+    // e.g. "\n\n---\n**Run cancelled.** Completed 0 operations …"
+    let t = md.trim().trim_start_matches(|c: char| matches!(c, '─' | '-' | '*' | '_') || c.is_whitespace());
+    t.starts_with("Run cancelled") || t.starts_with("Run canceled")
 }
 
 /// The orchestrator is "the assistant" — it needs no name tag; sub-agents do.
@@ -3816,6 +3844,17 @@ mod input_editor_tests {
         a.input_insert_str("two");
         assert_eq!(a.input, "line one\ntwo");
         assert!(!a.input_backslash_newline());
+    }
+
+    #[test]
+    fn cancel_receipt_becomes_interrupted_line() {
+        let mut a = app();
+        a.push_assistant("Strobes AI Supervisor".into(), "\n\n---\n**Run cancelled.** Completed 0 operations before cancellation.".into());
+        a.on_app_event(AppEvent::RunFinished("cancelled".into()));
+        let text = a.transcript_plaintext();
+        assert_eq!(text.matches("Interrupted").count(), 1, "{text}");
+        assert!(!text.contains("Run cancelled"));
+        assert!(!is_cancel_receipt("The run cancelled flag is set"));
     }
 
     #[test]
