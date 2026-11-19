@@ -726,7 +726,15 @@ fn handle_frame(v: Value, app_tx: &mpsc::UnboundedSender<AppEvent>, out_tx: &mps
                 label: arg_summary.lines().next().unwrap_or("").to_string(),
                 sink: job_sink(app_tx.clone()),
             });
-            let res = local::run_tool_ctx(&tool_name, &input, ctx).await;
+            // The user's hooks see the agent's calls (not the server's own
+            // setup cells); a PreToolUse hook can block one.
+            let res = match if hidden { Ok(()) } else { crate::hooks::pre_tool(&tool_name, &input).await } {
+                Ok(()) => local::run_tool_ctx(&tool_name, &input, ctx).await,
+                Err(reason) => local::LocalResult { output: String::new(), exit_code: None, error: Some(reason), captured_network: vec![] },
+            };
+            if !hidden {
+                crate::hooks::post_tool(&tool_name, &input, &res.output, res.error.as_deref()).await;
+            }
             if let (true, Some(ws)) = (syncs, ws.as_deref()) {
                 crate::wsync::after(ws, &sandbox).await;
             }

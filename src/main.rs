@@ -6,6 +6,7 @@
 //! its tools locally (the user's machine is the sandbox).
 
 mod analyzer_registry;
+mod hooks;
 mod jobs;
 mod api;
 mod app;

@@ -208,9 +208,6 @@ pub struct Config {
     /// else (default) approves automatically.
     #[serde(default)]
     pub approvals: String,
-    /// Project roots whose MCP servers (`.mcp.json`) the user allowed to run.
-    #[serde(default)]
-    pub mcp_trusted: Vec<String>,
 }
 
 fn default_profile_name() -> String {

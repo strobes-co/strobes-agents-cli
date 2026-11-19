@@ -9,6 +9,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("init", "Create a STROBES.md with scope and rules for this project"),
     ("mcp", "MCP servers: status · trust · reload"),
     ("skills", "Skills: list · show <slug> · push <dir> · enable|disable <slug>"),
+    ("hooks", "Your scripts around the agent's local tool calls (hooks.json)"),
 ];
 
 pub fn is_command(name: &str) -> bool {
@@ -32,6 +33,7 @@ pub async fn run(name: &str, args: &str, ctx: &Ctx) -> Result<Outcome, String> {
         "init" => init().map(Outcome::Text),
         "mcp" => mcp_cmd(sub).await.map(Outcome::Text),
         "skills" => skills(sub, rest, ctx).await.map(Outcome::Text),
+        "hooks" => Ok(Outcome::Text(hooks_text())),
         _ => Err(format!("unknown command /{name}")),
     }
 }
@@ -70,6 +72,26 @@ fn init() -> Result<String, String> {
         "created {}\nFill in scope and rules of engagement; the agent reads it at the start of every turn.",
         short_path(&path)
     ))
+}
+
+fn hooks_text() -> String {
+    let rows = crate::hooks::list();
+    let files = format!(
+        "{} or {} (project, needs /mcp trust)",
+        short_path(&config::config_dir().join("hooks.json")),
+        short_path(&project::root().join(".strobes/hooks.json"))
+    );
+    if rows.is_empty() {
+        return format!(
+            "No hooks. Add them to {files}, in Claude Code's format:\n  {{\"hooks\": {{\"PreToolUse\": [{{\"matcher\": \"Shell\", \"hooks\": [{{\"type\": \"command\", \"command\": \"./scope-guard.sh\"}}]}}]}}}}\nA PreToolUse hook that exits 2 blocks the call; its stderr tells the agent why."
+        );
+    }
+    let mut out = String::from("Hooks");
+    for (event, matcher, cmd) in rows {
+        out.push_str(&format!("\n  {event} [{matcher}] → {cmd}"));
+    }
+    out.push_str(&format!("\n  from {files}"));
+    out
 }
 
 async fn mcp_cmd(sub: &str) -> Result<String, String> {

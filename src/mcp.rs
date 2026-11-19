@@ -182,8 +182,18 @@ pub fn configured() -> Vec<ServerConfig> {
     by_name
 }
 
+/// Projects the user trusted to run their own MCP servers and hooks. A file
+/// of its own: the chat saves its in-memory config on the way out, which would
+/// drop a trust granted mid-session.
+fn trust_file() -> PathBuf {
+    crate::config::config_dir().join("trusted_projects.json")
+}
+
 fn trusted_projects() -> Vec<String> {
-    crate::config::Config::load().mcp_trusted
+    std::fs::read_to_string(trust_file())
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
 }
 
 pub fn is_trusted() -> bool {
@@ -192,11 +202,12 @@ pub fn is_trusted() -> bool {
 }
 
 pub fn trust_project() -> Result<()> {
-    let mut cfg = crate::config::Config::load();
+    let mut list = trusted_projects();
     let root = crate::project::root().display().to_string();
-    if !cfg.mcp_trusted.contains(&root) {
-        cfg.mcp_trusted.push(root);
-        cfg.save()?;
+    if !list.contains(&root) {
+        list.push(root);
+        std::fs::create_dir_all(crate::config::config_dir())?;
+        std::fs::write(trust_file(), serde_json::to_string_pretty(&list)?)?;
     }
     Ok(())
 }
