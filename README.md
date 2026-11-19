@@ -383,7 +383,7 @@ Agent skills (e.g. `/api-pentest`) appear in the same `/` menu after the built-i
 
 | Key | Action |
 |-----|--------|
-| `Enter` · `Ctrl-J` | Send · newline (Shift/Alt+Enter on kitty-protocol terminals) |
+| `Enter` · `\`+`Enter` | Send · newline (also `Ctrl-J`, or Shift/Alt+Enter on kitty-protocol terminals) |
 | `Esc` | Interrupt the agent · press twice to clear the prompt |
 | `Ctrl-C` | Interrupt · clear the prompt · press twice to quit (`Ctrl-D` quits too) |
 | `↑` / `↓` | Previous prompts (history is kept across sessions) |

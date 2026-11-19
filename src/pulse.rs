@@ -68,6 +68,8 @@ pub enum AppEvent {
     /// (`credit.update`); `final_run=true` is the authoritative run total
     /// (from `run.completed` metrics).
     Credits { credits: f64, tokens: i64, final_run: bool },
+    /// Percent of the model's context window in use.
+    Context(f64),
     Error(String),
 }
 
@@ -736,6 +738,13 @@ fn handle_frame(v: Value, app_tx: &mpsc::UnboundedSender<AppEvent>, out_tx: &mps
 
     // Credit/token usage (live per-call deltas).
     let sub = sval(&b, "type");
+    // How full the model's context window is (drives the footer hint).
+    if sub.as_deref() == Some("context.usage") {
+        if let Some(pct) = b.get("context_pct").and_then(|x| x.as_f64()) {
+            let _ = app_tx.send(AppEvent::Context(pct));
+        }
+        return;
+    }
     if etype == "credit.update" || sub.as_deref() == Some("credit.update") {
         let credits = b.get("credits_used").and_then(|x| x.as_f64()).unwrap_or(0.0);
         let it = b.get("input_tokens").and_then(|x| x.as_i64()).unwrap_or(0);

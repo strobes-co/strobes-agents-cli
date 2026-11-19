@@ -351,6 +351,8 @@ pub struct App {
     mention_sel: usize,
     /// Counter for `!cmd` call ids.
     bash_seq: u64,
+    /// Percent of the context window in use (from `context.usage`).
+    context_pct: Option<f64>,
     /// Big pastes, shown in the prompt as "[Pasted text #n +L lines]" and
     /// expanded back when the message is sent.
     pastes: Vec<String>,
@@ -562,6 +564,7 @@ impl App {
             mention_files: None,
             mention_sel: 0,
             bash_seq: 0,
+            context_pct: None,
             history: load_prompt_history(),
             hist_pos: None,
         };
@@ -854,6 +857,7 @@ impl App {
                 }
                 self.follow = true;
             }
+            AppEvent::Context(p) => self.context_pct = Some(p),
             AppEvent::Notice(n) => self.notice(&n),
             AppEvent::Progress(Some(msg)) => self.set_busy(msg),
             AppEvent::Progress(None) => self.clear_busy(),
@@ -1770,6 +1774,17 @@ impl App {
         out
     }
 
+    /// `\` right before the cursor + Enter → replace it with a newline.
+    pub fn input_backslash_newline(&mut self) -> bool {
+        if self.input_cursor > 0 && self.input[..self.input_cursor].ends_with('\\') {
+            self.input.remove(self.input_cursor - 1);
+            self.input_cursor -= 1;
+            self.input_newline();
+            return true;
+        }
+        false
+    }
+
     /// Insert a newline (Alt/Shift+Enter) for composing a multiline message.
     pub fn input_newline(&mut self) {
         self.input.insert(self.input_cursor, '\n');
@@ -2078,9 +2093,9 @@ impl App {
         } else if self.input.starts_with('!') {
             "  ! bash mode — runs locally in the agent's sandbox, not sent to the agent".to_string()
         } else if self.input.contains('\n') {
-            "  enter to send · ctrl+j newline".to_string()
+            "  enter to send · \\+enter newline".to_string()
         } else if !self.input.is_empty() {
-            "  enter to send · ctrl+j newline · ctrl+c clear".to_string()
+            "  enter to send · \\+enter newline · ctrl+c clear".to_string()
         } else {
             "  ? for shortcuts".to_string()
         };
@@ -2095,6 +2110,10 @@ impl App {
         });
         if self.thread_credits > 0.0 {
             right.push(format!("{:.2} cr", self.thread_credits));
+        }
+        // Like Claude Code: only mention context once it's getting full.
+        if let Some(p) = self.context_pct.filter(|p| *p >= 60.0) {
+            right.insert(0, format!("context {:.0}% used — /new for a fresh chat", p));
         }
         let right = format!("{} ", right.join(" · "));
         let rw = (right.chars().count() as u16).min(area.width / 2);
@@ -2115,7 +2134,7 @@ impl App {
             ("@", "mention a file in this folder", "ctrl+e", "open workspace folder"),
             ("esc", "interrupt the agent", "ctrl+w", "workspaces"),
             ("ctrl+c", "clear input · twice to quit", "ctrl+f", "findings"),
-            ("ctrl+j", "newline (shift+enter on kitty)", "ctrl+o", "expand tool output"),
+            ("\\ enter", "newline (or ctrl+j)", "ctrl+o", "expand tool output"),
             ("↑ / ↓", "previous prompts", "ctrl+t", "show thinking"),
             ("pgup/pgdn", "scroll the chat", "ctrl+y", "copy transcript"),
         ];
@@ -2610,6 +2629,15 @@ impl App {
     }
 
     pub fn set_title(&mut self, title: String) {
+        let generic = title.is_empty() || title == "CLI session" || title == "Chat with Strobes AI";
+        let first_ask = self.blocks.iter().find_map(|b| match b {
+            Block::User(t) => Some(t.lines().next().unwrap_or("").to_string()),
+            _ => None,
+        });
+        match (generic, first_ask) {
+            (true, Some(ask)) => set_terminal_title(&ask),
+            _ => set_terminal_title(&title),
+        }
         self.title = title;
     }
 
@@ -2993,11 +3021,18 @@ impl App {
         self.task_label = None;
         self.thread_credits = 0.0;
         self.thread_tokens = 0;
+        self.context_pct = None;
         self.tasks.clear();
+        set_terminal_title("");
         self.push_banner();
     }
 
     pub fn echo_user(&mut self, text: &str) {
+        // Generic thread titles say nothing; name the tab after the first ask.
+        let generic = self.title.is_empty() || self.title == "CLI session" || self.title == "Chat with Strobes AI";
+        if generic && !self.blocks.iter().any(|b| matches!(b, Block::User(_))) {
+            set_terminal_title(text.lines().next().unwrap_or(""));
+        }
         self.flush_stream();
         self.blocks.push(Block::User(text.to_string()));
         self.last_task = None;
@@ -3246,6 +3281,16 @@ pub fn tool_label(name: &str) -> String {
         Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
         None => name.to_string(),
     }
+}
+
+/// Name the terminal tab after the chat (OSC title; ignored where unsupported).
+pub fn set_terminal_title(title: &str) {
+    let t = if title.trim().is_empty() || title == "CLI session" {
+        "strobes".to_string()
+    } else {
+        format!("✻ {}", truncate(title.trim(), 40))
+    };
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::SetTitle(t));
 }
 
 /// The orchestrator is "the assistant" — it needs no name tag; sub-agents do.
@@ -3761,6 +3806,16 @@ mod input_editor_tests {
         a.input_clear();
         a.input_insert_str("mail me@exa");
         assert!(a.mention_query().is_none());
+    }
+
+    #[test]
+    fn backslash_enter_makes_a_newline() {
+        let mut a = app();
+        a.input_insert_str("line one\\");
+        assert!(a.input_backslash_newline());
+        a.input_insert_str("two");
+        assert_eq!(a.input, "line one\ntwo");
+        assert!(!a.input_backslash_newline());
     }
 
     #[test]

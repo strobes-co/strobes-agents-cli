@@ -1023,6 +1023,7 @@ async fn main() -> Result<()> {
         let r = chat_flow(&mut terminal, &mut cfg, &tenant, profile, launch, cli.workspace.clone(), cli.model, None, initial).await;
         disable_mouse();
         ratatui::restore();
+        let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::SetTitle(""));
         return r;
     }
 
@@ -1083,6 +1084,7 @@ async fn main() -> Result<()> {
             let r = chat_flow(&mut terminal, &mut cfg, &tenant, profile, launch, workspace, model, reasoning, None).await;
             disable_mouse();
             ratatui::restore();
+            let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::SetTitle(""));
             r
         }
         Cmd::Probe { thread, send, secs, model, reasoning } => cmd_probe(&profile, &thread, send, secs, model, reasoning).await,
@@ -7434,6 +7436,7 @@ fn describe(ev: &pulse::AppEvent) -> String {
         Notice(n) => format!("notice: {n}"),
         Progress(p) => format!("progress: {p:?}"),
         Credits { credits, tokens, final_run } => format!("credits {credits:.4} tokens {tokens} final={final_run}"),
+        Context(p) => format!("context {p:.1}%"),
         Error(e) => format!("error: {e}"),
         LocalToolDone { name, ms, exit, err } => {
             format!("local tool {name} done {ms}ms exit={exit:?} err={err:?}")
@@ -8264,6 +8267,8 @@ pub async fn run_chat(
                                 KeyCode::Enter if k.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::SHIFT) => {
                                     app.input_newline();
                                 }
+                                // `\` then Enter: newline (works on every terminal).
+                                KeyCode::Enter if app.input_backslash_newline() => {}
                                 KeyCode::Enter => {
                                     let text = app.input.trim().to_string();
                                     let builtin = text
