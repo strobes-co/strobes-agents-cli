@@ -1594,8 +1594,14 @@ impl App {
                         // CODE_PREVIEW_LINES source lines wrapped INSIDE the box
                         // (never overflowing), in a code-style color, with a
                         // "+N more · ctrl+o" hint in the bottom border. ^O expands.
-                        out.push(Line::from(vec![dot, name_span]));
-                        out.extend(code_box_lines(detail, width, self.show_full_code));
+                        if self.show_full_code {
+                            out.push(Line::from(vec![dot, name_span]));
+                            out.extend(code_box_lines(detail, width, true));
+                        } else {
+                            // Collapsed: "⏺ Run code(first real line" + one more,
+                            // like Claude Code's Bash(…) — never a wall of code.
+                            out.extend(code_call_lines(dot, name_span, detail, width));
+                        }
                     } else {
                         // Other tools: "⏺ name(args)" on one line, args in a
                         // readable gray with dim parens.
@@ -4120,6 +4126,45 @@ fn wrap_chars(s: &str, w: usize) -> Vec<String> {
     chars.chunks(w).map(|c| c.iter().collect()).collect()
 }
 
+/// The non-blank lines of a code blob, for the collapsed call line.
+fn code_gist(detail: &str) -> Vec<&str> {
+    detail.lines().map(|l| l.trim_end()).filter(|l| !l.trim().is_empty()).collect()
+}
+
+/// Collapsed code/command call: `⏺ Run code(<gist line>` plus at most one more
+/// line, each cut to the width, closing with `…)` when there is more.
+fn code_call_lines(dot: Span<'static>, name: Span<'static>, detail: &str, width: u16) -> Vec<Line<'static>> {
+    const SHOWN: usize = 2;
+    let code_style = Style::default().fg(Color::Gray);
+    let dim = Style::default().fg(Color::DarkGray);
+    let gist = code_gist(detail);
+    let head = 2 + name.content.chars().count() + 1;
+    let w = (width as usize).saturating_sub(head + 3).max(16);
+    let more = gist.len() > SHOWN;
+    let mut out = Vec::new();
+    for (i, l) in gist.iter().take(SHOWN).enumerate() {
+        let last = i + 1 == gist.len().min(SHOWN);
+        let mut text = truncate(l, w);
+        if last && more {
+            text.push_str(" …");
+        }
+        let mut spans = if i == 0 {
+            vec![dot.clone(), name.clone(), Span::styled("(".to_string(), dim)]
+        } else {
+            vec![Span::raw(" ".repeat(head))]
+        };
+        spans.push(Span::styled(text, code_style));
+        if last {
+            spans.push(Span::styled(")".to_string(), dim));
+        }
+        out.push(Line::from(spans));
+    }
+    if out.is_empty() {
+        out.push(Line::from(vec![dot, name]));
+    }
+    out
+}
+
 /// Render a code/command blob as a bordered box, wrapping each source line to
 /// fit INSIDE the box (so nothing ever overflows the transcript width). Shows up
 /// to `CODE_PREVIEW_LINES` source lines unless `show_full`, with a
@@ -4499,6 +4544,18 @@ mod input_editor_tests {
         a.input_insert_str("two");
         assert_eq!(a.input, "line one\ntwo");
         assert!(!a.input_backslash_newline());
+    }
+
+    #[test]
+    fn collapsed_code_call_is_two_lines_at_most() {
+        let code = "\nfor _g in [{\"url\": \"https://example.com/".to_string()
+            + &"a".repeat(600) + "\"}]:\n\n    print(_g)\nprint('done')\n";
+        let lines = code_call_lines(Span::raw("⏺ "), Span::raw("Run code"), &code, 100);
+        assert_eq!(lines.len(), 2);
+        let text: Vec<String> = lines.iter().map(|l| l.spans.iter().map(|s| s.content.to_string()).collect()).collect();
+        assert!(text[0].starts_with("⏺ Run code(for _g in"), "{:?}", text);
+        assert!(text.iter().all(|l| l.chars().count() <= 100), "{:?}", text);
+        assert!(text[1].ends_with("… )") || text[1].ends_with("…)"), "{:?}", text);
     }
 
     #[test]

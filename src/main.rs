@@ -10542,6 +10542,58 @@ mod tests {
     /// Verifies the full CLI_LOCAL round-trip in Rust against a mock pulse
     /// server: server sends a `tool.local_execute`, the client runs it on the
     /// local machine and replies with `tool.local_result` carrying the output.
+    /// The server marks its own cells `internal` and sends the agent's
+    /// unwrapped input as `display`: internal cells still run but never reach
+    /// the transcript; agent cells show `display`, not the wrapped input.
+    #[tokio::test]
+    async fn local_execute_internal_and_display() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(stream).await.unwrap();
+            for ev in [
+                serde_json::json!({"type": "tool", "data": {"status": "local_execute", "toolName": "execute_command",
+                    "requestId": "int1", "internal": true, "input": {"command": "echo SETUP"}}}),
+                serde_json::json!({"type": "tool", "data": {"status": "local_execute", "toolName": "execute_command",
+                    "requestId": "ag1", "internal": false, "input": {"command": "echo WRAPPED; echo AGENT"},
+                    "display": {"command": "echo AGENT"}}}),
+            ] {
+                ws.send(Message::Text(ev.to_string())).await.unwrap();
+            }
+            let mut got = 0;
+            while let Some(Ok(msg)) = ws.next().await {
+                if let Message::Text(t) = msg {
+                    if t.contains("tool.local_result") {
+                        got += 1;
+                        if got == 2 {
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+        let profile = config::Profile {
+            base_url: format!("http://127.0.0.1:{port}"),
+            org_id: "o".into(),
+            master_key: "k".into(),
+            deployment: "enterprise".into(),
+            ..Default::default()
+        };
+        let (tx, mut rx) = mpsc::unbounded_channel::<pulse::AppEvent>();
+        let _handle = pulse::connect(&profile, "t", tx, None, None).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), server).await.expect("both cells ran").unwrap();
+        let mut starts = Vec::new();
+        while let Ok(Some(ev)) = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
+            if let pulse::AppEvent::Stream(item) = ev {
+                if item.kind == "tool_start" {
+                    starts.push((item.call_id.clone().unwrap_or_default(), item.detail.clone().unwrap_or_default()));
+                }
+            }
+        }
+        assert_eq!(starts, vec![("ag1".to_string(), "echo AGENT".to_string())]);
+    }
+
     #[tokio::test]
     async fn local_execute_roundtrip() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -383,6 +383,26 @@ fn trim_code_preview(code: &str) -> String {
     }
 }
 
+/// Request ids of the server's internal cells seen this session, so any
+/// tool event for them is dropped too.
+static HIDDEN_CALLS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+fn hide_call(id: &str) {
+    if let Ok(mut v) = HIDDEN_CALLS.lock() {
+        v.push(id.to_string());
+        if v.len() > 256 {
+            v.remove(0);
+        }
+    }
+}
+
+fn is_hidden_call(id: Option<&str>) -> bool {
+    match id {
+        Some(id) if !id.is_empty() => HIDDEN_CALLS.lock().map(|v| v.iter().any(|x| x == id)).unwrap_or(false),
+        _ => false,
+    }
+}
+
 /// Tools whose primary argument is code or a shell command we render verbatim
 /// (multi-line, up to a cap) rather than as a flattened one-line summary.
 pub(crate) fn is_verbatim_tool(name: &str) -> bool {
@@ -656,8 +676,16 @@ fn handle_frame(v: Value, app_tx: &mpsc::UnboundedSender<AppEvent>, out_tx: &mps
         if let Some(ws) = ws_any {
             input["_workspace_id"] = json!(ws);
         }
-        let arg_summary = tool_detail(&tool_name, &input);
-        let _ = app_tx.send(AppEvent::Stream(StreamItem {
+        // The server sends what the agent asked for (`display`) alongside the
+        // input it actually runs (wrapped with its own setup), and marks its
+        // bookkeeping cells `internal`. Show the former; run the latter.
+        let shown = b.get("display").filter(|d| d.is_object()).unwrap_or(&input);
+        let arg_summary = tool_detail(&tool_name, shown);
+        let hidden = b.get("internal").and_then(|v| v.as_bool()).unwrap_or(false);
+        if hidden {
+            hide_call(&request_id);
+        }
+        if !hidden { let _ = app_tx.send(AppEvent::Stream(StreamItem {
             kind: "tool_start".into(),
             agent,
             text: None,
@@ -666,7 +694,7 @@ fn handle_frame(v: Value, app_tx: &mpsc::UnboundedSender<AppEvent>, out_tx: &mps
             status: Some("local_execute".into()),
             local: true,
             task_id: None, call_id: Some(request_id.clone()).filter(|r| !r.is_empty()),
-        }));
+        })); }
         let app_tx = app_tx.clone();
         let out_tx = out_tx.clone();
         tokio::spawn(async move {
@@ -680,7 +708,7 @@ fn handle_frame(v: Value, app_tx: &mpsc::UnboundedSender<AppEvent>, out_tx: &mps
                 crate::wsync::before(ws, &sandbox).await;
             }
             // Commands stream live output and can be backgrounded/interrupted.
-            let ctx = syncs.then(|| crate::jobs::RunCtx {
+            let ctx = (syncs && !hidden).then(|| crate::jobs::RunCtx {
                 call_id: request_id.clone(),
                 label: arg_summary.lines().next().unwrap_or("").to_string(),
                 sink: job_sink(app_tx.clone()),
@@ -840,6 +868,7 @@ fn handle_frame(v: Value, app_tx: &mpsc::UnboundedSender<AppEvent>, out_tx: &mps
             text: sval(&v, "content").or_else(|| sval(&b, "text")).or_else(|| sval(&b, "content")),
             tool_name: None, detail: None, status: None, local: false, task_id: None, call_id: None,
         }),
+        "tool" if is_hidden_call(sval(&b, "callId").or_else(|| sval(&b, "requestId")).as_deref()) => None,
         "tool" => {
             let name = sval(&b, "toolName");
             match status.as_deref() {
