@@ -328,6 +328,9 @@ pub struct App {
     /// One-shot footer hint ("Press Ctrl-C again to exit", …) and when it
     /// was armed; it expires after a couple of seconds.
     armed: Option<(Armed, std::time::Instant)>,
+    /// Big pastes, shown in the prompt as "[Pasted text #n +L lines]" and
+    /// expanded back when the message is sent.
+    pastes: Vec<String>,
     /// Previously sent prompts (oldest first) for ↑/↓ recall.
     history: Vec<String>,
     /// Position while browsing `history`, plus the draft it replaced.
@@ -473,6 +476,7 @@ impl App {
             lines_fingerprint: 0,
             show_help: false,
             armed: None,
+            pastes: Vec::new(),
             history: load_prompt_history(),
             hist_pos: None,
         };
@@ -1408,9 +1412,9 @@ impl App {
         }
         // Centered animated loader, drawn LAST so it floats on top of the chat
         // UI during an in-chat fetch (overlay open, thread switch, …).
-        if let Some(label) = &self.loading {
-            crate::picker::draw_loader(f, label, self.spinner, self.loading_seed);
-        }
+        // In-chat fetches show on the activity line (see activity_line), not
+        // as a full-screen loader.
+        let _ = self.loading_seed;
     }
 
     fn draw_overlay(&self, f: &mut Frame, area: Rect) {
@@ -1465,8 +1469,8 @@ impl App {
                         .title(format!(" {} ({count}){search} ", o.title))
                         .border_style(Style::default().fg(Color::DarkGray)),
                 )
-                .highlight_style(Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD))
-                .highlight_symbol("➤ ");
+                .highlight_style(Style::default().fg(Color::White).bg(Color::Rgb(40, 44, 52)).add_modifier(Modifier::BOLD))
+                .highlight_symbol("› ");
             // ASCII banner (+ authenticated line) above the bottom-anchored picker.
             let top_h = area.height.saturating_sub(h);
             if top_h >= 3 {
@@ -1605,6 +1609,32 @@ impl App {
         self.input_cursor += s.len();
     }
 
+    /// A paste: small ones go in verbatim; big ones become a placeholder so
+    /// the prompt stays readable (expanded by `take_message`).
+    pub fn input_paste(&mut self, s: &str) {
+        let s = s.replace("\r\n", "\n").replace('\r', "\n");
+        let lines = s.lines().count();
+        if lines > 4 || s.len() > 600 {
+            self.pastes.push(s);
+            let tag = format!("[Pasted text #{} +{lines} lines]", self.pastes.len());
+            self.input_insert_str(&tag);
+        } else {
+            self.input_insert_str(&s);
+        }
+        self.end_history_browse();
+    }
+
+    /// The prompt as it should be sent: paste placeholders expanded.
+    pub fn expand_pastes(&self, text: &str) -> String {
+        let mut out = text.to_string();
+        for (i, p) in self.pastes.iter().enumerate() {
+            let n = i + 1;
+            let lines = p.lines().count();
+            out = out.replace(&format!("[Pasted text #{n} +{lines} lines]"), p);
+        }
+        out
+    }
+
     /// Insert a newline (Alt/Shift+Enter) for composing a multiline message.
     pub fn input_newline(&mut self) {
         self.input.insert(self.input_cursor, '\n');
@@ -1712,6 +1742,7 @@ impl App {
     pub fn input_clear(&mut self) {
         self.input.clear();
         self.input_cursor = 0;
+        self.pastes.clear();
     }
 
     /// Text width available per visual row: terminal width minus the input
@@ -1822,7 +1853,9 @@ impl App {
     fn activity_line(&self) -> Option<Line<'static>> {
         const SPIN: [&str; 6] = ["✻", "✺", "✹", "✸", "✷", "✶"];
         let glyph = SPIN[(self.spinner / 2) % SPIN.len()];
-        let (label, extra) = if let Some(msg) = &self.busy {
+        let (label, extra) = if let Some(msg) = &self.loading {
+            (format!("{msg}…"), String::new())
+        } else if let Some(msg) = &self.busy {
             (msg.clone(), String::new())
         } else if self.running {
             let mut parts: Vec<String> = Vec::new();
@@ -2393,6 +2426,10 @@ impl App {
     }
 
     /// Name of the bound workspace (shown top-right in the transcript).
+    pub fn workspace_label(&self) -> Option<String> {
+        self.workspace_name.clone()
+    }
+
     pub fn set_workspace_name(&mut self, name: String) {
         self.workspace_name = if name.is_empty() { None } else { Some(name) };
     }
@@ -2687,6 +2724,11 @@ impl App {
         // server's run.started arrives).
         self.run_started = Some(std::time::Instant::now());
         self.last_elapsed = None;
+    }
+
+    /// True when nobody has written in this chat yet (so `/new` can reuse it).
+    pub fn chat_is_empty(&self) -> bool {
+        !self.running && !self.blocks.iter().any(|b| matches!(b, Block::User(_) | Block::Assistant { .. }))
     }
 
     /// `!cmd` bash mode: show the command as a running call.

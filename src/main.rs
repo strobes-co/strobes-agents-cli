@@ -7687,6 +7687,7 @@ fn run_builtin(cmd: &str, app: &mut App, handle: &mut pulse::PulseHandle, defer:
     let _ = handle;
     match cmd {
         "help" => app.show_help_text(),
+        "new" if app.chat_is_empty() => app.notice("this chat is already empty — go ahead"),
         "new" => *defer = Some(Defer::SwitchThread("__new__".into())),
         "resume" => *defer = Some(Defer::Threads),
         "workspace" => *defer = Some(Defer::Workspaces),
@@ -7730,6 +7731,8 @@ enum Defer {
 /// for why these run in the background instead of inline `.await`s).
 enum DeferResult {
     OpenOverlay(app::OverlayKind, String, Vec<app::OverlayItem>),
+    /// Chain another deferred action (e.g. bind a workspace → new chat).
+    Then(Defer),
     /// A `!cmd` finished: (output, success).
     Bash(String, bool),
     Notice(String),
@@ -8206,8 +8209,10 @@ pub async fn run_chat(
                                                 app.input_clear();
                                             }
                                             _ => {
+                                                // Show the compact form, send the full text.
+                                                let full = app.expand_pastes(&text);
                                                 app.echo_user(&text);
-                                                handle.send_user_message(&text);
+                                                handle.send_user_message(&full);
                                                 app.input_clear();
                                                 app.running = true;
                                                 app.status = "sending…".into();
@@ -8276,7 +8281,7 @@ pub async fn run_chat(
                                 app.input_insert_str(data.trim());
                                 app.notice("bind a workspace first, then drop files or folders to upload");
                             }
-                            None => app.input_insert_str(&data),
+                            None => app.input_paste(&data),
                         }
                     }
                     // A transient parse error (e.g. a stray escape byte) must NOT
@@ -8308,6 +8313,7 @@ pub async fn run_chat(
                     Some(DeferResult::OpenOverlay(kind, title, items)) => app.open_overlay(kind, title, items),
                     Some(DeferResult::Notice(s)) => app.notice(&s),
                     Some(DeferResult::Bash(out, ok)) => app.bash_done(out, ok),
+                    Some(DeferResult::Then(d)) => defer = Some(d),
                     Some(DeferResult::Error(e)) => app.on_app_event(pulse::AppEvent::Error(e)),
                     None => {}
                 }
@@ -8626,23 +8632,17 @@ pub async fn run_chat(
                         app.set_workspace_name(w.name.clone());
                     }
                 }
-                app.notice(&format!("✔ bound workspace {} — ^F findings · ^A approvals", &id[..8.min(id.len())]));
+                let ws_label = app.workspace_label().unwrap_or_else(|| id[..8.min(id.len())].to_string());
+                app.notice(&format!("✔ switched to workspace {ws_label}"));
                 // Sync the workspace files locally IN THE BACKGROUND so the
                 // agent's local tools see the real files without freezing the UI.
                 spawn_workspace_sync(profile.clone(), id.clone(), app_tx.clone());
-                // Lead straight into choosing a new chat or an existing thread
-                // for this workspace.
-                let threads_res = client.list_threads(Some(&id)).await;
+                // Straight into a fresh chat there (threads are created under
+                // a workspace; /resume lists its older chats).
                 app.clear_busy();
                 app.clear_loading();
-                match threads_res {
-                    Ok(ts) => app.open_overlay(
-                        app::OverlayKind::Threads,
-                        "New chat or existing thread".into(),
-                        thread_items(ts, &thread_id, true),
-                    ),
-                    Err(_) => app.close_overlay(),
-                }
+                app.close_overlay();
+                defer_tx.send(DeferResult::Then(Defer::SwitchThread("__new__".into()))).ok();
             }
             Some(Defer::SwitchThread(sel)) => {
                 // Paint the centered loader once before the blocking reconnect +
@@ -9097,8 +9097,10 @@ fn workspace_items(
         };
         let cr = credits.get(&w.id).copied().unwrap_or(0.0);
         let opens = cfg.workspace_open_count(&w.id);
-        let recent = if opens > 0 { format!(" · ↻ recent ×{opens}") } else { String::new() };
-        let label = format!("{name}{bound}  · {} · {tcount} · ◈ {cr:.2} cr{recent}", w.status);
+        let bound = if bound.is_empty() { "" } else { "  (current)" };
+        let usage = if cr > 0.0 { format!("  · {cr:.2} cr") } else { String::new() };
+        let state = if w.status == "active" || w.status.is_empty() { String::new() } else { format!("  · {}", w.status) };
+        let label = format!("{name}{state}{usage}{bound}");
         let mut detail = vec![name, format!("status: {}", w.status), format!("threads: {tcount}"),
             format!("credits: {cr:.3}")];
         if opens > 0 {
@@ -9135,9 +9137,10 @@ async fn workspace_overlay_items(
             .cmp(&cfg.workspace_open_count(&a.id))
             .then(cfg.workspace_last_opened(&b.id).cmp(&cfg.workspace_last_opened(&a.id)))
     });
-    let (counts, credits) =
-        tokio::join!(workspace_thread_counts(client, &ws), workspace_credits_map(client));
-    Ok(workspace_items(ws, &counts, &credits, profile, &cfg))
+    // No per-workspace thread counts here: that's one request per workspace
+    // and made the picker take ~20s to open on a busy org.
+    let credits = workspace_credits_map(client).await;
+    Ok(workspace_items(ws, &[], &credits, profile, &cfg))
 }
 
 /// `workspace_overlay_items` wrapped as a `DeferResult`, for the background
@@ -9150,7 +9153,7 @@ async fn fetch_workspaces_overlay(profile: &config::Profile) -> DeferResult {
         Err(e) => return DeferResult::Error(e.to_string()),
     };
     match workspace_overlay_items(&client, profile).await {
-        Ok(items) => DeferResult::OpenOverlay(app::OverlayKind::Workspaces, "Workspaces".into(), items),
+        Ok(items) => DeferResult::OpenOverlay(app::OverlayKind::Workspaces, "Switch workspace".into(), items),
         Err(e) => DeferResult::Error(e.to_string()),
     }
 }
