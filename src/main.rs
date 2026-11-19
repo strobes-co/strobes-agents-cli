@@ -15,6 +15,7 @@ mod commands;
 mod config;
 mod local;
 mod mcp;
+mod mcp_serve;
 mod project;
 mod pack;
 mod markdown;
@@ -236,6 +237,14 @@ enum Launch {
 }
 
 #[derive(Subcommand)]
+enum McpAction {
+    /// Serve Strobes over MCP on stdin/stdout.
+    Serve,
+    /// Show configured MCP servers and their tools.
+    List,
+}
+
+#[derive(Subcommand)]
 enum Cmd {
     /// Interactive chat TUI (default).
     Chat {
@@ -333,6 +342,15 @@ enum Cmd {
         /// Print the body as-is (no pretty-printing).
         #[arg(long)]
         raw: bool,
+    },
+    /// MCP: `strobes mcp serve` runs Strobes as an MCP server (stdio) for
+    /// Claude Code, Cursor, …; `strobes mcp list` shows the MCP servers the
+    /// agent can use from here.
+    ///
+    ///   claude mcp add strobes -- strobes mcp serve
+    Mcp {
+        #[command(subcommand)]
+        action: McpAction,
     },
     /// Update the CLI to the latest release (downloads + replaces the binary).
     Update {
@@ -1150,6 +1168,15 @@ async fn main() -> Result<()> {
         Cmd::Api { path, method, data, query, raw } => cmd_api(&profile, &path, &method, data, query, raw).await,
         Cmd::Batch { prompt, file, jobs, out, workspace, model, timeout } => {
             cmd_batch(&profile, &tenant, prompt, file, jobs, out, workspace, model, timeout).await
+        }
+        Cmd::Mcp { action: McpAction::Serve } => mcp_serve::serve(profile.clone(), tenant.clone()).await,
+        Cmd::Mcp { action: McpAction::List } => {
+            mcp::start_all();
+            mcp::wait_ready(std::time::Duration::from_secs(20)).await;
+            match commands::run("mcp", "", &commands::Ctx { profile: profile.clone(), thread_id: String::new() }).await {
+                Ok(commands::Outcome::Text(t)) => { println!("{t}"); Ok(()) }
+                Err(e) => Err(anyhow::anyhow!(e)),
+            }
         }
         Cmd::Update { force } => cmd_update(force).await,
         Cmd::Tenants => cmd_tenants(&cfg),

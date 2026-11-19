@@ -95,7 +95,7 @@ pub struct ThreadHistory {
     pub active_run: Option<ActiveRun>,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize, Default)]
 pub struct Finding {
     #[serde(default)]
     pub id: i64,
