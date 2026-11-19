@@ -411,6 +411,7 @@ pub const BUILTIN_COMMANDS: &[(&str, &str)] = &[
     ("approvals", "Review pending approvals"),
     ("files", "Browse the workspace's local files"),
     ("jobs", "Background commands: status, output, stop (alias /bg)"),
+    ("browser", "Agent's browser: open <url> to sign in · show · hide · attach <port> · close"),
     ("copy", "Copy the transcript to the clipboard"),
     ("thinking", "Show or hide the agent's reasoning"),
     ("markdown", "Toggle rendered / raw markdown"),
@@ -3324,10 +3325,11 @@ impl App {
 
     /// A non-error informational line (workspace bound, hints, etc.).
     pub fn notice(&mut self, text: &str) {
-        self.push(Line::from(Span::styled(
-            format!("  · {text}"),
-            Style::default().fg(Color::Cyan),
-        )));
+        for (i, l) in text.lines().enumerate() {
+            let lead = if i == 0 { "  · " } else { "    " };
+            let style = if i == 0 { Style::default().fg(Color::Cyan) } else { Style::default().fg(Color::DarkGray) };
+            self.push(Line::from(Span::styled(format!("{lead}{l}"), style)));
+        }
     }
 
     /// Duration (seconds) the most recently finished run took, if known —

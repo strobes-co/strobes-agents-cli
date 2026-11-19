@@ -8000,6 +8000,7 @@ fn run_builtin(cmd: &str, app: &mut App, handle: &mut pulse::PulseHandle, defer:
         "approvals" => *defer = Some(Defer::Approvals),
         "files" => *defer = Some(Defer::Files),
         "jobs" => *defer = Some(Defer::Jobs),
+        "browser" => *defer = Some(Defer::Browser(String::new())),
         "copy" => match copy_to_clipboard(&app.transcript_plaintext()) {
             Ok(_) => app.notice("copied transcript to clipboard"),
             Err(e) => app.on_app_event(pulse::AppEvent::Error(format!("copy failed: {e}"))),
@@ -8026,6 +8027,62 @@ fn run_builtin(cmd: &str, app: &mut App, handle: &mut pulse::PulseHandle, defer:
     }
 }
 
+/// `/browser`: the agent's live local browser (strobes_pt) and its tabs.
+const BROWSER_STATUS_PY: &str = r#"
+import json, os, urllib.request
+from strobes_pt import browser as b
+
+def tabs(name):
+    ws = b.local_ws_url(name, launch=False)
+    if not ws:
+        return None
+    port = ws.split("//", 1)[1].split("/", 1)[0].split(":")[1]
+    lst = json.load(urllib.request.urlopen(f"http://127.0.0.1:{port}/json/list", timeout=3))
+    return [t.get("url", "") for t in lst if t.get("type") == "page"]
+
+parts = []
+for s in b.sessions():
+    t = tabs(s["name"])
+    if t is None:
+        parts.append(f'{s["name"]} (stopped)')
+    else:
+        parts.append(f'{s["name"]} (running · ' + (", ".join(t[:3]) or "no tabs") + ")")
+print("sessions: " + "; ".join(parts) if parts else "no browser yet — it starts when the agent (or /browser open) needs it")
+"#;
+
+/// `/browser open <url>`: open a tab in the agent's browser — the session it
+/// used most recently (so a sign-in lands where the agent will look), else
+/// "default" — launching it if needed.
+const BROWSER_OPEN_PY: &str = r#"
+import os, urllib.request, urllib.parse
+from strobes_pt import browser as b
+names = [s["name"] for s in b.sessions()]
+def mtime(n):
+    try:
+        return os.path.getmtime(os.path.join(b._LOCAL_DIR, n))
+    except OSError:
+        return 0
+live = [n for n in names if b.local_ws_url(n, launch=False)]
+name = max(live or names or ["default"], key=mtime)
+ws = b.local_ws_url(name)
+port = ws.split("//", 1)[1].split("/", 1)[0].split(":")[1]
+url = __URL__
+req = urllib.request.Request(f"http://127.0.0.1:{port}/json/new?" + urllib.parse.quote(url, safe=":/?&=%#"), method="PUT")
+urllib.request.urlopen(req, timeout=10).read()
+print(name)
+"#;
+
+/// `/browser close`: stop every running browser session of the agent.
+const BROWSER_CLOSE_PY: &str = r#"
+from strobes_pt import browser as b
+n = 0
+for s in b.sessions():
+    if b.local_ws_url(s["name"], launch=False):
+        b._purge_local(s["name"])
+        n += 1
+print(f"closed {n} browser session(s)" if n else "the agent's browser wasn't running")
+"#;
+
 /// What a keypress deferred to after the select block (these need `.await`
 /// and/or to reassign `rx`, which can't happen while select borrows it).
 enum Defer {
@@ -8043,6 +8100,8 @@ enum Defer {
     Bash(String),
     /// /jobs overlay.
     Jobs,
+    /// /browser [args].
+    Browser(String),
 }
 
 /// Result of a `Defer::{Workspaces,Threads,Findings,Approvals}` list fetch,
@@ -8588,7 +8647,11 @@ pub async fn run_chat(
                                         .map(str::trim)
                                         .filter(|a| !a.is_empty())
                                         .map(str::to_lowercase);
-                                    if let Some(q) = model_arg {
+                                    let browser_arg = text.strip_prefix("/browser ").map(|a| a.trim().to_string());
+                                    if let Some(a) = browser_arg {
+                                        app.input_clear();
+                                        defer = Some(Defer::Browser(a));
+                                    } else if let Some(q) = model_arg {
                                         app.input_clear();
                                         match api::find_model(&q) {
                                             Some((id, name)) => {
@@ -8893,6 +8956,83 @@ pub async fn run_chat(
                 app.open_overlay(app::OverlayKind::Models, "Select AI model  (^P toggle)".into(), items);
             }
             Some(Defer::Jobs) => app.open_jobs(),
+            Some(Defer::Browser(args)) => {
+                let dtx = defer_tx.clone();
+                app.set_busy("browser…");
+                // The agent's browser is strobes_pt's local Chrome (it reuses a
+                // live one via its profile), so drive it with the same local
+                // runner, HOME and workspace mirror the agent's code uses.
+                let mut base = serde_json::json!({ "language": "python", "_thread_id": app.thread_id.clone() });
+                if let Some(ws) = &profile.workspace_id {
+                    base["_workspace_id"] = serde_json::json!(ws);
+                }
+                tokio::spawn(async move {
+                    let mut it = args.split_whitespace();
+                    let sub = it.next().unwrap_or("").to_lowercase();
+                    let rest: String = it.collect::<Vec<_>>().join(" ");
+                    let py = |code: String| {
+                        let mut input = base.clone();
+                        input["code"] = serde_json::json!(code);
+                        input
+                    };
+                    let run = |input: serde_json::Value| async move {
+                        let r = local::run_tool("execute_code", &input).await;
+                        match r.error {
+                            Some(e) => Err(e),
+                            None if r.exit_code.unwrap_or(0) != 0 => Err(r.output.lines().last().unwrap_or("browser command failed").to_string()),
+                            None => Ok(r.output),
+                        }
+                    };
+                    let msg: Result<String, String> = match sub.as_str() {
+                        "" | "status" => {
+                            let out = run(py(BROWSER_STATUS_PY.to_string())).await;
+                            let mode = if std::env::var("STROBES_BROWSER_HEADLESS").as_deref() == Ok("1") { "headless" } else { "visible window" };
+                            out.map(|o| format!(
+                                "browser ({mode}): {}\n/browser open <url> — sign in to a target there; the agent continues in that session\n/browser show · hide · close · attach <port> (drive your own Chrome for browser_* tools)",
+                                o.trim()
+                            ))
+                        }
+                        "open" | "login" if !rest.is_empty() => {
+                            let url = if rest.contains("://") { rest.clone() } else { format!("https://{rest}") };
+                            std::env::remove_var("STROBES_BROWSER_HEADLESS");
+                            run(py(BROWSER_OPEN_PY.replace("__URL__", &serde_json::to_string(&url).unwrap()))).await
+                                .map(|name| format!(
+                                    "opened {url} in the agent's browser (session \"{}\") — sign in there, then tell the agent to continue in that session",
+                                    name.trim()
+                                ))
+                        }
+                        "show" | "headed" => {
+                            std::env::remove_var("STROBES_BROWSER_HEADLESS");
+                            browser::set_headless(false).await;
+                            Ok("the agent's browser opens as a visible window (from its next launch; /browser close restarts it)".into())
+                        }
+                        "hide" | "headless" => {
+                            std::env::set_var("STROBES_BROWSER_HEADLESS", "1");
+                            browser::set_headless(true).await;
+                            Ok("the agent's browser runs headless (from its next launch; /browser close restarts it)".into())
+                        }
+                        "close" => {
+                            let n = browser::close_all().await;
+                            run(py(BROWSER_CLOSE_PY.to_string())).await.map(|o| format!("{}{}", o.trim(), if n > 0 { format!(" (+{n} tool browser)") } else { String::new() }))
+                        }
+                        "attach" => {
+                            let ep = if rest.is_empty() { "9222".to_string() } else { rest.clone() };
+                            browser::attach(&ep).await
+                                .map(|b| format!("attached: browser_* tools now drive your {b} (/browser detach to stop)"))
+                                .map_err(|e| e.to_string())
+                        }
+                        "detach" => {
+                            browser::detach().await;
+                            Ok("detached — browser_* tools use the agent's own browser again".into())
+                        }
+                        other => Err(format!("unknown /browser {other} — try /browser for options")),
+                    };
+                    dtx.send(match msg {
+                        Ok(m) => DeferResult::Notice(m),
+                        Err(e) => DeferResult::Error(e),
+                    }).ok();
+                });
+            }
             Some(Defer::Bash(cmd)) => {
                 let id = app.bash_started(&cmd);
                 let dtx = defer_tx.clone();
