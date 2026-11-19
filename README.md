@@ -391,7 +391,8 @@ Agent skills (e.g. `/api-pentest`) appear in the same `/` menu after the built-i
 | Paste | Long pastes collapse to `[Pasted text #1 +40 lines]` and are sent in full |
 | `Ctrl-O` | Expand tool output |
 | `Ctrl-P` · `Ctrl-W` · `Ctrl-F` · `Ctrl-A` | Model · workspaces · findings · approvals |
-| `Ctrl-T` · `Ctrl-R` · `Ctrl-Y` · `Ctrl-S` | Thinking · raw markdown · copy transcript · select mode |
+| `Ctrl-R` | Search prompt history |
+| `Ctrl-T` · `Ctrl-Y` · `Ctrl-S` | Thinking · copy transcript · select mode (`/markdown` toggles raw markdown) |
 
 Other commands: `strobes status`, `strobes workspaces`, `strobes threads`,
 `strobes bind --download`, `strobes pull`, `strobes export -w <id>`,

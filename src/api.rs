@@ -147,26 +147,66 @@ pub struct SlashCmd {
 /// ID `0` is the sentinel that means "use the org's configured default"
 /// (no `llm_model` key is sent in the context).
 pub const BUILTIN_MODELS: &[(i64, &str)] = &[
-    (0,  "Default (org setting)"),
-    (4,  "Claude Haiku 4.5"),
-    (10, "Claude Sonnet 4.5"),
-    (18, "Claude Sonnet 4.6"),
-    (11, "Claude Opus 4.5"),
-    (14, "Claude Opus 4.6"),
-    (21, "Claude Opus 4.7"),
-    (24, "Claude Opus 4.8"),
-    (12, "Nova 2 Lite"),
-    (15, "DeepSeek-R1"),
-    (16, "MiniMax M2"),
-    (19, "MiniMax M2.5"),
-    (17, "Kimi K2 Thinking"),
-    (22, "Kimi K2.5"),
-    (20, "GLM 5"),
-    (25, "GPT-5.4"),
-    (26, "GPT-5.5"),
-    (27, "Gemma 4 31B"),
-    (28, "Gemma 4 26B-A4B"),
+    // Synced with strobes/app/models/connectors_models.py llm_model_choices
+    // (2026-11-19). Retired ids (10, 11, 22, 23, 25, 26, 29) are gone.
+    (0,   "Default (org setting)"),
+    (46,  "SAI"),
+    (999, "Smart Router"),
+    (42,  "Claude Haiku 5.5"),
+    (4,   "Claude Haiku 4.5"),
+    (18,  "Claude Sonnet 4.6"),
+    (40,  "Claude Sonnet 5.5"),
+    (43,  "Claude Sonnet 5.5 (Claude Platform on AWS)"),
+    (14,  "Claude Opus 4.6"),
+    (21,  "Claude Opus 4.7"),
+    (24,  "Claude Opus 4.8"),
+    (33,  "Claude Opus 5"),
+    (41,  "Claude Opus 5.5 (Claude Platform on AWS)"),
+    (45,  "Claude Mythos 5.1 (Claude Platform on AWS)"),
+    (12,  "Nova 2 Lite"),
+    (15,  "DeepSeek-R1"),
+    (16,  "MiniMax M2"),
+    (19,  "MiniMax M2.5"),
+    (17,  "Kimi K2 Thinking"),
+    (34,  "Kimi K3"),
+    (30,  "GPT-5.6 Sol"),
+    (31,  "GPT-5.6 Terra"),
+    (32,  "GPT-5.6 Luna"),
+    (35,  "Daybreak Blue (GPT-5.6 Sol)"),
+    (36,  "GPT-6 Sol"),
+    (37,  "GPT-6 Luna"),
+    (38,  "GPT-6.1 Sol"),
+    (39,  "Grok 4.7"),
+    (20,  "GLM 5"),
+    (44,  "GLM 5.3"),
+    (27,  "Gemma 4 31B"),
+    (28,  "Gemma 4 26B-A4B"),
 ];
+
+/// `/model <query>`: an exact id, else the matching model with the highest
+/// version number (ties → the plainer, shorter name). "sonnet" → Sonnet 5.5,
+/// "opus" → Opus 5.5, "sai" → SAI.
+pub fn find_model(query: &str) -> Option<(i64, &'static str)> {
+    let q = query.trim().to_lowercase();
+    if let Some(hit) = BUILTIN_MODELS.iter().find(|(id, _)| id.to_string() == q) {
+        return Some(*hit);
+    }
+    let version = |name: &str| -> f64 {
+        name.split(|c: char| c == ' ' || c == '(' || c == ')')
+            .find_map(|t| t.trim_start_matches(|c: char| !c.is_ascii_digit()).parse::<f64>().ok())
+            .unwrap_or(0.0)
+    };
+    BUILTIN_MODELS
+        .iter()
+        .filter(|(_, n)| n.to_lowercase().contains(&q))
+        .max_by(|a, b| {
+            version(a.1)
+                .partial_cmp(&version(b.1))
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(b.1.len().cmp(&a.1.len()))
+        })
+        .copied()
+}
 
 /// Display name for a model id, or "Default" when None/0.
 pub fn model_name(id: Option<i64>) -> String {
@@ -966,5 +1006,20 @@ mod trunc_tests {
         let body = out.strip_suffix('…').unwrap();
         assert!(body.len() <= 101);
         assert!(body.len() % 2 == 0); // never split a 2-byte "é"
+    }
+}
+
+#[cfg(test)]
+mod model_tests {
+    use super::find_model;
+
+    #[test]
+    fn model_queries_pick_the_newest_plain_match() {
+        assert_eq!(find_model("sai").map(|m| m.0), Some(46));
+        assert_eq!(find_model("46").map(|m| m.0), Some(46));
+        assert_eq!(find_model("sonnet").map(|m| m.0), Some(40));
+        assert_eq!(find_model("haiku").map(|m| m.0), Some(42));
+        assert_eq!(find_model("gpt").map(|m| m.0), Some(38));
+        assert_eq!(find_model("nope"), None);
     }
 }

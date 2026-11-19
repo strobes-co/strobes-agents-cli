@@ -7747,6 +7747,10 @@ fn run_builtin(cmd: &str, app: &mut App, handle: &mut pulse::PulseHandle, defer:
             app.notice(if app.show_thinking { "showing the agent's reasoning" } else { "hiding the agent's reasoning" });
         }
         "status" => app.show_status_text(),
+        "markdown" => {
+            app.markdown = !app.markdown;
+            app.notice(if app.markdown { "rendering markdown" } else { "showing raw markdown" });
+        }
         "exit" => *quit = true,
         _ => {}
     }
@@ -8083,6 +8087,10 @@ pub async fn run_chat(
                                     match app.overlay_enter() {
                                         Some((app::OverlayKind::Workspaces, id)) => defer = Some(Defer::BindWorkspace(id)),
                                         Some((app::OverlayKind::Threads, id)) => defer = Some(Defer::SwitchThread(id)),
+                                        Some((app::OverlayKind::History, text)) => {
+                                            app.close_overlay();
+                                            app.set_input(&text);
+                                        }
                                         Some((app::OverlayKind::Models, id)) => {
                                             let model_id = match id.parse::<i64>().ok() {
                                                 Some(0) => None,
@@ -8212,6 +8220,7 @@ pub async fn run_chat(
                                 KeyCode::Esc => {
                                     if app.running {
                                         handle.cancel();
+                                        app.cancel_requested = true;
                                         app.status = "interrupting…".into();
                                     } else if app.is_pinned() {
                                         app.jump_to_bottom();
@@ -8229,6 +8238,7 @@ pub async fn run_chat(
                                 KeyCode::Char('c') if ctrl => {
                                     if app.running {
                                         handle.cancel();
+                                        app.cancel_requested = true;
                                         app.status = "interrupting…".into();
                                     } else if !app.input.is_empty() {
                                         app.input_clear();
@@ -8242,7 +8252,9 @@ pub async fn run_chat(
                                 KeyCode::Char('d') if ctrl && app.input.is_empty() => quit = true,
                                 KeyCode::Char('?') if app.input.is_empty() => app.show_help = true,
                                 KeyCode::Char('t') if ctrl => app.show_thinking = !app.show_thinking,
-                                KeyCode::Char('r') if ctrl => app.markdown = !app.markdown,
+                                // Ctrl-R searches history (as in Claude Code / shells);
+                                // the raw-markdown toggle moved to /markdown.
+                                KeyCode::Char('r') if ctrl => app.open_history_search(),
                                 KeyCode::Char('s') if ctrl => {
                                     app.select_mode = !app.select_mode;
                                     if app.select_mode { disable_mouse(); } else { enable_mouse(); }
@@ -8284,12 +8296,8 @@ pub async fn run_chat(
                                         .map(str::to_lowercase);
                                     if let Some(q) = model_arg {
                                         app.input_clear();
-                                        // Exact id first; else the newest name match
-                                        // (the table lists versions oldest first).
-                                        let hit = api::BUILTIN_MODELS.iter().find(|(id, _)| id.to_string() == q)
-                                            .or_else(|| api::BUILTIN_MODELS.iter().rev().find(|(_, name)| name.to_lowercase().contains(&q)));
-                                        match hit {
-                                            Some(&(id, name)) => {
+                                        match api::find_model(&q) {
+                                            Some((id, name)) => {
                                                 let m = if id == 0 { None } else { Some(id) };
                                                 handle.set_model(m);
                                                 app.set_model(m);
@@ -8402,6 +8410,14 @@ pub async fn run_chat(
                 match maybe_app {
                     Some(ev) => {
                         let finished = matches!(ev, pulse::AppEvent::RunFinished(_));
+                        // An interrupt pressed before the server had started the
+                        // run was dropped by it — send it again now that it exists.
+                        if matches!(ev, pulse::AppEvent::RunStarted) && app.cancel_requested {
+                            handle.cancel();
+                        }
+                        if finished {
+                            app.cancel_requested = false;
+                        }
                         app.on_app_event(ev);
                         // Notify the (possibly away) user that the reply is ready.
                         if finished {

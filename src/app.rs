@@ -113,6 +113,21 @@ enum Block {
     Todos { agent: String, items: Vec<TodoItem> },
     /// A tool call's result, shown as "  ⎿  first lines…" under the call.
     ToolResult { text: String, failed: bool },
+    /// Where a sub-agent's work sits in the main transcript (index into
+    /// `App::subs`). Its own text and tool calls live in that run, never
+    /// interleaved with the main agent's.
+    SubAgent(usize),
+}
+
+/// One sub-agent's separate transcript, rendered as a collapsed group.
+struct SubAgentRun {
+    name: String,
+    blocks: Vec<Block>,
+    stream: Option<Stream>,
+    started: std::time::Instant,
+    last_activity: std::time::Instant,
+    /// Built from history (no meaningful timings).
+    replayed: bool,
 }
 
 #[derive(Clone)]
@@ -210,6 +225,8 @@ pub enum OverlayKind {
     Workspaces,
     Files,
     Models,
+    /// Ctrl-R: search previously sent prompts.
+    History,
 }
 
 /// One row in an overlay browser. `detail` lines are shown when the row is
@@ -342,6 +359,8 @@ pub struct App {
     lines_fingerprint: u64,
     /// `?` on an empty prompt shows the shortcuts panel under the input.
     pub show_help: bool,
+    /// The user interrupted; re-sent if the run only starts afterwards.
+    pub cancel_requested: bool,
     /// One-shot footer hint ("Press Ctrl-C again to exit", …) and when it
     /// was armed; it expires after a couple of seconds.
     armed: Option<(Armed, std::time::Instant)>,
@@ -353,6 +372,10 @@ pub struct App {
     bash_seq: u64,
     /// Percent of the context window in use (from `context.usage`).
     context_pct: Option<f64>,
+    /// Sub-agent runs, each with its own transcript (see Block::SubAgent).
+    subs: Vec<SubAgentRun>,
+    /// Set while replaying history, so new sub-agent groups are marked.
+    replaying: bool,
     /// Big pastes, shown in the prompt as "[Pasted text #n +L lines]" and
     /// expanded back when the message is sent.
     pastes: Vec<String>,
@@ -382,6 +405,7 @@ pub const BUILTIN_COMMANDS: &[(&str, &str)] = &[
     ("files", "Browse the workspace's local files"),
     ("copy", "Copy the transcript to the clipboard"),
     ("thinking", "Show or hide the agent's reasoning"),
+    ("markdown", "Toggle rendered / raw markdown"),
     ("status", "Show tenant, workspace, chat and usage"),
     ("exit", "Quit (alias /quit)"),
 ];
@@ -559,12 +583,15 @@ impl App {
             // first draw does one harmless extra rebuild.
             lines_fingerprint: 0,
             show_help: false,
+            cancel_requested: false,
             armed: None,
             pastes: Vec::new(),
             mention_files: None,
             mention_sel: 0,
             bash_seq: 0,
             context_pct: None,
+            subs: Vec::new(),
+            replaying: false,
             history: load_prompt_history(),
             hist_pos: None,
         };
@@ -851,6 +878,7 @@ impl App {
                 // Settle the last reply now (also turns a cancel receipt into
                 // the "Interrupted" line).
                 self.flush_stream();
+                self.flush_subagents();
                 self.running = false;
                 self.settle_running_tools();
                 self.last_elapsed = self.run_started.take().map(|t| t.elapsed());
@@ -1038,7 +1066,61 @@ impl App {
         self.record_answer(&shown, value)
     }
 
+    /// Route a stream item: sub-agent work goes to that agent's own
+    /// transcript, everything else to the main one.
     fn on_stream(&mut self, item: StreamItem) {
+        let agent = item.agent.clone().unwrap_or_default();
+        if is_main_agent(&agent) || item.kind == "approval" {
+            self.on_stream_main(item);
+        } else {
+            self.in_agent_ctx(&agent, |s| s.on_stream_main(item));
+        }
+    }
+
+    /// Run `f` with `agent`'s sub-agent transcript swapped in as the current
+    /// one, creating the group (at this point in the main transcript) on
+    /// first sight. All the tool-pairing/streaming logic then applies as-is.
+    fn in_agent_ctx(&mut self, agent: &str, f: impl FnOnce(&mut Self)) {
+        let idx = match self.subs.iter().position(|r| r.name == agent) {
+            Some(i) => i,
+            None => {
+                // The main agent's in-progress text is left streaming (it
+                // renders below the group) rather than cut mid-sentence.
+                let now = std::time::Instant::now();
+                self.subs.push(SubAgentRun {
+                    name: agent.to_string(),
+                    blocks: Vec::new(),
+                    stream: None,
+                    started: now,
+                    last_activity: now,
+                    replayed: self.replaying,
+                });
+                let i = self.subs.len() - 1;
+                self.blocks.push(Block::SubAgent(i));
+                i
+            }
+        };
+        std::mem::swap(&mut self.blocks, &mut self.subs[idx].blocks);
+        std::mem::swap(&mut self.stream, &mut self.subs[idx].stream);
+        let (lt, lk) = (self.last_tool.take(), self.last_task.take());
+        f(self);
+        self.last_tool = lt;
+        self.last_task = lk;
+        std::mem::swap(&mut self.stream, &mut self.subs[idx].stream);
+        std::mem::swap(&mut self.blocks, &mut self.subs[idx].blocks);
+        self.subs[idx].last_activity = std::time::Instant::now();
+        self.follow = true;
+    }
+
+    /// Settle every sub-agent's streamed text (end of a run).
+    fn flush_subagents(&mut self) {
+        let names: Vec<String> = self.subs.iter().filter(|r| r.stream.is_some()).map(|r| r.name.clone()).collect();
+        for n in names {
+            self.in_agent_ctx(&n, |s| s.flush_stream());
+        }
+    }
+
+    fn on_stream_main(&mut self, item: StreamItem) {
         match item.kind.as_str() {
             "token" => {
                 if let Some(t) = item.text {
@@ -1232,62 +1314,79 @@ impl App {
     /// Markdown. Must stay defensive: anything `build_lines()`/`render_md`/
     /// `render_thinking` read has to be reflected here, or the cache goes
     /// stale and the transcript stops updating.
+    /// Hash what `build_block_lines` would render for `blocks`.
+    fn fp_blocks(&self, blocks: &[Block], h: &mut std::collections::hash_map::DefaultHasher) {
+        use std::hash::Hash;
+        for b in blocks {
+            match b {
+                Block::User(t) => {
+                    0u8.hash(h);
+                    t.len().hash(h);
+                }
+                Block::Assistant { agent, md } => {
+                    1u8.hash(h);
+                    agent.len().hash(h);
+                    md.len().hash(h);
+                }
+                Block::Thinking(s) => {
+                    2u8.hash(h);
+                    s.len().hash(h);
+                }
+                Block::Plain(_) => 3u8.hash(h),
+                Block::Tool { name, detail, status, agent, .. } => {
+                    4u8.hash(h);
+                    name.len().hash(h);
+                    detail.len().hash(h);
+                    agent.len().hash(h);
+                    // Only a Running tool's dot animates, so its phase is
+                    // the only thing that can change frame-to-frame.
+                    match status {
+                        ToolStatus::Running => {
+                            5u8.hash(h);
+                            (self.spinner / 3 % 2).hash(h);
+                        }
+                        ToolStatus::Done => 6u8.hash(h),
+                        ToolStatus::Failed => 7u8.hash(h),
+                    }
+                }
+                Block::Rule(l) => {
+                    8u8.hash(h);
+                    l.len().hash(h);
+                }
+                Block::ToolResult { text, failed } => {
+                    10u8.hash(h);
+                    text.len().hash(h);
+                    failed.hash(h);
+                }
+                Block::SubAgent(i) => {
+                    11u8.hash(h);
+                    if let Some(sub) = self.subs.get(*i) {
+                        self.fp_blocks(&sub.blocks, h);
+                        sub.stream.as_ref().map(|s| (s.buf.len(), s.thinking)).hash(h);
+                        if self.sub_busy(sub) {
+                            (self.spinner / 3 % 2).hash(h);
+                            sub.started.elapsed().as_secs().hash(h);
+                        }
+                    }
+                }
+                Block::Todos { agent, items } => {
+                    9u8.hash(h);
+                    agent.len().hash(h);
+                    for t in items {
+                        t.content.len().hash(h);
+                        t.status.hash(h);
+                    }
+                }
+            }
+        }
+    }
+
     fn content_fingerprint(&self, width: u16) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
         // Width changes rewrap the code boxes, so it must bust the cache.
         width.hash(&mut h);
-        for b in &self.blocks {
-            match b {
-                Block::User(t) => {
-                    0u8.hash(&mut h);
-                    t.len().hash(&mut h);
-                }
-                Block::Assistant { agent, md } => {
-                    1u8.hash(&mut h);
-                    agent.len().hash(&mut h);
-                    md.len().hash(&mut h);
-                }
-                Block::Thinking(s) => {
-                    2u8.hash(&mut h);
-                    s.len().hash(&mut h);
-                }
-                Block::Plain(_) => 3u8.hash(&mut h),
-                Block::Tool { name, detail, status, agent, .. } => {
-                    4u8.hash(&mut h);
-                    name.len().hash(&mut h);
-                    detail.len().hash(&mut h);
-                    agent.len().hash(&mut h);
-                    // Only a Running tool's dot animates, so its phase is
-                    // the only thing that can change frame-to-frame.
-                    match status {
-                        ToolStatus::Running => {
-                            5u8.hash(&mut h);
-                            (self.spinner / 3 % 2).hash(&mut h);
-                        }
-                        ToolStatus::Done => 6u8.hash(&mut h),
-                        ToolStatus::Failed => 7u8.hash(&mut h),
-                    }
-                }
-                Block::Rule(l) => {
-                    8u8.hash(&mut h);
-                    l.len().hash(&mut h);
-                }
-                Block::ToolResult { text, failed } => {
-                    10u8.hash(&mut h);
-                    text.len().hash(&mut h);
-                    failed.hash(&mut h);
-                }
-                Block::Todos { agent, items } => {
-                    9u8.hash(&mut h);
-                    agent.len().hash(&mut h);
-                    for t in items {
-                        t.content.len().hash(&mut h);
-                        t.status.hash(&mut h);
-                    }
-                }
-            }
-        }
+        self.fp_blocks(&self.blocks, &mut h);
         match &self.stream {
             Some(s) => {
                 1u8.hash(&mut h);
@@ -1311,12 +1410,28 @@ impl App {
     }
 
     fn build_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let mut out = self.build_block_lines(&self.blocks, self.stream.as_ref(), width);
+        out.iter_mut().for_each(win_safe_line);
+        // Wrap here (not in the Paragraph) so continuation lines hang under
+        // their text — "⏺ long reply…" continues under the reply, not at col 0.
+        let w = width as usize;
+        out.into_iter().flat_map(|l| wrap_hanging(l, w)).collect()
+    }
+
+    /// Render a block list (the main transcript, or one sub-agent's).
+    fn build_block_lines(&self, blocks: &[Block], stream: Option<&Stream>, width: u16) -> Vec<Line<'static>> {
         let mut out: Vec<Line<'static>> = Vec::new();
         // Track the agent currently "speaking" so we only print the agent
         // header when it changes (not on every segment or after every tool).
         let mut cur_agent: Option<String> = None;
-        for b in &self.blocks {
+        for b in blocks {
             match b {
+                Block::SubAgent(i) => {
+                    cur_agent = None;
+                    if let Some(sub) = self.subs.get(*i) {
+                        self.render_subagent(sub, width, &mut out);
+                    }
+                }
                 Block::User(text) => {
                     cur_agent = None; // next agent reply re-prints its header
                     blank(&mut out);
@@ -1432,7 +1547,7 @@ impl App {
                 }
             }
         }
-        if let Some(s) = &self.stream {
+        if let Some(s) = stream {
             if s.thinking {
                 if self.show_thinking {
                     self.render_thinking(&s.buf, &mut out);
@@ -1449,11 +1564,67 @@ impl App {
                 self.render_reply(&s.buf, first, &mut out);
             }
         }
-        out.iter_mut().for_each(win_safe_line);
-        // Wrap here (not in the Paragraph) so continuation lines hang under
-        // their text — "⏺ long reply…" continues under the reply, not at col 0.
-        let w = width as usize;
-        out.into_iter().flat_map(|l| wrap_hanging(l, w)).collect()
+        out
+    }
+
+    /// Is this sub-agent still doing something we can see?
+    fn sub_busy(&self, sub: &SubAgentRun) -> bool {
+        sub.stream.is_some()
+            || sub.blocks.iter().any(|b| matches!(b, Block::Tool { status: ToolStatus::Running, .. }))
+    }
+
+    /// A sub-agent as one group: its name, its latest tool calls and a status
+    /// line — or (ctrl+o) its whole transcript, indented under the name.
+    fn render_subagent(&self, sub: &SubAgentRun, width: u16, out: &mut Vec<Line<'static>>) {
+        let dim = Style::default().fg(Color::DarkGray);
+        let busy = self.sub_busy(sub);
+        blank(out);
+        let dot = if busy {
+            let on = (self.spinner / 3) % 2 == 0;
+            Style::default().fg(if on { Color::Cyan } else { Color::DarkGray }).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+        };
+        out.push(Line::from(vec![
+            Span::styled("⏺ ", dot),
+            Span::styled(sub.name.clone(), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            Span::styled("  sub-agent", dim),
+        ]));
+        let calls: Vec<String> = sub.blocks.iter().filter_map(|b| match b {
+            Block::Tool { name, detail, .. } => {
+                let d = detail.lines().next().unwrap_or("").trim();
+                Some(if d.is_empty() { tool_label(name) } else { format!("{}({})", tool_label(name), truncate(d, 80)) })
+            }
+            _ => None,
+        }).collect();
+        if self.show_full_code {
+            // Expanded: the sub-agent's own transcript, indented.
+            let inner = self.build_block_lines(&sub.blocks, sub.stream.as_ref(), width.saturating_sub(4));
+            for mut l in inner {
+                l.spans.insert(0, Span::raw("    "));
+                out.push(l);
+            }
+            out.push(Line::default());
+            return;
+        }
+        const SHOW: usize = 3;
+        let skip = calls.len().saturating_sub(SHOW);
+        for (i, c) in calls.iter().skip(skip).enumerate() {
+            let lead = if i == 0 { "  ⎿  " } else { "     " };
+            out.push(Line::from(Span::styled(format!("{lead}{c}"), Style::default().fg(Color::Gray))));
+        }
+        let n = calls.len();
+        let uses = format!("{n} tool use{}", if n == 1 { "" } else { "s" });
+        let lead = if calls.is_empty() { "  ⎿  " } else { "     " };
+        let status = if busy {
+            let el = if sub.replayed { String::new() } else { format!(" · {}", fmt_elapsed(sub.started.elapsed())) };
+            format!("{lead}Working… ({uses}{el}) · ctrl+o to expand")
+        } else {
+            let el = if sub.replayed { String::new() } else { format!(" · {}", fmt_elapsed(sub.last_activity - sub.started)) };
+            let more = if skip > 0 { format!("+{skip} more · ") } else { String::new() };
+            format!("{lead}{more}Done ({uses}{el}) · ctrl+o to expand")
+        };
+        out.push(Line::from(Span::styled(status, dim)));
     }
 
     fn render_md(&self, md: &str, out: &mut Vec<Line<'static>>) {
@@ -2162,7 +2333,7 @@ impl App {
 
     /// The shortcuts table: two columns when it fits, else one.
     fn help_lines_for(&self, width: u16) -> Vec<Line<'static>> {
-        let rows: [(&str, &str, &str, &str); 8] = [
+        let rows: [(&str, &str, &str, &str); 9] = [
             ("/", "commands", "ctrl+p", "model"),
             ("!", "run a shell command locally", "ctrl+l", "local files"),
             ("@", "mention a file in this folder", "ctrl+e", "open workspace folder"),
@@ -2171,6 +2342,7 @@ impl App {
             ("\\ enter", "newline (or ctrl+j)", "ctrl+o", "expand tool output"),
             ("↑ / ↓", "previous prompts", "ctrl+t", "show thinking"),
             ("pgup/pgdn", "scroll the chat", "ctrl+y", "copy transcript"),
+            ("ctrl+r", "search prompt history", "ctrl+s", "select mode (copy text)"),
         ];
         let key = Style::default().fg(Color::White);
         let dim = Style::default().fg(Color::DarkGray);
@@ -2460,148 +2632,161 @@ impl App {
 
     /// Seed the transcript from full-fidelity persisted events (ordered by seq):
     /// user/agent messages, tool calls + results, tasks, thinking.
+    /// Replay one persisted event into the current transcript.
+    fn seed_event(&mut self, e: &Value) {
+        let etype = e.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        let p = e.get("payload").cloned().unwrap_or(Value::Null);
+        let pstr = |k: &str| p.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let actor = e.get("actor").and_then(|a| a.as_str()).unwrap_or("");
+        let agent = e.get("agentName").and_then(|a| a.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "Strobes AI Supervisor".into());
+
+        match etype {
+            "message.created" if actor == "user" => {
+                let t = pstr("text");
+                if !t.trim().is_empty() {
+                    self.echo_user(&t);
+                }
+            }
+            "message.segment.completed" => {
+                self.push_assistant(agent, pstr("text"));
+            }
+            "thinking.completed" => {
+                self.push_thinking(pstr("text"));
+            }
+            "tool.start" => {
+                // Historical calls are already complete → Done (green dot);
+                // a following tool.failed downgrades it to Failed. Summarize
+                // the args the same way the live path does (code/command,
+                // not a raw JSON dump).
+                let name = pstr("toolName");
+                if is_silent_tool(&name) {
+                    return;
+                }
+                let args = crate::pulse::tool_detail(&name, p.get("arguments").unwrap_or(&Value::Null));
+                self.flush_stream();
+                // Same wrapper/local pairing as the live path: one call, one line.
+                let dup = self.blocks.iter().rev().take(3).any(|b| matches!(b,
+                    Block::Tool { agent: a, detail: d, .. } if a == &agent && (d == &args || args.trim().is_empty())));
+                let cid = Some(pstr("callId")).filter(|c| !c.is_empty());
+                if let Some(i) = self.tool_by_id(cid.as_deref()) {
+                    self.settle_call_args(i, &args);
+                } else if !dup || cid.is_some() {
+                    self.blocks.push(Block::Tool { name, detail: args, status: ToolStatus::Done, agent: agent.clone(), call_id: cid, local_id: None });
+                }
+            }
+            "tool.output" if is_silent_tool(&pstr("toolName")) => {}
+            "tool.output" => {
+                let body = match p.get("result") {
+                    Some(v) => concise_result_value(v),
+                    None => "(ok)".to_string(),
+                };
+                let body = if body.is_empty() { "(ok)".to_string() } else { body };
+                let cid = pstr("callId");
+                if !self.attach_by_id(Some(&cid), &body, false) {
+                    self.push_tool_result(body, false);
+                }
+            }
+            "tool.failed" => {
+                let cid = pstr("callId");
+                if !self.attach_by_id(Some(&cid), &pstr("error"), true) {
+                    self.finish_last_tool(&agent, false);
+                    self.push_tool_result(pstr("error"), true);
+                }
+            }
+            t if t.starts_with("task.") => {
+                let title = pstr("title");
+                let task_id = e.get("taskId").and_then(|v| v.as_str()).map(|s| s.to_string());
+                let hist_status = match t {
+                    "task.started"      => TaskStatus::Running,
+                    "task.completed"    => TaskStatus::Completed,
+                    "task.failed"       => TaskStatus::Failed,
+                    "task.blocked"      => TaskStatus::Blocked,
+                    "task.inconclusive" => TaskStatus::Inconclusive,
+                    _                   => TaskStatus::Created,
+                };
+                // Upsert into the tasks panel.
+                if let Some(ref id) = task_id {
+                    if let Some(existing) = self.tasks.iter_mut().find(|t| &t.id == id) {
+                        existing.status = hist_status;
+                        if !title.trim().is_empty() {
+                            existing.title = title.clone();
+                        }
+                    } else if !title.trim().is_empty() {
+                        self.tasks.push(Task {
+                            id: id.clone(),
+                            title: title.clone(),
+                            status: hist_status,
+                            agent: e.get("agentName").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                        });
+                    }
+                }
+                // Inline marker only for task.created events.
+                if t == "task.created" && !title.trim().is_empty()
+                    && self.last_task.as_deref() != Some(title.as_str())
+                {
+                    self.flush_stream();
+                    self.blocks.push(Block::Plain(Line::from(Span::styled(
+                        format!("◇ {title}"),
+                        Style::default().fg(Color::Yellow).add_modifier(Modifier::DIM),
+                    ))));
+                    self.last_task = Some(title);
+                    self.last_tool = None;
+                }
+            }
+            "plan.updated" => {
+                // Batch task upserts from workspace_add_tasks — panel only, no inline markers.
+                if let Some(tasks) = p.get("tasks").and_then(|t| t.as_array()) {
+                    for task in tasks {
+                        let tid = task.get("id").and_then(|v| v.as_str()).map(|s| s.to_string());
+                        let title = task.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        if title.is_empty() { continue; }
+                        let status_str = task.get("status").and_then(|v| v.as_str()).unwrap_or("pending");
+                        let hist_status = match status_str {
+                            "running"      => TaskStatus::Running,
+                            "completed"    => TaskStatus::Completed,
+                            "failed"       => TaskStatus::Failed,
+                            "blocked"      => TaskStatus::Blocked,
+                            "inconclusive" => TaskStatus::Inconclusive,
+                            _              => TaskStatus::Created,
+                        };
+                        if let Some(ref id) = tid {
+                            if let Some(existing) = self.tasks.iter_mut().find(|t| &t.id == id) {
+                                existing.status = hist_status;
+                                if !title.is_empty() { existing.title = title.clone(); }
+                            } else {
+                                self.tasks.push(Task {
+                                    id: id.clone(),
+                                    title,
+                                    status: hist_status,
+                                    agent: task.get("agentName").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
     pub fn seed_history_events(&mut self, events: Vec<Value>) {
         if events.is_empty() {
             return;
         }
+        self.replaying = true;
         for e in &events {
-            let etype = e.get("type").and_then(|t| t.as_str()).unwrap_or("");
-            let p = e.get("payload").cloned().unwrap_or(Value::Null);
-            let pstr = |k: &str| p.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let actor = e.get("actor").and_then(|a| a.as_str()).unwrap_or("");
-            let agent = e.get("agentName").and_then(|a| a.as_str())
-                .filter(|s| !s.is_empty())
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| "Strobes AI Supervisor".into());
-
-            match etype {
-                "message.created" if actor == "user" => {
-                    let t = pstr("text");
-                    if !t.trim().is_empty() {
-                        self.echo_user(&t);
-                    }
-                }
-                "message.segment.completed" => {
-                    self.push_assistant(agent, pstr("text"));
-                }
-                "thinking.completed" => {
-                    self.push_thinking(pstr("text"));
-                }
-                "tool.start" => {
-                    // Historical calls are already complete → Done (green dot);
-                    // a following tool.failed downgrades it to Failed. Summarize
-                    // the args the same way the live path does (code/command,
-                    // not a raw JSON dump).
-                    let name = pstr("toolName");
-                    if is_silent_tool(&name) {
-                        continue;
-                    }
-                    let args = crate::pulse::tool_detail(&name, p.get("arguments").unwrap_or(&Value::Null));
-                    self.flush_stream();
-                    // Same wrapper/local pairing as the live path: one call, one line.
-                    let dup = self.blocks.iter().rev().take(3).any(|b| matches!(b,
-                        Block::Tool { agent: a, detail: d, .. } if a == &agent && (d == &args || args.trim().is_empty())));
-                    let cid = Some(pstr("callId")).filter(|c| !c.is_empty());
-                    if let Some(i) = self.tool_by_id(cid.as_deref()) {
-                        self.settle_call_args(i, &args);
-                    } else if !dup || cid.is_some() {
-                        self.blocks.push(Block::Tool { name, detail: args, status: ToolStatus::Done, agent: agent.clone(), call_id: cid, local_id: None });
-                    }
-                }
-                "tool.output" if is_silent_tool(&pstr("toolName")) => {}
-                "tool.output" => {
-                    let body = match p.get("result") {
-                        Some(v) => concise_result_value(v),
-                        None => "(ok)".to_string(),
-                    };
-                    let body = if body.is_empty() { "(ok)".to_string() } else { body };
-                    let cid = pstr("callId");
-                    if !self.attach_by_id(Some(&cid), &body, false) {
-                        self.push_tool_result(body, false);
-                    }
-                }
-                "tool.failed" => {
-                    let cid = pstr("callId");
-                    if !self.attach_by_id(Some(&cid), &pstr("error"), true) {
-                        self.finish_last_tool(&agent, false);
-                        self.push_tool_result(pstr("error"), true);
-                    }
-                }
-                t if t.starts_with("task.") => {
-                    let title = pstr("title");
-                    let task_id = e.get("taskId").and_then(|v| v.as_str()).map(|s| s.to_string());
-                    let hist_status = match t {
-                        "task.started"      => TaskStatus::Running,
-                        "task.completed"    => TaskStatus::Completed,
-                        "task.failed"       => TaskStatus::Failed,
-                        "task.blocked"      => TaskStatus::Blocked,
-                        "task.inconclusive" => TaskStatus::Inconclusive,
-                        _                   => TaskStatus::Created,
-                    };
-                    // Upsert into the tasks panel.
-                    if let Some(ref id) = task_id {
-                        if let Some(existing) = self.tasks.iter_mut().find(|t| &t.id == id) {
-                            existing.status = hist_status;
-                            if !title.trim().is_empty() {
-                                existing.title = title.clone();
-                            }
-                        } else if !title.trim().is_empty() {
-                            self.tasks.push(Task {
-                                id: id.clone(),
-                                title: title.clone(),
-                                status: hist_status,
-                                agent: e.get("agentName").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                            });
-                        }
-                    }
-                    // Inline marker only for task.created events.
-                    if t == "task.created" && !title.trim().is_empty()
-                        && self.last_task.as_deref() != Some(title.as_str())
-                    {
-                        self.flush_stream();
-                        self.blocks.push(Block::Plain(Line::from(Span::styled(
-                            format!("◇ {title}"),
-                            Style::default().fg(Color::Yellow).add_modifier(Modifier::DIM),
-                        ))));
-                        self.last_task = Some(title);
-                        self.last_tool = None;
-                    }
-                }
-                "plan.updated" => {
-                    // Batch task upserts from workspace_add_tasks — panel only, no inline markers.
-                    if let Some(tasks) = p.get("tasks").and_then(|t| t.as_array()) {
-                        for task in tasks {
-                            let tid = task.get("id").and_then(|v| v.as_str()).map(|s| s.to_string());
-                            let title = task.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                            if title.is_empty() { continue; }
-                            let status_str = task.get("status").and_then(|v| v.as_str()).unwrap_or("pending");
-                            let hist_status = match status_str {
-                                "running"      => TaskStatus::Running,
-                                "completed"    => TaskStatus::Completed,
-                                "failed"       => TaskStatus::Failed,
-                                "blocked"      => TaskStatus::Blocked,
-                                "inconclusive" => TaskStatus::Inconclusive,
-                                _              => TaskStatus::Created,
-                            };
-                            if let Some(ref id) = tid {
-                                if let Some(existing) = self.tasks.iter_mut().find(|t| &t.id == id) {
-                                    existing.status = hist_status;
-                                    if !title.is_empty() { existing.title = title.clone(); }
-                                } else {
-                                    self.tasks.push(Task {
-                                        id: id.clone(),
-                                        title,
-                                        status: hist_status,
-                                        agent: task.get("agentName").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                                    });
-                                }
-                            }
-                        }
-                    }
-                }
-                _ => {}
+            let agent = e.get("agentName").and_then(|a| a.as_str()).unwrap_or("").to_string();
+            if is_main_agent(&agent) {
+                self.seed_event(e);
+            } else {
+                self.in_agent_ctx(&agent, |s| s.seed_event(e));
             }
         }
+        self.flush_subagents();
+        self.replaying = false;
         self.follow = true;
     }
 
@@ -2649,8 +2834,37 @@ impl App {
     pub fn overlay_searchable(&self) -> bool {
         matches!(
             self.overlay.as_ref().map(|o| o.kind),
-            Some(OverlayKind::Threads) | Some(OverlayKind::Workspaces) | Some(OverlayKind::Models)
+            Some(OverlayKind::Threads) | Some(OverlayKind::Workspaces) | Some(OverlayKind::Models) | Some(OverlayKind::History)
         )
+    }
+
+    /// Ctrl-R: a searchable list of sent prompts, newest first.
+    pub fn open_history_search(&mut self) {
+        let mut seen = std::collections::HashSet::new();
+        let items: Vec<OverlayItem> = self
+            .history
+            .iter()
+            .rev()
+            .filter(|h| seen.insert(h.as_str()))
+            .take(300)
+            .map(|h| OverlayItem {
+                label: truncate(&h.replace('\n', " ⏎ "), 160),
+                detail: vec![h.clone()],
+                action: Some(h.clone()),
+            })
+            .collect();
+        if items.is_empty() {
+            self.notice("no previous prompts yet");
+            return;
+        }
+        self.open_overlay(OverlayKind::History, "Search prompt history".into(), items);
+    }
+
+    /// Put a recalled prompt in the input, ready to edit or send.
+    pub fn set_input(&mut self, text: &str) {
+        self.input = text.to_string();
+        self.input_cursor = self.input.len();
+        self.hist_pos = None;
     }
 
     pub fn overlay_active(&self) -> bool {
@@ -2713,10 +2927,19 @@ impl App {
     }
 
     /// Plain-text dump of the whole conversation (for ^Y → clipboard).
-    pub fn transcript_plaintext(&self) -> String {
-        let mut out = String::new();
-        for b in &self.blocks {
+    fn plain_blocks(&self, blocks: &[Block], out: &mut String) {
+        for b in blocks {
             match b {
+                Block::SubAgent(i) => {
+                    if let Some(sub) = self.subs.get(*i) {
+                        out.push_str(&format!("⏺ {} (sub-agent)\n", sub.name));
+                        let mut inner = String::new();
+                        self.plain_blocks(&sub.blocks, &mut inner);
+                        for l in inner.lines() {
+                            out.push_str(&format!("    {l}\n"));
+                        }
+                    }
+                }
                 Block::User(t) => out.push_str(&format!("You: {t}\n")),
                 Block::Assistant { agent, md } => out.push_str(&format!("{agent}: {md}\n")),
                 Block::Thinking(t) => out.push_str(&format!("[thinking] {t}\n")),
@@ -2747,6 +2970,11 @@ impl App {
                 }
             }
         }
+    }
+
+    pub fn transcript_plaintext(&self) -> String {
+        let mut out = String::new();
+        self.plain_blocks(&self.blocks, &mut out);
         if let Some(s) = &self.stream {
             out.push_str(&s.buf);
             out.push('\n');
@@ -3024,7 +3252,7 @@ impl App {
                 o.dscroll = 0;
                 None
             }
-            OverlayKind::Threads | OverlayKind::Workspaces | OverlayKind::Models => {
+            OverlayKind::Threads | OverlayKind::Workspaces | OverlayKind::Models | OverlayKind::History => {
                 let idx = o.current()?;
                 o.items.get(idx).and_then(|it| it.action.clone()).map(|a| (o.kind, a))
             }
@@ -3063,6 +3291,7 @@ impl App {
         self.thread_credits = 0.0;
         self.thread_tokens = 0;
         self.context_pct = None;
+        self.subs.clear();
         self.tasks.clear();
         set_terminal_title("");
         self.push_banner();
@@ -3984,6 +4213,50 @@ mod input_editor_tests {
         assert_eq!(hang_indent("  12. item"), 6);
         // Code boxes are left for the renderer.
         assert_eq!(wrap_hanging(Line::from("│ ".to_string() + &"x".repeat(50)), 20).len(), 1);
+    }
+
+    #[test]
+    fn subagent_work_stays_in_its_own_group() {
+        let mut a = app();
+        let ev = |agent: &str, kind: &str, name: Option<&str>, text: Option<&str>, detail: Option<&str>, id: Option<&str>| StreamItem {
+            kind: kind.into(), agent: Some(agent.into()), text: text.map(String::from),
+            tool_name: name.map(String::from), detail: detail.map(String::from), status: None,
+            local: false, task_id: None, call_id: id.map(String::from),
+        };
+        let main = "Strobes AI Supervisor";
+        let sub = "Network Pentest Agent";
+        a.on_stream(ev(main, "token", None, Some("Dispatching a sub-agent."), None, None));
+        a.on_stream(ev(sub, "token", None, Some("I'll run whoami."), None, None));
+        // Main agent keeps talking while the sub-agent works.
+        a.on_stream(ev(main, "token", None, Some(" Waiting for it."), None, None));
+        a.on_stream(ev(sub, "tool_start", Some("execute_command"), None, Some("whoami"), Some("c1")));
+        a.on_stream(ev(sub, "tool_output", Some("execute_command"), None, Some("\"admin\""), Some("c1")));
+        a.on_stream(ev(sub, "token", None, Some("Result: admin."), None, None));
+        a.on_app_event(AppEvent::RunFinished("completed".into()));
+
+        // Main transcript: its text in one piece, plus a single group marker.
+        let main_text: Vec<&str> = a.blocks.iter().filter_map(|b| match b {
+            Block::Assistant { md, .. } => Some(md.as_str()), _ => None }).collect();
+        assert_eq!(main_text, vec!["Dispatching a sub-agent. Waiting for it."]);
+        assert_eq!(a.blocks.iter().filter(|b| matches!(b, Block::SubAgent(_))).count(), 1);
+        // The sub-agent's text and tool call live in its own run.
+        let run = &a.subs[0];
+        assert_eq!(run.name, sub);
+        assert!(run.blocks.iter().any(|b| matches!(b, Block::Tool { detail, .. } if detail == "whoami")));
+        assert!(run.blocks.iter().any(|b| matches!(b, Block::ToolResult { text, .. } if text == "admin")));
+        // Collapsed render: header + the call + a Done line, no sub-agent prose.
+        let lines: Vec<String> = a.build_lines(100).iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect()).collect();
+        let joined = lines.join("\n");
+        assert!(joined.contains("Network Pentest Agent  sub-agent"), "{joined}");
+        assert!(joined.contains("Shell(whoami)"), "{joined}");
+        assert!(joined.contains("Done (1 tool use"), "{joined}");
+        assert!(!joined.contains("Result: admin."), "{joined}");
+        // ctrl+o expands it.
+        a.show_full_code = true;
+        let joined: String = a.build_lines(100).iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>()).collect::<Vec<_>>().join("\n");
+        assert!(joined.contains("Result: admin."), "{joined}");
     }
 
     #[test]
