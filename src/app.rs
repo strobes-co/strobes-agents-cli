@@ -2834,8 +2834,11 @@ impl App {
         self.follow = true;
         self.pinned = false;
         // Start the turn's elapsed timer at send (covers the wait before the
-        // server's run.started arrives).
-        self.run_started = Some(std::time::Instant::now());
+        // server's run.started arrives) — but a follow-up queued mid-turn
+        // doesn't restart the running clock.
+        if !self.running || self.run_started.is_none() {
+            self.run_started = Some(std::time::Instant::now());
+        }
         self.last_elapsed = None;
     }
 
@@ -2943,6 +2946,21 @@ impl App {
             // A local execution whose wrapper already has its args.
             return (lo..self.blocks.len()).find(|&i| matches!(&self.blocks[i],
                 Block::Tool { status: ToolStatus::Running, agent: a, name: n, local_id: None, .. } if a == agent && same(n)));
+        }
+        // The local execution can be announced before its wrapper: a wrapper
+        // start then belongs to a local-only call with the same (or no) args,
+        // as long as nobody has spoken since.
+        let mut orphan = None;
+        for i in (lo..self.blocks.len()).rev() {
+            match &self.blocks[i] {
+                Block::User(_) | Block::Assistant { .. } => break,
+                Block::Tool { agent: a, name: n, detail: d, call_id: None, local_id: Some(_), .. }
+                    if a == agent && same(n) && (detail.trim().is_empty() || d.trim() == detail.trim()) => orphan = Some(i),
+                _ => {}
+            }
+        }
+        if orphan.is_some() {
+            return orphan;
         }
         // Re-announce of a finished call: same tool and args, and nobody has
         // spoken since.
@@ -3450,6 +3468,18 @@ mod input_editor_tests {
             ("Shell".into(), "date +%Y".into(), Some("2026".into())),
             ("Shell".into(), "uname -s".into(), Some("Darwin".into())),
         ]);
+    }
+
+    #[test]
+    fn local_announced_before_wrapper_is_still_one_call() {
+        let mut a = app();
+        let w = "workspace_execute_shell_command";
+        a.on_stream(tool_id("tool_start", "execute_command", "date", true, "L1"));
+        a.on_stream(tool_id("tool_start", w, "", false, "C1"));
+        a.on_stream(tool_id("tool_output", "execute_command", "\"Thu\"", false, "L1"));
+        a.on_stream(tool_id("tool_start", w, "date", false, "C1"));
+        a.on_stream(tool_id("tool_output", w, "\"Thu\"", false, "C1"));
+        assert_eq!(calls(&a), vec![("Shell".into(), "date".into(), Some("Thu".into()))]);
     }
 
     #[test]
