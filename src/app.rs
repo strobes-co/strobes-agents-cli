@@ -1252,7 +1252,12 @@ impl App {
                 }
                 // Result rendered as a dim child block under ITS call.
                 let d = item.detail.unwrap_or_default();
-                let body = if d.is_empty() { "(ok)".to_string() } else { concise_tool_result(&d) };
+                let body = if d.is_empty() {
+                    "(ok)".to_string()
+                } else {
+                    let raw = serde_json::from_str::<Value>(&d).unwrap_or(Value::String(d.clone()));
+                    tool_summary(&name, &raw).unwrap_or_else(|| concise_tool_result(&d))
+                };
                 self.flush_stream();
                 if !self.attach_by_id(item.call_id.as_deref(), &body, false) {
                     self.attach_tool_result(&agent, &name, body, false);
@@ -2741,7 +2746,7 @@ impl App {
             "tool.output" if is_silent_tool(&pstr("toolName")) => {}
             "tool.output" => {
                 let body = match p.get("result") {
-                    Some(v) => concise_result_value(v),
+                    Some(v) => tool_summary(&pstr("toolName"), v).unwrap_or_else(|| concise_result_value(v)),
                     None => "(ok)".to_string(),
                 };
                 let body = if body.is_empty() { "(ok)".to_string() } else { body };
@@ -3740,11 +3745,62 @@ fn wrap_hanging(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
     rows
 }
 
+/// One-line results for discovery tools whose raw output is noise to a
+/// reader (a whole skill's text, a JSON catalogue). None = default view.
+fn tool_summary(name: &str, raw: &Value) -> Option<String> {
+    let text = match raw {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    };
+    match name {
+        "load_skill" | "workspace_load_skill" => {
+            let lines = text.lines().filter(|l| !l.trim().is_empty()).count();
+            if text.trim().is_empty() {
+                return None;
+            }
+            if text.to_lowercase().contains("not found") && lines < 4 {
+                return Some(format!("✗ {}", truncate(text.trim(), 160)));
+            }
+            Some(format!("loaded · {lines} lines"))
+        }
+        "search_skills" => {
+            let v: Value = match raw {
+                Value::String(s) => serde_json::from_str(s).ok()?,
+                other => other.clone(),
+            };
+            let slugs: Vec<String> = v.get("skills")?.as_array()?
+                .iter()
+                .filter_map(|k| k.get("slug").or_else(|| k.get("name")).and_then(|x| x.as_str()).map(String::from))
+                .collect();
+            Some(match slugs.len() {
+                0 => "no matching skills".to_string(),
+                n => format!("found {n}: {}", truncate(&slugs.join(", "), 160)),
+            })
+        }
+        "search_tools" => {
+            let names: Vec<String> = text
+                .lines()
+                .filter_map(|l| l.trim().strip_prefix("- "))
+                .filter_map(|l| l.split(|c: char| c == ' ' || c == '(' || c == ':').next())
+                .filter(|n| !n.is_empty())
+                .map(String::from)
+                .collect();
+            if names.is_empty() {
+                return Some(truncate(text.lines().next().unwrap_or("").trim(), 160));
+            }
+            let n = names.len();
+            Some(format!("loaded {n} tool{}: {}", if n == 1 { "" } else { "s" }, truncate(&names.join(", "), 160)))
+        }
+        _ => None,
+    }
+}
+
 /// Reader-facing tool name: `workspace_execute_shell_command` → "Shell",
 /// `browser_navigate` → "Browser navigate", anything else in sentence case.
 pub fn tool_label(name: &str) -> String {
     let known = match name {
         "__bash__" => Some("Bash"),
+        "load_skill" | "workspace_load_skill" => Some("Skill"),
         "execute_command" | "workspace_execute_shell_command" => Some("Shell"),
         "execute_code" | "workspace_execute_code" => Some("Run code"),
         "read_file" | "workspace_read_file" => Some("Read"),
@@ -4448,6 +4504,18 @@ mod input_editor_tests {
         let t = "line 1\nline 2\n\n[The user moved this command to the background — it is still running as job #7. Its full output is being written to /x/job-7.log. Continue with other work; read that file (e.g. tail it) to check progress or results later.]";
         assert_eq!(humanize_job_note(t), "line 1\nline 2\n⟳ moved to the background · job #7 · /jobs");
         assert_eq!(humanize_job_note("plain"), "plain");
+    }
+
+    #[test]
+    fn discovery_tools_summarize() {
+        let skill = Value::String("\n## Loaded Skill: api-pentest\n\n## Orchestrator\n- a\n- b".into());
+        assert_eq!(tool_summary("load_skill", &skill).unwrap(), "loaded · 4 lines");
+        let found = serde_json::json!({"success": true, "skills": [{"slug": "api-pentest"}, {"slug": "web-pentest"}]});
+        assert_eq!(tool_summary("search_skills", &found).unwrap(), "found 2: api-pentest, web-pentest");
+        let tools = Value::String("Loaded 1 tool(s); they are callable from your next step:\n- oob_send_smtp (oob): Actively send".into());
+        assert_eq!(tool_summary("search_tools", &tools).unwrap(), "loaded 1 tool: oob_send_smtp");
+        assert!(tool_summary("execute_command", &tools).is_none());
+        assert_eq!(tool_label("load_skill"), "Skill");
     }
 
     #[test]
