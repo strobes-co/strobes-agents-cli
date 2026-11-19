@@ -3273,12 +3273,26 @@ fn fmt_tokens(t: i64) -> String {
 /// Windows console, but the same font-dependent double-width rendering can
 /// happen in terminals on any OS, so this applies everywhere rather than
 /// gating on `cfg(windows)`.
+/// ASCII fallbacks are for consoles that draw these glyphs at the wrong
+/// width (classic Windows conhost). Elsewhere they render fine, so keep them —
+/// unless STROBES_ASCII=1 asks for plain ASCII.
+fn ascii_glyphs() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cfg!(windows) || std::env::var("STROBES_ASCII").map(|v| v == "1" || v == "true").unwrap_or(false)
+    })
+}
+
 fn win_glyph(c: char) -> Option<&'static str> {
+    if !ascii_glyphs() {
+        return None;
+    }
     Some(match c {
-        '●' | '◆' | '⏺' | '◇' | '✻' | '◈' | '⛁' | '⊞' | '◐' | '★' => "*",
+        '●' | '◆' | '⏺' | '◇' | '✻' | '✺' | '✹' | '✸' | '✷' | '✶' | '◈' | '⛁' | '⊞' | '◐' | '★' => "*",
         '○' => "o",
         '⎿' => "L",
-        '▷' | '➤' | '›' | '↪' => ">",
+        '▷' | '➤' | '›' | '❯' | '↪' => ">",
+        '↓' => "v",
         '✔' => "+",
         '✗' => "x",
         '⚠' => "!",
