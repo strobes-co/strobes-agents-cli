@@ -8584,6 +8584,15 @@ fn parse_dragged_paths(input: &str) -> Option<Vec<std::path::PathBuf>> {
 
 /// Load a thread's history, active-run state and title into the app, running
 /// the independent round-trips concurrently. Used when switching threads.
+/// A chat opened with /agent is titled after its specialist, which runs it:
+/// show that agent as the main one when the chat is reopened.
+fn mark_specialist_chat(threads: Option<&Vec<api::Thread>>, thread_id: &str, events: &[serde_json::Value]) {
+    let Some(title) = threads.and_then(|ts| ts.iter().find(|t| t.id == thread_id)).map(|t| t.title.as_str()) else { return };
+    if !title.is_empty() && events.iter().any(|e| e.get("agentName").and_then(|a| a.as_str()) == Some(title)) {
+        app::mark_main_agent(title);
+    }
+}
+
 async fn load_thread_data(
     client: &api::ApiClient,
     thread_id: &str,
@@ -8599,21 +8608,9 @@ async fn load_thread_data(
     if let Ok(c) = credits_res {
         app.set_thread_credits(c.credits, c.tokens);
     }
-    let title = threads_res
-        .as_ref()
-        .ok()
-        .and_then(|ts| ts.iter().find(|t| t.id == thread_id))
-        .map(|t| t.title.clone())
-        .unwrap_or_default();
     match events_res {
         Ok(events) if !events.is_empty() => {
-            // A chat opened with /agent is titled after its specialist, which
-            // runs it: show that agent as the main one.
-            if !title.is_empty()
-                && events.iter().any(|e| e.get("agentName").and_then(|a| a.as_str()) == Some(title.as_str()))
-            {
-                app::mark_main_agent(&title);
-            }
+            mark_specialist_chat(threads_res.as_ref().ok(), thread_id, &events);
             app.seed_history_events(events)
         }
         _ => {
@@ -8713,7 +8710,10 @@ pub async fn run_chat(
 
     // Apply the fetched data (in-memory, fast).
     match events_res {
-        Ok(events) if !events.is_empty() => app.seed_history_events(events),
+        Ok(events) if !events.is_empty() => {
+            mark_specialist_chat(threads_res.as_ref().ok(), &thread_id, &events);
+            app.seed_history_events(events)
+        }
         _ => {
             if let Ok(hist) = client.get_thread_history(&thread_id, 100).await {
                 app.seed_history(hist.messages);
