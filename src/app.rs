@@ -412,6 +412,7 @@ pub const BUILTIN_COMMANDS: &[(&str, &str)] = &[
     ("files", "Browse the workspace's local files"),
     ("jobs", "Background commands: status, output, stop (alias /bg)"),
     ("permissions", "Ask before approval-gated actions, or approve automatically"),
+    ("api", "Call the Strobes API: /api [METHOD] /cli/workspaces/ [json]"),
     ("browser", "Agent's browser: open <url> to sign in · show · hide · attach <port> · close"),
     ("copy", "Copy the transcript to the clipboard"),
     ("thinking", "Show or hide the agent's reasoning"),

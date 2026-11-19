@@ -8291,6 +8291,7 @@ fn run_builtin(cmd: &str, app: &mut App, handle: &mut pulse::PulseHandle, defer:
             });
         }
         "browser" => *defer = Some(Defer::Browser(String::new())),
+        "api" => app.notice("usage: /api [GET|POST|PATCH|DELETE] /cli/workspaces/ [json body] — org-relative unless it starts with /v1/"),
         "copy" => match copy_to_clipboard(&app.transcript_plaintext()) {
             Ok(_) => app.notice("copied transcript to clipboard"),
             Err(e) => app.on_app_event(pulse::AppEvent::Error(format!("copy failed: {e}"))),
@@ -8392,6 +8393,8 @@ enum Defer {
     Jobs,
     /// /browser [args].
     Browser(String),
+    /// /api [METHOD] <path> [json].
+    Api(String),
 }
 
 /// Result of a `Defer::{Workspaces,Threads,Findings,Approvals}` list fetch,
@@ -8949,7 +8952,12 @@ pub async fn run_chat(
                                         .filter(|a| !a.is_empty())
                                         .map(str::to_lowercase);
                                     let browser_arg = text.strip_prefix("/browser ").map(|a| a.trim().to_string());
-                                    if let Some(a) = browser_arg {
+                                    let api_arg = text.strip_prefix("/api ").map(|a| a.trim().to_string());
+                                    if let Some(a) = api_arg {
+                                        app.remember_prompt(&text);
+                                        app.input_clear();
+                                        defer = Some(Defer::Api(a));
+                                    } else if let Some(a) = browser_arg {
                                         app.input_clear();
                                         defer = Some(Defer::Browser(a));
                                     } else if let Some(q) = model_arg {
@@ -9262,6 +9270,51 @@ pub async fn run_chat(
                 app.open_overlay(app::OverlayKind::Models, "Select AI model  (^P toggle)".into(), items);
             }
             Some(Defer::Jobs) => app.open_jobs(),
+            Some(Defer::Api(args)) => {
+                let dtx = defer_tx.clone();
+                let profile = profile.clone();
+                app.set_busy("api…");
+                tokio::spawn(async move {
+                    // [METHOD] <path> [json…]
+                    let mut parts = args.splitn(2, char::is_whitespace);
+                    let first = parts.next().unwrap_or("").to_string();
+                    let (method, rest) = if ["GET", "POST", "PUT", "PATCH", "DELETE"].contains(&first.to_uppercase().as_str()) {
+                        (first.to_uppercase(), parts.next().unwrap_or("").trim().to_string())
+                    } else {
+                        ("GET".to_string(), args.trim().to_string())
+                    };
+                    let mut it = rest.splitn(2, char::is_whitespace);
+                    let path = it.next().unwrap_or("").to_string();
+                    let body = it.next().map(str::trim).filter(|b| !b.is_empty());
+                    let result: Result<String, String> = async {
+                        let client = api::ApiClient::new(profile).map_err(|e| e.to_string())?;
+                        let url = client.resolve_api_path(&path).map_err(|e| e.to_string())?;
+                        let body = match body {
+                            Some(b) => Some(serde_json::from_str::<serde_json::Value>(b).map_err(|e| format!("body is not JSON: {e}"))?),
+                            None => None,
+                        };
+                        let method = if body.is_some() && method == "GET" { "POST".to_string() } else { method };
+                        let (status, text) = client.raw(&method, &url, body).await.map_err(|e| e.to_string())?;
+                        let pretty = serde_json::from_str::<serde_json::Value>(&text)
+                            .ok()
+                            .and_then(|v| serde_json::to_string_pretty(&v).ok())
+                            .unwrap_or_else(|| if text.trim_start().starts_with('<') { "(HTML page)".into() } else { text.clone() });
+                        let lines: Vec<&str> = pretty.lines().collect();
+                        let shown = lines.iter().take(40).cloned().collect::<Vec<_>>().join("\n");
+                        let more = if lines.len() > 40 { format!("\n… +{} lines (strobes api {path} for all)", lines.len() - 40) } else { String::new() };
+                        if (200..300).contains(&status) {
+                            Ok(format!("{method} {path} → {status}\n{shown}{more}"))
+                        } else {
+                            Err(format!("{method} {path} → HTTP {status}: {}", pretty.lines().next().unwrap_or("")))
+                        }
+                    }
+                    .await;
+                    dtx.send(match result {
+                        Ok(m) => DeferResult::Notice(m),
+                        Err(e) => DeferResult::Error(e),
+                    }).ok();
+                });
+            }
             Some(Defer::Browser(args)) => {
                 let dtx = defer_tx.clone();
                 app.set_busy("browser…");
