@@ -8207,7 +8207,28 @@ pub async fn run_chat(
                                         .strip_prefix('/')
                                         .filter(|t| !t.contains(' '))
                                         .and_then(app::builtin_command);
-                                    if let Some(cmd) = builtin {
+                                    // `/model <name>` switches without the picker.
+                                    let model_arg = text
+                                        .strip_prefix("/model ")
+                                        .map(str::trim)
+                                        .filter(|a| !a.is_empty())
+                                        .map(str::to_lowercase);
+                                    if let Some(q) = model_arg {
+                                        app.input_clear();
+                                        // Exact id first; else the newest name match
+                                        // (the table lists versions oldest first).
+                                        let hit = api::BUILTIN_MODELS.iter().find(|(id, _)| id.to_string() == q)
+                                            .or_else(|| api::BUILTIN_MODELS.iter().rev().find(|(_, name)| name.to_lowercase().contains(&q)));
+                                        match hit {
+                                            Some(&(id, name)) => {
+                                                let m = if id == 0 { None } else { Some(id) };
+                                                handle.set_model(m);
+                                                app.set_model(m);
+                                                app.notice(&format!("model → {name}"));
+                                            }
+                                            None => app.notice(&format!("no model matches “{q}” — /model lists them")),
+                                        }
+                                    } else if let Some(cmd) = builtin {
                                         app.input_clear();
                                         run_builtin(cmd, &mut app, &mut handle, &mut defer, &mut quit);
                                     } else if let Some(cmd) = text.strip_prefix('!').map(str::trim).filter(|c| !c.is_empty()) {

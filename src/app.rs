@@ -368,7 +368,7 @@ pub const BUILTIN_COMMANDS: &[(&str, &str)] = &[
     ("new", "Start a new chat (alias /clear)"),
     ("resume", "Switch to another chat in this workspace"),
     ("workspace", "Switch or bind a workspace"),
-    ("model", "Choose the AI model"),
+    ("model", "Choose the AI model (or /model sonnet)"),
     ("findings", "Browse this workspace's findings"),
     ("approvals", "Review pending approvals"),
     ("files", "Browse the workspace's local files"),
