@@ -848,6 +848,9 @@ impl App {
                 }
             }
             AppEvent::RunFinished(label) => {
+                // Settle the last reply now (also turns a cancel receipt into
+                // the "Interrupted" line).
+                self.flush_stream();
                 self.running = false;
                 self.settle_running_tools();
                 self.last_elapsed = self.run_started.take().map(|t| t.elapsed());
