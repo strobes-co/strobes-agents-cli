@@ -248,6 +248,42 @@ impl ApiClient {
         Ok(format!("{}{}", self.profile.http_base()?, path))
     }
 
+    /// `strobes api` path resolution: a full URL as-is; `/v1/…` under the API
+    /// root; anything else relative to the org (`/cli/workspaces/` →
+    /// `<root>/organizations/<org>/cli/workspaces/`). `{org}` is filled in.
+    pub fn resolve_api_path(&self, path: &str) -> Result<String> {
+        let p = path.trim().replace("{org}", &self.profile.org_id);
+        if p.starts_with("http://") || p.starts_with("https://") {
+            return Ok(p);
+        }
+        let p = if p.starts_with('/') { p } else { format!("/{p}") };
+        for v in ["/v1/", "/v2/"] {
+            if let Some(rest) = p.strip_prefix(v) {
+                let root = self.profile.api_prefix().trim_end_matches("/v1");
+                return self.url(&format!("{root}{}{rest}", &v[..v.len()]));
+            }
+        }
+        self.url(&self.org_path(&p))
+    }
+
+    /// One raw authenticated request (for `strobes api`): (status, body).
+    pub async fn raw(&self, method: &str, url: &str, body: Option<serde_json::Value>) -> Result<(u16, String)> {
+        let m = reqwest::Method::from_bytes(method.to_uppercase().as_bytes())
+            .map_err(|_| anyhow!("unknown HTTP method {method}"))?;
+        let mut req = self
+            .http
+            .request(m, url)
+            .header("Authorization", format!("token {}", self.profile.master_key))
+            .header("Accept", "application/json")
+            .timeout(std::time::Duration::from_secs(120));
+        if let Some(b) = body {
+            req = req.json(&b);
+        }
+        let resp = req.send().await.map_err(|e| anyhow!("{method} {url}: {e}"))?;
+        let status = resp.status().as_u16();
+        Ok((status, resp.text().await.unwrap_or_default()))
+    }
+
     async fn get_json(&self, path: &str) -> Result<serde_json::Value> {
         self.get_json_timeout(
             path,

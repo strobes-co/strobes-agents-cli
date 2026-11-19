@@ -265,6 +265,28 @@ enum Cmd {
     },
     /// Forget this tenant's credentials.
     Logout,
+    /// Call the Strobes API with your credentials (like `gh api`).
+    ///
+    /// Paths are relative to your organization unless they start with /v1/:
+    ///   strobes api /cli/workspaces/
+    ///   strobes api -X POST /cli/threads/create/ -d '{"title":"x"}'
+    ///   strobes api /v1/organizations/{org}/master_key/
+    Api {
+        /// API path (org-relative, /v1/…, or a full URL; {org} is filled in).
+        path: String,
+        /// HTTP method.
+        #[arg(short = 'X', long, default_value = "GET")]
+        method: String,
+        /// JSON body, @file, or @- for stdin.
+        #[arg(short = 'd', long)]
+        data: Option<String>,
+        /// Query parameter key=value (repeatable).
+        #[arg(short = 'q', long = "query", value_name = "KEY=VALUE")]
+        query: Vec<String>,
+        /// Print the body as-is (no pretty-printing).
+        #[arg(long)]
+        raw: bool,
+    },
     /// Update the CLI to the latest release (downloads + replaces the binary).
     Update {
         /// Reinstall even if already on the latest version.
@@ -1078,6 +1100,7 @@ async fn main() -> Result<()> {
             }
         }
         Cmd::Logout => cmd_logout(&mut cfg, &tenant),
+        Cmd::Api { path, method, data, query, raw } => cmd_api(&profile, &path, &method, data, query, raw).await,
         Cmd::Update { force } => cmd_update(force).await,
         Cmd::Tenants => cmd_tenants(&cfg),
         Cmd::Credits { workspace, thread } => cmd_credits(&profile, workspace, thread).await,
@@ -7724,6 +7747,62 @@ async fn browser_login(cfg: &mut Config, tenant: &str, url: Option<String>, web_
     println!("  \x1b[32m✔\x1b[0m Signed in{who}{ws}");
     println!("  Run \x1b[1mstrobes\x1b[0m to start chatting.");
     Ok(())
+}
+
+/// `strobes api`: one authenticated request, pretty JSON out, non-zero exit
+/// on HTTP errors.
+async fn cmd_api(p: &config::Profile, path: &str, method: &str, data: Option<String>, query: Vec<String>, raw: bool) -> Result<()> {
+    require_complete(p)?;
+    let client = api::ApiClient::new(p.clone())?;
+    let mut url = client.resolve_api_path(path)?;
+    if !query.is_empty() {
+        let mut u = url::Url::parse(&url)?;
+        for q in &query {
+            let (k, v) = q.split_once('=').ok_or_else(|| anyhow!("-q expects key=value, got {q}"))?;
+            u.query_pairs_mut().append_pair(k, v);
+        }
+        url = u.to_string();
+    }
+    let body = match data {
+        None => None,
+        Some(d) => {
+            let text = if d == "@-" {
+                let mut s = String::new();
+                std::io::Read::read_to_string(&mut std::io::stdin(), &mut s)?;
+                s
+            } else if let Some(f) = d.strip_prefix('@') {
+                std::fs::read_to_string(f).with_context(|| format!("reading {f}"))?
+            } else {
+                d
+            };
+            Some(serde_json::from_str(&text).map_err(|e| anyhow!("-d is not valid JSON: {e}"))?)
+        }
+    };
+    let method = if body.is_some() && method.eq_ignore_ascii_case("GET") { "POST".to_string() } else { method.to_string() };
+    let (status, text) = client.raw(&method, &url, body).await?;
+    let pretty = if raw {
+        text.clone()
+    } else {
+        serde_json::from_str::<serde_json::Value>(&text)
+            .ok()
+            .and_then(|v| serde_json::to_string_pretty(&v).ok())
+            .unwrap_or_else(|| text.clone())
+    };
+    if (200..300).contains(&status) {
+        println!("{pretty}");
+        Ok(())
+    } else {
+        eprintln!("HTTP {status} — {method} {url}");
+        // An HTML error page (proxy/debug 404) — its title says it all.
+        let lower = pretty.to_lowercase();
+        if lower.trim_start().starts_with("<!doctype html") || lower.trim_start().starts_with("<html") {
+            let title = lower.find("<title>").and_then(|a| lower[a + 7..].find("</title>").map(|b| pretty[a + 7..a + 7 + b].trim().to_string()));
+            eprintln!("{}", title.unwrap_or_else(|| "(HTML error page)".into()));
+        } else if !pretty.trim().is_empty() {
+            eprintln!("{}", if pretty.len() > 4000 { &pretty[..4000] } else { &pretty });
+        }
+        std::process::exit(1);
+    }
 }
 
 /// `strobes logout`: drop this tenant's key (and its chat/workspace binding).

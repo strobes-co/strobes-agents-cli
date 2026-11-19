@@ -410,6 +410,25 @@ Agent skills (e.g. `/api-pentest`) appear in the same `/` menu after the built-i
 | `Ctrl-R` | Search prompt history |
 | `Ctrl-T` · `Ctrl-Y` · `Ctrl-S` | Thinking · copy transcript · select mode (`/markdown` toggles raw markdown) |
 
+### Local commands, background jobs and the browser
+
+- Commands the agent runs on your machine stream their output live under the
+  call. **Ctrl-B** moves a long one (a scan, a crawl) to the background: the
+  agent gets the output so far plus the job's log file and carries on; **/jobs**
+  lists them (x stops one). **Esc** stops the running command along with the turn.
+- **/browser** shows the agent's local browser sessions and tabs.
+  `/browser open https://target.example` opens it (visible) so you can sign in —
+  the agent continues in that session. `show`/`hide` switch visible/headless,
+  `attach 9222` drives your own Chrome, `close` stops it.
+
+### Strobes API
+
+```bash
+strobes api /cli/workspaces/ -q limit=5            # org-relative, auth filled in
+strobes api -X POST /cli/threads/create/ -d '{"title":"x"}'
+strobes api /v1/organizations/{org}/master_key/    # explicit path
+```
+
 Other commands: `strobes status`, `strobes workspaces`, `strobes threads`,
 `strobes bind --download`, `strobes pull`, `strobes export -w <id>`,
 `strobes update`. `strobes chat` still opens the workspace → thread pickers.
