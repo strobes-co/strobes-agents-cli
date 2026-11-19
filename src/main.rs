@@ -8599,8 +8599,23 @@ async fn load_thread_data(
     if let Ok(c) = credits_res {
         app.set_thread_credits(c.credits, c.tokens);
     }
+    let title = threads_res
+        .as_ref()
+        .ok()
+        .and_then(|ts| ts.iter().find(|t| t.id == thread_id))
+        .map(|t| t.title.clone())
+        .unwrap_or_default();
     match events_res {
-        Ok(events) if !events.is_empty() => app.seed_history_events(events),
+        Ok(events) if !events.is_empty() => {
+            // A chat opened with /agent is titled after its specialist, which
+            // runs it: show that agent as the main one.
+            if !title.is_empty()
+                && events.iter().any(|e| e.get("agentName").and_then(|a| a.as_str()) == Some(title.as_str()))
+            {
+                app::mark_main_agent(&title);
+            }
+            app.seed_history_events(events)
+        }
         _ => {
             if let Ok(hist) = client.get_thread_history(thread_id, 100).await {
                 app.seed_history(hist.messages);

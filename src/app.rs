@@ -378,8 +378,6 @@ pub struct App {
     context_pct: Option<f64>,
     /// Sub-agent runs, each with its own transcript (see Block::SubAgent).
     subs: Vec<SubAgentRun>,
-    /// Someone has spoken in the current run (its first speaker is the main agent).
-    run_has_speaker: bool,
     /// Duration of the tool result about to be attached (one-shot).
     next_result_ms: Option<u64>,
     /// Latest output lines of running local commands, by tool-call id.
@@ -568,7 +566,6 @@ impl App {
             status: "connecting…".into(),
             connected: false,
             running: false,
-            run_has_speaker: false,
             show_thinking: false,
             markdown: true,
             show_full_code: false,
@@ -903,7 +900,6 @@ impl App {
             }
             AppEvent::RunStarted => {
                 self.running = true;
-                self.run_has_speaker = false;
                 self.status = "running…".into();
                 self.run_credits = 0.0;
                 self.run_tokens = 0;
@@ -1181,15 +1177,6 @@ impl App {
     /// transcript, everything else to the main one.
     fn on_stream(&mut self, item: StreamItem) {
         let agent = item.agent.clone().unwrap_or_default();
-        // The first agent to speak in a run is the main one (a chat started
-        // with /agent runs a specialist itself); sub-agents only appear once
-        // it spawns them.
-        if self.running && !self.run_has_speaker && !agent.is_empty() {
-            self.run_has_speaker = true;
-            if !is_main_agent(&agent) && self.subs.iter().all(|s| s.name != agent) {
-                mark_main_agent(&agent);
-            }
-        }
         if is_main_agent(&agent) || item.kind == "approval" {
             self.on_stream_main(item);
         } else {
@@ -2949,21 +2936,8 @@ impl App {
             return;
         }
         self.replaying = true;
-        // Same rule as live: after each user message, the first agent to
-        // speak is the main one (a /agent specialist, usually the supervisor).
-        let mut spoken = false;
         for e in &events {
             let agent = e.get("agentName").and_then(|a| a.as_str()).unwrap_or("").to_string();
-            let etype = e.get("type").and_then(|t| t.as_str()).unwrap_or("");
-            let actor = e.get("actor").and_then(|t| t.as_str()).unwrap_or("");
-            if etype == "message.created" && actor == "user" {
-                spoken = false;
-            } else if !spoken && !agent.is_empty() && actor != "user" {
-                spoken = true;
-                if !is_main_agent(&agent) && self.subs.iter().all(|s| s.name != agent) {
-                    mark_main_agent(&agent);
-                }
-            }
             if is_main_agent(&agent) {
                 self.seed_event(e);
             } else {
@@ -4037,7 +4011,9 @@ pub fn strobie_frame(tick: usize) -> (&'static str, Style) {
 /// specialist. Process-wide, like the names of the built-in supervisor.
 static MAIN_AGENTS: std::sync::RwLock<Vec<String>> = std::sync::RwLock::new(Vec::new());
 
-fn mark_main_agent(agent: &str) {
+/// A specialist that runs a chat itself (opened with /agent): its replies are
+/// the main transcript, not a sub-agent group.
+pub fn mark_main_agent(agent: &str) {
     if let Ok(mut v) = MAIN_AGENTS.write() {
         if !v.iter().any(|a| a == agent) {
             v.push(agent.to_string());
@@ -4455,6 +4431,7 @@ mod input_editor_tests {
     #[test]
     fn a_specialist_running_the_chat_is_the_main_agent() {
         let mut a = App::new("t".into(), "http://x".into(), "ten".into(), "org".into());
+        mark_main_agent("Vulnerability Triage Agent");
         a.on_app_event(AppEvent::RunStarted);
         let tok = |agent: &str, t: &str| StreamItem {
             kind: "token".into(), agent: Some(agent.into()), text: Some(t.into()),

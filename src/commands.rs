@@ -488,6 +488,8 @@ async fn agent(args: &str, ctx: &Ctx) -> Result<Outcome, String> {
         .or_else(|| agents.iter().find(|a| s(a, "id").to_lowercase().contains(&w) || s(a, "name").to_lowercase().contains(&w)))
         .ok_or_else(|| format!("no agent matches '{want}' — /agent lists them"))?;
     let id = s(pick, "id");
+    // The specialist runs this chat itself: show it as the main agent.
+    crate::app::mark_main_agent(s(pick, "name"));
     let thread = c
         .create_thread(s(pick, "name"), ctx.profile.workspace_id.as_deref(), Some(id))
         .await
@@ -644,11 +646,12 @@ async fn schedule(sub: &str, rest: &str, ctx: &Ctx) -> Result<String, String> {
             }
             let mut out = String::from("Schedules");
             for sch in items {
+                // `frequency` is the stored number; `frequency_display` its label.
+                let freq = if s(sch, "frequency_display").is_empty() { s(sch, "frequency") } else { s(sch, "frequency_display") };
+                let time: String = s(sch, "time").chars().take(5).collect();
                 out.push_str(&format!(
-                    "\n  {}  {} {} · {} · {}",
+                    "\n  {}  {freq} {time} · {} · {}",
                     s(sch, "id").chars().take(8).collect::<String>(),
-                    s(sch, "frequency"),
-                    s(sch, "time"),
                     s(sch, "status"),
                     s(sch, "name")
                 ));
