@@ -124,7 +124,9 @@ impl PulseHandle {
     }
 
     pub fn send_user_message(&self, text: &str) {
-        let mut ctx = json!({ "client_type": "cli" });
+        // STROBES.md, local skills and MCP tools ride along with every message.
+        let mut ctx = crate::project::client_context();
+        ctx["client_type"] = json!("cli");
         if let Some(ws) = self.workspace_id.lock().ok().and_then(|w| w.clone()) {
             ctx["workspace_id"] = json!(ws);
         }
@@ -546,6 +548,17 @@ pub(crate) fn concise_args(tool: &str, v: &Value) -> String {
                 None => Some(sid),
             }
         }
+        // MCP tools: their arguments, as key=value.
+        t if t.starts_with("mcp__") => v.as_object().map(|o| {
+            o.iter()
+                .filter(|(k, _)| !k.starts_with('_'))
+                .map(|(k, val)| match val {
+                    Value::String(s) => format!("{k}={}", s.replace('\n', " ")),
+                    other => format!("{k}={other}"),
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        }),
         t if t.starts_with("browser_") => pick("url").or_else(|| pick("selector")).or_else(|| pick("script")),
         "spawn_subagent" => pick("agent_id").or_else(|| pick("task")),
         // The raw args are a full DAG (a `nodes` array whose `agent_task`

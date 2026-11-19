@@ -95,6 +95,19 @@ pub async fn run_tool_ctx(tool_name: &str, input: &serde_json::Value, ctx: Optio
             error: None,
             captured_network: vec![],
         },
+        // The agent loading one of this project's skills (`local:<slug>`).
+        "load_local_skill" => {
+            let slug = input.get("slug").and_then(|v| v.as_str()).unwrap_or("");
+            match crate::project::load_skill(slug) {
+                Ok(text) => LocalResult { output: text, exit_code: Some(0), error: None, captured_network: vec![] },
+                Err(e) => LocalResult { output: String::new(), exit_code: None, error: Some(e), captured_network: vec![] },
+            }
+        }
+        // A tool from one of the user's MCP servers.
+        t if crate::mcp::is_mcp_tool(t) => match crate::mcp::call(t, input).await {
+            Ok(text) => LocalResult { output: text, exit_code: Some(0), error: None, captured_network: vec![] },
+            Err(e) => LocalResult { output: String::new(), exit_code: None, error: Some(format!("{e:#}")), captured_network: vec![] },
+        },
         "todo_write" => todo_write(input, &sandbox),
         "todo_read" => todo_read(&sandbox),
         b if b.starts_with("browser_") => match crate::browser::handle(b, input).await {

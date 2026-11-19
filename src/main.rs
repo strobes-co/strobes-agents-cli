@@ -11,8 +11,11 @@ mod api;
 mod app;
 mod browser;
 mod cache;
+mod commands;
 mod config;
 mod local;
+mod mcp;
+mod project;
 mod pack;
 mod markdown;
 mod picker;
@@ -2233,6 +2236,9 @@ async fn cmd_send(
     print_mode: bool,
 ) -> Result<()> {
     require_complete(p)?;
+    // One-shot runs wait (briefly) for MCP servers so their tools are offered.
+    mcp::start_all();
+    mcp::wait_ready(std::time::Duration::from_secs(15)).await;
 
     // If a sandbox_id was supplied, create the directory and point the
     // STROBES_AI_SANDBOX env var at it.  sandbox_dir_for() checks this var
@@ -8314,6 +8320,7 @@ fn run_builtin(cmd: &str, app: &mut App, handle: &mut pulse::PulseHandle, defer:
             *quit = true;
         }
         "exit" => *quit = true,
+        c if commands::is_command(c) => *defer = Some(Defer::Cmd(c.to_string(), String::new())),
         _ => {}
     }
 }
@@ -8395,6 +8402,8 @@ enum Defer {
     Browser(String),
     /// /api [METHOD] <path> [json].
     Api(String),
+    /// An argument-taking command from `commands` (name, args).
+    Cmd(String, String),
 }
 
 /// Result of a `Defer::{Workspaces,Threads,Findings,Approvals}` list fetch,
@@ -8523,6 +8532,9 @@ pub async fn run_chat(
     open_resume: bool,
 ) -> Result<()> {
     require_complete(&profile)?;
+    // The user's MCP servers start in the background; their tools join the
+    // next message once they're up (see /mcp).
+    mcp::start_all();
 
     let mut profile = profile;
     let client = api::ApiClient::new(profile.clone())?;
@@ -8955,7 +8967,16 @@ pub async fn run_chat(
                                         .map(str::to_lowercase);
                                     let browser_arg = text.strip_prefix("/browser ").map(|a| a.trim().to_string());
                                     let api_arg = text.strip_prefix("/api ").map(|a| a.trim().to_string());
-                                    if let Some(a) = api_arg {
+                                    // `/name args` for the commands in `commands`.
+                                    let cmd_arg = text.strip_prefix('/').and_then(|t| {
+                                        let (n, a) = t.split_once(char::is_whitespace)?;
+                                        commands::is_command(n).then(|| (n.to_string(), a.trim().to_string()))
+                                    });
+                                    if let Some((n, a)) = cmd_arg {
+                                        app.remember_prompt(&text);
+                                        app.input_clear();
+                                        defer = Some(Defer::Cmd(n, a));
+                                    } else if let Some(a) = api_arg {
                                         app.remember_prompt(&text);
                                         app.input_clear();
                                         defer = Some(Defer::Api(a));
@@ -9278,6 +9299,18 @@ pub async fn run_chat(
                 app.open_overlay(app::OverlayKind::Models, "Select AI model  (^P toggle)".into(), items);
             }
             Some(Defer::Jobs) => app.open_jobs(),
+            Some(Defer::Cmd(name, args)) => {
+                let dtx = defer_tx.clone();
+                let ctx = commands::Ctx { profile: profile.clone(), thread_id: app.thread_id.clone() };
+                app.set_busy(&format!("/{name}…"));
+                tokio::spawn(async move {
+                    let r = commands::run(&name, &args, &ctx).await;
+                    dtx.send(match r {
+                        Ok(commands::Outcome::Text(t)) => DeferResult::Notice(t),
+                        Err(e) => DeferResult::Error(e),
+                    }).ok();
+                });
+            }
             Some(Defer::Api(args)) => {
                 let dtx = defer_tx.clone();
                 let profile = profile.clone();

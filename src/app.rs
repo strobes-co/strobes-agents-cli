@@ -437,7 +437,16 @@ pub fn builtin_command(name: &str) -> Option<&'static str> {
         "?" | "h" => "help",
         other => other,
     };
-    BUILTIN_COMMANDS.iter().find(|(c, _)| *c == n).map(|(c, _)| *c)
+    all_builtin_commands().find(|(c, _)| *c == n).map(|(c, _)| *c)
+}
+
+/// Built-ins plus the argument-taking commands in `crate::commands`.
+pub fn all_builtin_commands() -> impl Iterator<Item = &'static (&'static str, &'static str)> {
+    let n = BUILTIN_COMMANDS.len();
+    BUILTIN_COMMANDS[..n - 1]
+        .iter()
+        .chain(crate::commands::COMMANDS.iter())
+        .chain(BUILTIN_COMMANDS[n - 1..].iter())
 }
 
 /// Files under the current directory for `@` mentions — relative paths,
@@ -2587,7 +2596,7 @@ impl App {
         let dim = Style::default().fg(Color::DarkGray);
         self.blocks.push(Block::Plain(Line::default()));
         self.blocks.push(Block::Plain(Line::from(Span::styled("Commands", key.add_modifier(Modifier::BOLD)))));
-        for (name, desc) in BUILTIN_COMMANDS {
+        for (name, desc) in all_builtin_commands() {
             self.blocks.push(Block::Plain(Line::from(vec![
                 Span::styled(format!("  /{name:<12}"), key),
                 Span::styled(desc.to_string(), dim),
@@ -3271,8 +3280,7 @@ impl App {
 
     pub fn set_slash_commands(&mut self, cmds: Vec<crate::api::SlashCmd>) {
         // Built-ins first; a server command can't shadow one.
-        let mut all: Vec<crate::api::SlashCmd> = BUILTIN_COMMANDS
-            .iter()
+        let mut all: Vec<crate::api::SlashCmd> = all_builtin_commands()
             .map(|(n, d)| crate::api::SlashCmd { name: n.to_string(), description: d.to_string(), argument_hint: String::new() })
             .collect();
         all.extend(cmds.into_iter().filter(|c| builtin_command(&c.name).is_none()));
@@ -3889,6 +3897,10 @@ pub fn tool_label(name: &str) -> String {
     };
     if let Some(k) = known {
         return k.to_string();
+    }
+    // mcp__<server>__<tool> → "server · tool (MCP)", as Claude Code shows it.
+    if let Some((server, tool)) = name.strip_prefix("mcp__").and_then(|r| r.split_once("__")) {
+        return format!("{server} · {tool} (MCP)");
     }
     let base = name.strip_prefix("workspace_").unwrap_or(name).replace('_', " ");
     let mut c = base.chars();
