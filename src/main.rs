@@ -8105,6 +8105,19 @@ pub async fn run_chat(
                                 }
                                 _ => {}
                             }
+                        } else if !app.slash_open()
+                            && matches!(k.code, KeyCode::Up | KeyCode::Down | KeyCode::Tab | KeyCode::Enter | KeyCode::Esc)
+                            && !ctrl
+                            && app.mention_open()
+                        {
+                            // ----- @ file mention menu -----
+                            match k.code {
+                                KeyCode::Up => app.mention_move(true),
+                                KeyCode::Down => app.mention_move(false),
+                                KeyCode::Tab | KeyCode::Enter => app.mention_complete(),
+                                KeyCode::Esc => app.input_insert_char(' '),
+                                _ => {}
+                            }
                         } else if app.slash_open()
                             && matches!(k.code, KeyCode::Up | KeyCode::Down | KeyCode::Tab | KeyCode::Enter | KeyCode::Esc)
                             && !ctrl

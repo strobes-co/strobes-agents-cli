@@ -345,6 +345,10 @@ pub struct App {
     /// One-shot footer hint ("Press Ctrl-C again to exit", …) and when it
     /// was armed; it expires after a couple of seconds.
     armed: Option<(Armed, std::time::Instant)>,
+    /// `@` file mentions: files under the launch directory (relative paths),
+    /// listed lazily the first time `@` is typed.
+    mention_files: Option<Vec<String>>,
+    mention_sel: usize,
     /// Big pastes, shown in the prompt as "[Pasted text #n +L lines]" and
     /// expanded back when the message is sent.
     pastes: Vec<String>,
@@ -390,6 +394,37 @@ pub fn builtin_command(name: &str) -> Option<&'static str> {
         other => other,
     };
     BUILTIN_COMMANDS.iter().find(|(c, _)| *c == n).map(|(c, _)| *c)
+}
+
+/// Files under the current directory for `@` mentions — relative paths,
+/// skipping VCS/build/dependency dirs, capped so a huge tree stays instant.
+fn list_mention_files() -> Vec<String> {
+    const SKIP: &[&str] = &[".git", "node_modules", "target", "dist", "build", ".venv", "venv", "__pycache__", ".next", ".cache", "Library"];
+    let root = match std::env::current_dir() { Ok(d) => d, Err(_) => return Vec::new() };
+    let mut out = Vec::new();
+    let mut stack = vec![(root.clone(), 0usize)];
+    while let Some((dir, depth)) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        let mut entries: Vec<_> = rd.flatten().collect();
+        entries.sort_by_key(|e| e.file_name());
+        for e in entries {
+            let name = e.file_name().to_string_lossy().to_string();
+            let Ok(ft) = e.file_type() else { continue };
+            if ft.is_dir() {
+                if depth < 8 && !SKIP.contains(&name.as_str()) && !(name.starts_with('.') && depth == 0 && name != ".github") {
+                    stack.push((e.path(), depth + 1));
+                }
+            } else if ft.is_file() {
+                if let Ok(rel) = e.path().strip_prefix(&root) {
+                    out.push(rel.to_string_lossy().replace('\\', "/"));
+                }
+            }
+            if out.len() >= 5000 {
+                return out;
+            }
+        }
+    }
+    out
 }
 
 fn history_path() -> Option<std::path::PathBuf> {
@@ -494,6 +529,8 @@ impl App {
             show_help: false,
             armed: None,
             pastes: Vec::new(),
+            mention_files: None,
+            mention_sel: 0,
             history: load_prompt_history(),
             hist_pos: None,
         };
@@ -1460,6 +1497,8 @@ impl App {
             }
             if self.slash_open() {
                 self.draw_slash_popup(f, chunks[0]);
+            } else if self.mention_open_now() {
+                self.draw_mention_popup(f, chunks[0]);
             }
         }
         if let Some(l) = self.activity_line() {
@@ -1662,6 +1701,10 @@ impl App {
     pub fn input_insert_char(&mut self, c: char) {
         self.input.insert(self.input_cursor, c);
         self.input_cursor += c.len_utf8();
+        if c == '@' {
+            self.mention_sel = 0;
+            let _ = self.mention_open(); // list files on first use
+        }
     }
 
     /// Insert a block of text (e.g. a bracketed paste) at the cursor.
@@ -1999,7 +2042,7 @@ impl App {
             }
         } else if self.select_mode {
             "  select mode — drag to select, ⌘C copies · ctrl+s to exit".to_string()
-        } else if self.slash_open() {
+        } else if self.slash_open() || self.mention_open_now() {
             "  ↑↓ select · tab/enter complete · esc cancel".to_string()
         } else if self.input.starts_with('!') {
             "  ! bash mode — runs locally in the agent's sandbox, not sent to the agent".to_string()
@@ -2032,9 +2075,10 @@ impl App {
 
     /// The `?` shortcuts panel (replaces the footer until the next key).
     fn help_lines(&self) -> Vec<Line<'static>> {
-        let rows: [(&str, &str, &str, &str); 7] = [
+        let rows: [(&str, &str, &str, &str); 8] = [
             ("/", "commands", "ctrl+p", "model"),
             ("!", "run a shell command locally", "ctrl+l", "local files"),
+            ("@", "mention a file in this folder", "ctrl+e", "open workspace folder"),
             ("esc", "interrupt the agent", "ctrl+w", "workspaces"),
             ("ctrl+c", "clear input · twice to quit", "ctrl+f", "findings"),
             ("ctrl+j", "newline (shift+enter on kitty)", "ctrl+o", "expand tool output"),
@@ -2608,6 +2652,103 @@ impl App {
             out.push('\n');
         }
         out
+    }
+
+    // ---- @ file mentions -----------------------------------------------
+
+    /// The `@query` word the cursor is at the end of, if any.
+    fn mention_query(&self) -> Option<(usize, &str)> {
+        let before = &self.input[..self.input_cursor];
+        let start = before.rfind(|c: char| c.is_whitespace()).map(|i| i + 1).unwrap_or(0);
+        let word = &before[start..];
+        let q = word.strip_prefix('@')?;
+        // "@" inside an email-ish word isn't a mention.
+        if start > 0 && !before[..start].ends_with(char::is_whitespace) {
+            return None;
+        }
+        Some((start, q))
+    }
+
+    fn mention_matches(&self) -> Vec<String> {
+        let Some((_, q)) = self.mention_query() else { return Vec::new() };
+        let Some(files) = &self.mention_files else { return Vec::new() };
+        let q = q.to_lowercase();
+        // Filename hits rank above path hits; shorter paths first.
+        let mut hits: Vec<(u8, &String)> = files
+            .iter()
+            .filter_map(|f| {
+                let lf = f.to_lowercase();
+                let name = lf.rsplit('/').next().unwrap_or(&lf);
+                if q.is_empty() || name.starts_with(&q) {
+                    Some((0, f))
+                } else if name.contains(&q) {
+                    Some((1, f))
+                } else if lf.contains(&q) {
+                    Some((2, f))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        hits.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.len().cmp(&b.1.len())));
+        hits.into_iter().take(8).map(|(_, f)| f.clone()).collect()
+    }
+
+    /// True while an `@` completion menu should show (loads the file list
+    /// on first use).
+    pub fn mention_open(&mut self) -> bool {
+        if self.mention_query().is_none() || self.pending.is_some() {
+            return false;
+        }
+        if self.mention_files.is_none() {
+            self.mention_files = Some(list_mention_files());
+        }
+        !self.mention_matches().is_empty()
+    }
+
+    fn mention_open_now(&self) -> bool {
+        self.mention_query().is_some() && self.pending.is_none() && !self.mention_matches().is_empty()
+    }
+
+    pub fn mention_move(&mut self, up: bool) {
+        let n = self.mention_matches().len();
+        if n > 0 {
+            self.mention_sel = if up { (self.mention_sel + n - 1) % n } else { (self.mention_sel + 1) % n };
+        }
+    }
+
+    /// Replace the `@query` word with the chosen file's path (absolute, so the
+    /// agent's local tools can open it from any working directory).
+    pub fn mention_complete(&mut self) {
+        let m = self.mention_matches();
+        let Some(pick) = m.get(self.mention_sel.min(m.len().saturating_sub(1))).cloned() else { return };
+        let Some((start, _)) = self.mention_query() else { return };
+        let abs = std::env::current_dir().map(|d| d.join(&pick)).unwrap_or_else(|_| pick.clone().into());
+        let rep = format!("@{} ", abs.display());
+        self.input.replace_range(start..self.input_cursor, &rep);
+        self.input_cursor = start + rep.len();
+        self.mention_sel = 0;
+    }
+
+    fn draw_mention_popup(&self, f: &mut Frame, above: Rect) {
+        let m = self.mention_matches();
+        if m.is_empty() {
+            return;
+        }
+        let h = (m.len() as u16 + 2).min(above.height);
+        let area = Rect { x: above.x, y: above.y + above.height.saturating_sub(h), width: above.width, height: h };
+        let sel = self.mention_sel.min(m.len() - 1);
+        let items: Vec<ListItem> = m.iter().map(|p| ListItem::new(Line::from(Span::styled(p.clone(), Style::default().fg(Color::Gray))))).collect();
+        let mut state = ListState::default();
+        state.select(Some(sel));
+        let list = List::new(items)
+            .block(TuiBlock::default().borders(Borders::ALL)
+                .border_type(ratatui::widgets::BorderType::Rounded)
+                .border_style(Style::default().fg(Color::DarkGray)))
+            .highlight_style(Style::default().fg(Color::White).bg(Color::Rgb(40, 44, 52)).add_modifier(Modifier::BOLD))
+            .highlight_symbol("› ");
+        f.render_widget(ratatui::widgets::Clear, area);
+        f.render_stateful_widget(list, area, &mut state);
     }
 
     // ---- slash-command autocomplete -----------------------------------
@@ -3554,6 +3695,22 @@ mod input_editor_tests {
         assert_eq!(a.pending.as_ref().unwrap().answers.get("depth"), Some(&Value::from("deep")));
         a.decline_interrupt();
         assert!(a.pending.is_none());
+    }
+
+    #[test]
+    fn mention_completes_to_absolute_path() {
+        let mut a = app();
+        a.mention_files = Some(vec!["src/app.rs".into(), "src/main.rs".into(), "README.md".into()]);
+        a.input_insert_str("review @mai");
+        assert!(a.mention_open());
+        assert_eq!(a.mention_matches(), vec!["src/main.rs".to_string()]);
+        a.mention_complete();
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(a.input, format!("review @{} ", cwd.join("src/main.rs").display()));
+        // An email isn't a mention.
+        a.input_clear();
+        a.input_insert_str("mail me@exa");
+        assert!(a.mention_query().is_none());
     }
 
     #[test]
