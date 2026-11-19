@@ -6,6 +6,7 @@
 //! its tools locally (the user's machine is the sandbox).
 
 mod analyzer_registry;
+mod jobs;
 mod api;
 mod app;
 mod browser;
@@ -7483,6 +7484,8 @@ fn describe(ev: &pulse::AppEvent) -> String {
         Progress(p) => format!("progress: {p:?}"),
         Credits { credits, tokens, final_run } => format!("credits {credits:.4} tokens {tokens} final={final_run}"),
         Context(p) => format!("context {p:.1}%"),
+        LocalLine { call_id, line } => format!("local[{}] {line}", &call_id[..8.min(call_id.len())]),
+        JobDone { job, exit, command } => format!("job #{job} done exit={exit:?} {command}"),
         Error(e) => format!("error: {e}"),
         LocalToolDone { name, ms, exit, err } => {
             format!("local tool {name} done {ms}ms exit={exit:?} err={err:?}")
@@ -7996,6 +7999,7 @@ fn run_builtin(cmd: &str, app: &mut App, handle: &mut pulse::PulseHandle, defer:
         "findings" => *defer = Some(Defer::Findings),
         "approvals" => *defer = Some(Defer::Approvals),
         "files" => *defer = Some(Defer::Files),
+        "jobs" => *defer = Some(Defer::Jobs),
         "copy" => match copy_to_clipboard(&app.transcript_plaintext()) {
             Ok(_) => app.notice("copied transcript to clipboard"),
             Err(e) => app.on_app_event(pulse::AppEvent::Error(format!("copy failed: {e}"))),
@@ -8037,6 +8041,8 @@ enum Defer {
     Models,
     /// `!cmd` — run a shell command locally, outside the agent.
     Bash(String),
+    /// /jobs overlay.
+    Jobs,
 }
 
 /// Result of a `Defer::{Workspaces,Threads,Findings,Approvals}` list fetch,
@@ -8385,6 +8391,17 @@ pub async fn run_chat(
                                 // Type-to-search in the workspace/thread/model pickers.
                                 KeyCode::Backspace if app.overlay_searchable() => app.overlay_filter_pop(),
                                 KeyCode::Char(c) if !ctrl && app.overlay_searchable() => app.overlay_filter_push(c),
+                                // /jobs: x stops the selected command, r refreshes.
+                                KeyCode::Char('x') if app.overlay_kind() == Some(app::OverlayKind::Jobs) => {
+                                    if let Some(id) = app.overlay_current_action().and_then(|a| a.parse::<u32>().ok()) {
+                                        if jobs::kill(id) {
+                                            app.notice(&format!("stopping job #{id}"));
+                                        }
+                                        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                                        app.open_jobs();
+                                    }
+                                }
+                                KeyCode::Char('r') if app.overlay_kind() == Some(app::OverlayKind::Jobs) => app.open_jobs(),
                                 // vim-style j/k nav only where there's no search.
                                 KeyCode::Char('k') if !ctrl => app.overlay_move(true),
                                 KeyCode::Char('j') if !ctrl => app.overlay_move(false),
@@ -8483,10 +8500,15 @@ pub async fn run_chat(
                                 // Esc: interrupt a running turn; else snap back
                                 // to the bottom if scrolled; else (twice) clear
                                 // the prompt.
+                                KeyCode::Esc if !app.running && jobs::foreground_running() > 0 => {
+                                    let n = jobs::kill_foreground();
+                                    app.notice(&format!("stopped {n} running command{}", if n == 1 { "" } else { "s" }));
+                                }
                                 KeyCode::Esc => {
                                     if app.running {
                                         handle.cancel();
                                         app.cancel_requested = true;
+                                        jobs::kill_foreground();
                                         app.status = "interrupting…".into();
                                     } else if app.is_pinned() {
                                         app.jump_to_bottom();
@@ -8505,6 +8527,7 @@ pub async fn run_chat(
                                     if app.running {
                                         handle.cancel();
                                         app.cancel_requested = true;
+                                        jobs::kill_foreground();
                                         app.status = "interrupting…".into();
                                     } else if !app.input.is_empty() {
                                         app.input_clear();
@@ -8516,6 +8539,11 @@ pub async fn run_chat(
                                     }
                                 }
                                 KeyCode::Char('d') if ctrl && app.input.is_empty() => quit = true,
+                                // Ctrl-B: move the running local command to the background.
+                                KeyCode::Char('b') if ctrl => match jobs::detach_latest() {
+                                    Some(id) => app.notice(&format!("moved to the background as job #{id} — the agent carries on · /jobs to check on it")),
+                                    None => app.notice("no local command is running — ctrl+b backgrounds one while it runs"),
+                                },
                                 KeyCode::Char('?') if app.input.is_empty() => app.show_help = true,
                                 KeyCode::Char('t') if ctrl => app.show_thinking = !app.show_thinking,
                                 // Ctrl-R searches history (as in Claude Code / shells);
@@ -8721,6 +8749,7 @@ pub async fn run_chat(
         needs_draw |= redraw;
 
         if quit {
+            jobs::kill_all();
             break Ok(());
         }
 
@@ -8863,6 +8892,7 @@ pub async fn run_chat(
                     .collect();
                 app.open_overlay(app::OverlayKind::Models, "Select AI model  (^P toggle)".into(), items);
             }
+            Some(Defer::Jobs) => app.open_jobs(),
             Some(Defer::Bash(cmd)) => {
                 let id = app.bash_started(&cmd);
                 let dtx = defer_tx.clone();
@@ -8871,13 +8901,18 @@ pub async fn run_chat(
                 if let Some(ws) = &ws {
                     input["_workspace_id"] = serde_json::json!(ws);
                 }
+                let ctx = jobs::RunCtx {
+                    call_id: id.clone(),
+                    label: cmd.lines().next().unwrap_or("").to_string(),
+                    sink: pulse::job_sink(app_tx.clone()),
+                };
                 tokio::spawn(async move {
                     // Same workspace mirror sync as the agent's own commands.
                     let sandbox = local::sandbox_dir_for(input.get("_thread_id").and_then(|v| v.as_str()));
                     if let Some(ws) = ws.as_deref() {
                         wsync::before(ws, &sandbox).await;
                     }
-                    let r = local::run_tool("execute_command", &input).await;
+                    let r = local::run_tool_ctx("execute_command", &input, Some(ctx)).await;
                     if let Some(ws) = ws.as_deref() {
                         wsync::after(ws, &sandbox).await;
                     }

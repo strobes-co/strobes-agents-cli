@@ -5,7 +5,6 @@
 //! are reported as unsupported by this TUI build (shell sandbox is the core).
 
 use std::path::PathBuf;
-use std::process::Stdio;
 use tokio::process::Command;
 
 /// Result of a local tool execution, shaped for the `tool.local_result` /
@@ -58,7 +57,14 @@ pub fn sandbox_dir() -> PathBuf {
 
 
 /// Route a proxied tool call to the right local executor.
+#[allow(dead_code)]
 pub async fn run_tool(tool_name: &str, input: &serde_json::Value) -> LocalResult {
+    run_tool_ctx(tool_name, input, None).await
+}
+
+/// `run_tool` with live output / background / kill support for commands
+/// (see `crate::jobs`).
+pub async fn run_tool_ctx(tool_name: &str, input: &serde_json::Value, ctx: Option<crate::jobs::RunCtx>) -> LocalResult {
     // Each task runs in its own thread; the thread_id is injected by pulse.rs.
     // We use it to key an isolated sandbox directory per task.
     let thread_id = input.get("_thread_id").and_then(|v| v.as_str());
@@ -73,7 +79,7 @@ pub async fn run_tool(tool_name: &str, input: &serde_json::Value) -> LocalResult
     match tool_name {
         "execute_command" => {
             let cmd = input.get("command").and_then(|v| v.as_str()).unwrap_or("");
-            run_shell(cmd, &sandbox, home.as_deref()).await
+            run_shell(cmd, &sandbox, home.as_deref(), ctx).await
         }
         "execute_code" => {
             let code = input.get("code").and_then(|v| v.as_str()).unwrap_or("");
@@ -81,7 +87,7 @@ pub async fn run_tool(tool_name: &str, input: &serde_json::Value) -> LocalResult
                 .get("language")
                 .and_then(|v| v.as_str())
                 .unwrap_or("python");
-            run_code(code, lang, &sandbox, home.as_deref()).await
+            run_code(code, lang, &sandbox, home.as_deref(), ctx).await
         }
         "workspace_get_meta" => LocalResult {
             output: meta_json(&sandbox),
@@ -121,7 +127,7 @@ fn shell_quote(v: &str) -> String {
     format!("'{}'", v.replace('\'', "'\\''"))
 }
 
-async fn run_shell(command: &str, sandbox: &std::path::Path, home: Option<&std::path::Path>) -> LocalResult {
+async fn run_shell(command: &str, sandbox: &std::path::Path, home: Option<&std::path::Path>, ctx: Option<crate::jobs::RunCtx>) -> LocalResult {
     let _ = std::fs::create_dir_all(sandbox);
     // Use the native shell: cmd.exe on Windows, login bash elsewhere.
     // Prepend the pack INSIDE the shell, not via `Command::env`.
@@ -155,16 +161,17 @@ async fn run_shell(command: &str, sandbox: &std::path::Path, home: Option<&std::
     // reset arbitrary env vars, so this one does survive `bash -lc`.
     cmd.env("STROBES_SURFACE", "cli_local");
     with_workspace_home(&mut cmd, home);
-    let out = cmd
-        .current_dir(sandbox)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .await;
-    finish(out)
+    cmd.current_dir(sandbox);
+    streamed(cmd, ctx, sandbox).await
 }
 
-async fn run_code(code: &str, lang: &str, sandbox: &std::path::Path, home: Option<&std::path::Path>) -> LocalResult {
+/// Run through the job runner (live output, Ctrl-B background, interrupt).
+async fn streamed(cmd: Command, ctx: Option<crate::jobs::RunCtx>, sandbox: &std::path::Path) -> LocalResult {
+    let r = crate::jobs::run_streaming(cmd, ctx, sandbox).await;
+    LocalResult { output: r.output, exit_code: r.exit_code, error: r.error, captured_network: vec![] }
+}
+
+async fn run_code(code: &str, lang: &str, sandbox: &std::path::Path, home: Option<&std::path::Path>, ctx: Option<crate::jobs::RunCtx>) -> LocalResult {
     // The pack's standalone interpreter when one is installed (it has boto3,
     // curl_cffi, reportlab, strobes_pt … baked in); otherwise the host launcher,
     // `python` on Windows and `python3` elsewhere.
@@ -195,7 +202,7 @@ async fn run_code(code: &str, lang: &str, sandbox: &std::path::Path, home: Optio
     }
     let mut cmd = Command::new(program);
     with_workspace_home(&mut cmd, home);
-    let out = cmd
+    cmd
         .args(&args)
         .arg(&file)
         .envs(
@@ -209,13 +216,10 @@ async fn run_code(code: &str, lang: &str, sandbox: &std::path::Path, home: Optio
         // present, assume local" safety net, which a stray inherited
         // STROBES_SANDBOX=1 could silently defeat.
         .env("STROBES_SURFACE", "cli_local")
-        .current_dir(sandbox)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .await;
+        .current_dir(sandbox);
+    let r = streamed(cmd, ctx, sandbox).await;
     let _ = tokio::fs::remove_file(&file).await;
-    finish(out)
+    r
 }
 
 fn finish(out: std::io::Result<std::process::Output>) -> LocalResult {
@@ -333,7 +337,7 @@ mod surface_marker_tests {
     /// STROBES_SANDBOX=1 could silently defeat.
     #[tokio::test]
     async fn run_code_sets_the_cli_local_surface_marker() {
-        let result = run_code("echo \"$STROBES_SURFACE\"", "bash", &sandbox(), None).await;
+        let result = run_code("echo \"$STROBES_SURFACE\"", "bash", &sandbox(), None, None).await;
         assert_eq!(result.error, None, "unexpected error: {:?}", result.error);
         assert_eq!(result.output.trim(), "cli_local");
     }
@@ -344,7 +348,7 @@ mod surface_marker_tests {
         // own profile and may add its own output — assert containment, not an
         // exact match, so this doesn't depend on the test environment's shell
         // profile being silent.
-        let result = run_shell("echo \"STROBES_SURFACE=$STROBES_SURFACE\"", &sandbox(), None).await;
+        let result = run_shell("echo \"STROBES_SURFACE=$STROBES_SURFACE\"", &sandbox(), None, None).await;
         assert_eq!(result.error, None, "unexpected error: {:?}", result.error);
         assert!(
             result.output.contains("STROBES_SURFACE=cli_local"),

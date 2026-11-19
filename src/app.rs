@@ -78,6 +78,8 @@ enum ToolStatus {
 /// One transcript entry.
 /// Max lines of a code/command tool call shown before a "ctrl+o" hint.
 const CODE_PREVIEW_LINES: usize = 5;
+/// Live output lines shown under a running local command.
+const LIVE_TAIL_LINES: usize = 3;
 /// Lines of a tool's output shown under the call before "+N lines".
 const RESULT_PREVIEW_LINES: usize = 3;
 
@@ -227,6 +229,8 @@ pub enum OverlayKind {
     Models,
     /// Ctrl-R: search previously sent prompts.
     History,
+    /// /jobs: local background commands.
+    Jobs,
 }
 
 /// One row in an overlay browser. `detail` lines are shown when the row is
@@ -374,6 +378,9 @@ pub struct App {
     context_pct: Option<f64>,
     /// Sub-agent runs, each with its own transcript (see Block::SubAgent).
     subs: Vec<SubAgentRun>,
+    /// Latest output lines of running local commands, by tool-call id.
+    live_tails: HashMap<String, std::collections::VecDeque<String>>,
+    live_gen: u64,
     /// Set while replaying history, so new sub-agent groups are marked.
     replaying: bool,
     /// Big pastes, shown in the prompt as "[Pasted text #n +L lines]" and
@@ -403,6 +410,7 @@ pub const BUILTIN_COMMANDS: &[(&str, &str)] = &[
     ("findings", "Browse this workspace's findings"),
     ("approvals", "Review pending approvals"),
     ("files", "Browse the workspace's local files"),
+    ("jobs", "Background commands: status, output, stop (alias /bg)"),
     ("copy", "Copy the transcript to the clipboard"),
     ("thinking", "Show or hide the agent's reasoning"),
     ("markdown", "Toggle rendered / raw markdown"),
@@ -419,6 +427,7 @@ pub fn builtin_command(name: &str) -> Option<&'static str> {
         "quit" | "q" => "exit",
         "threads" | "chats" => "resume",
         "workspaces" | "ws" => "workspace",
+        "bg" | "tasks" => "jobs",
         "models" => "model",
         "?" | "h" => "help",
         other => other,
@@ -593,6 +602,8 @@ impl App {
             bash_seq: 0,
             context_pct: None,
             subs: Vec::new(),
+            live_tails: HashMap::new(),
+            live_gen: 0,
             replaying: false,
             history: load_prompt_history(),
             hist_pos: None,
@@ -903,6 +914,25 @@ impl App {
                 self.follow = true;
             }
             AppEvent::Context(p) => self.context_pct = Some(p),
+            AppEvent::LocalLine { call_id, line } => {
+                let tail = self.live_tails.entry(call_id).or_default();
+                let line = line.replace('\r', "");
+                if !line.trim().is_empty() {
+                    tail.push_back(truncate(line.trim_end(), 300));
+                    while tail.len() > LIVE_TAIL_LINES {
+                        tail.pop_front();
+                    }
+                    self.live_gen += 1;
+                }
+            }
+            AppEvent::JobDone { job, exit, command } => {
+                let how = match exit {
+                    Some(0) => "finished".to_string(),
+                    Some(c) => format!("exited {c}"),
+                    None => "stopped".to_string(),
+                };
+                self.notice(&format!("background job #{job} {how} — {} · /jobs to view", truncate(&command, 60)));
+            }
             AppEvent::Notice(n) => self.notice(&n),
             AppEvent::Progress(Some(msg)) => self.set_busy(msg),
             AppEvent::Progress(None) => self.clear_busy(),
@@ -1409,6 +1439,7 @@ impl App {
             }
             None => 0u8.hash(&mut h),
         }
+        self.live_gen.hash(&mut h);
         self.show_thinking.hash(&mut h);
         self.markdown.hash(&mut h);
         self.show_full_code.hash(&mut h);
@@ -1460,8 +1491,18 @@ impl App {
                 }
                 Block::Thinking(s) => self.render_thinking(s, &mut out),
                 Block::Plain(l) => out.push(l.clone()),
-                Block::Tool { name, detail, status, .. } => {
-                    // Dot: blinks while running, green when done, red on failure.
+                Block::Tool { name, detail, status, local_id, call_id, .. } => {
+                    // Live tail of a running local command (rendered after the call line).
+                    let live: Vec<String> = if *status == ToolStatus::Running {
+                        [local_id, call_id]
+                            .iter()
+                            .filter_map(|id| id.as_ref().and_then(|i| self.live_tails.get(i)))
+                            .next()
+                            .map(|t| t.iter().cloned().collect())
+                            .unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    };
                     let dot_style = match status {
                         ToolStatus::Running => {
                             // ~3 ticks per state → a calm ≈0.7s blink cycle.
@@ -1506,6 +1547,13 @@ impl App {
                             spans.push(Span::styled(")".to_string(), dim));
                         }
                         out.push(Line::from(spans));
+                    }
+                    for (i, l) in live.iter().enumerate() {
+                        let lead = if i == 0 { "  ⎿  " } else { "     " };
+                        out.push(Line::from(Span::styled(
+                            format!("{lead}{l}"),
+                            Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+                        )));
                     }
                 }
                 Block::Rule(label) => {
@@ -2232,6 +2280,9 @@ impl App {
             if self.run_tokens > 0 {
                 parts.push(format!("↓ {}", fmt_tokens(self.run_tokens)));
             }
+            if crate::jobs::foreground_running() > 0 {
+                parts.push("ctrl+b to background".into());
+            }
             parts.push("esc to interrupt".into());
             // What the agent is doing right now, most specific first.
             let running_tool = self.blocks.iter().rev().take(3).find_map(|b| match b {
@@ -2269,12 +2320,16 @@ impl App {
         let dim = Style::default().fg(Color::DarkGray);
         let left = if let Some(a) = self.armed_now() {
             match a {
-                Armed::Quit => "  Press Ctrl-C again to exit".to_string(),
+                Armed::Quit => match crate::jobs::background_running() {
+                    0 => "  Press Ctrl-C again to exit".to_string(),
+                    n => format!("  Press Ctrl-C again to exit (stops {n} background job{})", if n == 1 { "" } else { "s" }),
+                },
                 Armed::ClearInput => "  Esc again to clear".to_string(),
             }
         } else if self.overlay.is_some() {
             let search = if self.overlay_searchable() { "type to filter · " } else { "" };
-            format!("  {search}↑↓ select · enter open · esc back")
+            let extra = if self.overlay_kind() == Some(OverlayKind::Jobs) { " · x stop · r refresh" } else { "" };
+            format!("  {search}↑↓ select · enter open{extra} · esc back")
         } else if self.pending.is_some() && !self.pending_choices().is_empty() {
             "  ↑↓ or 1-9 to choose · enter to confirm · esc to decline".to_string()
         } else if self.pending.is_some() {
@@ -2338,7 +2393,7 @@ impl App {
 
     /// The shortcuts table: two columns when it fits, else one.
     fn help_lines_for(&self, width: u16) -> Vec<Line<'static>> {
-        let rows: [(&str, &str, &str, &str); 9] = [
+        let rows: [(&str, &str, &str, &str); 10] = [
             ("/", "commands", "ctrl+p", "model"),
             ("!", "run a shell command locally", "ctrl+l", "local files"),
             ("@", "mention a file in this folder", "ctrl+e", "open workspace folder"),
@@ -2348,6 +2403,7 @@ impl App {
             ("↑ / ↓", "previous prompts", "ctrl+t", "show thinking"),
             ("pgup/pgdn", "scroll the chat", "ctrl+y", "copy transcript"),
             ("ctrl+r", "search prompt history", "ctrl+s", "select mode (copy text)"),
+            ("ctrl+b", "run the current command in background", "/jobs", "background commands"),
         ];
         let key = Style::default().fg(Color::White);
         let dim = Style::default().fg(Color::DarkGray);
@@ -2843,6 +2899,56 @@ impl App {
         )
     }
 
+    /// The selected overlay row's action id.
+    pub fn overlay_current_action(&self) -> Option<String> {
+        let o = self.overlay.as_ref()?;
+        let i = o.current()?;
+        o.items.get(i).and_then(|it| it.action.clone())
+    }
+
+    /// /jobs: local commands (newest first) with status and log tail.
+    pub fn open_jobs(&mut self) {
+        let jobs = crate::jobs::list();
+        if jobs.is_empty() {
+            self.notice("no local commands yet — press ctrl+b while one runs to move it to the background");
+            return;
+        }
+        let items: Vec<OverlayItem> = jobs
+            .iter()
+            .map(|j| {
+                let el = fmt_elapsed(j.finished.unwrap_or_else(std::time::Instant::now) - j.started);
+                let state = if j.running() {
+                    if j.background { format!("⟳ background {el}") } else { format!("⟳ running {el}") }
+                } else if j.stopped {
+                    format!("✗ stopped · {el}")
+                } else {
+                    let bg = if j.background { " (background)" } else { "" };
+                    match j.exit {
+                        Some(0) => format!("✓ done{bg} · {el}"),
+                        Some(c) => format!("✗ exit {c}{bg} · {el}"),
+                        None => format!("done{bg} · {el}"),
+                    }
+                };
+                let cmd = if j.command.is_empty() { "(command)".to_string() } else { j.command.clone() };
+                let mut detail = vec![cmd.clone(), state.clone()];
+                if let Some(log) = &j.log {
+                    detail.push(format!("log: {}", log.display()));
+                    detail.push(String::new());
+                    detail.extend(crate::jobs::tail(j.id, 60));
+                } else if j.running() {
+                    detail.push(String::new());
+                    detail.push("Running in the foreground — the agent is waiting on it. ctrl+b moves it to the background.".into());
+                }
+                if j.running() {
+                    detail.push(String::new());
+                    detail.push("x stops it".into());
+                }
+                OverlayItem { label: format!("#{}  {state}   {}", j.id, truncate(&cmd, 80)), detail, action: Some(j.id.to_string()) }
+            })
+            .collect();
+        self.open_overlay(OverlayKind::Jobs, "Local commands".into(), items);
+    }
+
     /// Ctrl-R: a searchable list of sent prompts, newest first.
     pub fn open_history_search(&mut self) {
         let mut seen = std::collections::HashSet::new();
@@ -3252,7 +3358,7 @@ impl App {
     pub fn overlay_enter(&mut self) -> Option<(OverlayKind, String)> {
         let o = self.overlay.as_mut()?;
         match o.kind {
-            OverlayKind::Findings | OverlayKind::Approvals | OverlayKind::Files => {
+            OverlayKind::Findings | OverlayKind::Approvals | OverlayKind::Files | OverlayKind::Jobs => {
                 o.detail_open = !o.detail_open;
                 o.dscroll = 0;
                 None
@@ -3413,7 +3519,13 @@ impl App {
 
     /// Put a result under the call with this id. False if no call has it.
     fn attach_by_id(&mut self, id: Option<&str>, text: &str, failed: bool) -> bool {
+        let text = &humanize_job_note(text);
         let Some(i) = self.tool_by_id(id) else { return false };
+        if let Block::Tool { local_id, call_id, .. } = &self.blocks[i] {
+            for k in [local_id, call_id].into_iter().flatten() {
+                self.live_tails.remove(k);
+            }
+        }
         if let Block::Tool { status, .. } = &mut self.blocks[i] {
             if *status == ToolStatus::Running || failed {
                 *status = if failed { ToolStatus::Failed } else { ToolStatus::Done };
@@ -3479,6 +3591,7 @@ impl App {
     /// tool from that agent) and settle its dot; a duplicate report of the
     /// same output (wrapper + local mirror) is dropped.
     fn attach_tool_result(&mut self, agent: &str, name: &str, text: String, failed: bool) {
+        let text = humanize_job_note(&text);
         let label = tool_label(name);
         let lo = self.blocks.len().saturating_sub(40);
         let target = (lo..self.blocks.len()).find(|&i| matches!(&self.blocks[i],
@@ -3509,6 +3622,7 @@ impl App {
     /// Attach a tool's result under its call. The wrapper tool and the local
     /// execution it drives both report the same output; show it once.
     fn push_tool_result(&mut self, text: String, failed: bool) {
+        let text = humanize_job_note(&text);
         // Only a report repeated back-to-back is a duplicate; another call
         // that happens to return the same text keeps its own result.
         let dup = matches!(self.blocks.last(), Some(Block::ToolResult { text: t, .. }) if t.trim() == text.trim());
@@ -3659,6 +3773,23 @@ pub fn set_terminal_title(title: &str) {
         format!("✦ {}", truncate(title.trim(), 40))
     };
     let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::SetTitle(t));
+}
+
+/// The agent-facing "moved to the background" note (see jobs.rs) reads as
+/// a short status line for people: "⟳ running in the background · job #3".
+fn humanize_job_note(text: &str) -> String {
+    const MARK: &str = "[The user moved this command to the background — it is still running as job #";
+    let Some(start) = text.find(MARK) else { return text.to_string() };
+    let rest = &text[start + MARK.len()..];
+    let id: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    let end = rest.find("later.]").map(|i| start + MARK.len() + i + "later.]".len()).unwrap_or(text.len());
+    let mut out = text[..start].trim_end().to_string();
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    out.push_str(&format!("⟳ moved to the background · job #{id} · /jobs"));
+    out.push_str(&text[end..]);
+    out
 }
 
 /// Is `chunk` a server re-send of text already shown? Older servers race two
@@ -4310,6 +4441,13 @@ mod input_editor_tests {
         h.push_assistant("Strobes AI Supervisor".into(), "Hi!\n\nJust let me know how you'd like to proceed!".into());
         h.push_assistant("Strobes AI Supervisor".into(), "Just let me know how you'd like to proceed!".into());
         assert_eq!(h.transcript_plaintext().matches("proceed!").count(), 1);
+    }
+
+    #[test]
+    fn job_note_reads_as_a_status_line() {
+        let t = "line 1\nline 2\n\n[The user moved this command to the background — it is still running as job #7. Its full output is being written to /x/job-7.log. Continue with other work; read that file (e.g. tail it) to check progress or results later.]";
+        assert_eq!(humanize_job_note(t), "line 1\nline 2\n⟳ moved to the background · job #7 · /jobs");
+        assert_eq!(humanize_job_note("plain"), "plain");
     }
 
     #[test]

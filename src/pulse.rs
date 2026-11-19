@@ -70,6 +70,10 @@ pub enum AppEvent {
     Credits { credits: f64, tokens: i64, final_run: bool },
     /// Percent of the model's context window in use.
     Context(f64),
+    /// A live output line from a running local command (tool call id).
+    LocalLine { call_id: String, line: String },
+    /// A backgrounded local command finished.
+    JobDone { job: u32, exit: Option<i32>, command: String },
     Error(String),
 }
 
@@ -563,6 +567,16 @@ fn compact(v: &Value, limit: usize) -> String {
     }
 }
 
+/// Forward job events (live lines, background completion) to the UI.
+pub fn job_sink(app_tx: mpsc::UnboundedSender<AppEvent>) -> crate::jobs::Sink {
+    std::sync::Arc::new(move |e| {
+        let _ = app_tx.send(match e {
+            crate::jobs::JobEvent::Line { call_id, line } => AppEvent::LocalLine { call_id, line },
+            crate::jobs::JobEvent::Done { job, exit, command } => AppEvent::JobDone { job, exit, command },
+        });
+    })
+}
+
 fn handle_frame(v: Value, app_tx: &mpsc::UnboundedSender<AppEvent>, out_tx: &mpsc::UnboundedSender<String>, workspace_id: Option<&str>, thread_id: &str) {
     let mtype = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
     match mtype {
@@ -632,7 +646,7 @@ fn handle_frame(v: Value, app_tx: &mpsc::UnboundedSender<AppEvent>, out_tx: &mps
             agent,
             text: None,
             tool_name: Some(tool_name.clone()),
-            detail: Some(arg_summary),
+            detail: Some(arg_summary.clone()),
             status: Some("local_execute".into()),
             local: true,
             task_id: None, call_id: Some(request_id.clone()).filter(|r| !r.is_empty()),
@@ -649,7 +663,13 @@ fn handle_frame(v: Value, app_tx: &mpsc::UnboundedSender<AppEvent>, out_tx: &mps
             if let (true, Some(ws)) = (syncs, ws.as_deref()) {
                 crate::wsync::before(ws, &sandbox).await;
             }
-            let res = local::run_tool(&tool_name, &input).await;
+            // Commands stream live output and can be backgrounded/interrupted.
+            let ctx = syncs.then(|| crate::jobs::RunCtx {
+                call_id: request_id.clone(),
+                label: arg_summary.lines().next().unwrap_or("").to_string(),
+                sink: job_sink(app_tx.clone()),
+            });
+            let res = local::run_tool_ctx(&tool_name, &input, ctx).await;
             if let (true, Some(ws)) = (syncs, ws.as_deref()) {
                 crate::wsync::after(ws, &sandbox).await;
             }
