@@ -94,7 +94,16 @@ enum Block {
     /// only matching by tool NAME (as this used to) let one agent's
     /// completion event settle a same-named call that actually belonged to
     /// the other, leaving the real match stuck Running (blinking) forever.
-    Tool { name: String, detail: String, status: ToolStatus, agent: String },
+    Tool {
+        name: String,
+        detail: String,
+        status: ToolStatus,
+        agent: String,
+        /// Server call id (`callId`) and the local execution's request id —
+        /// whichever an event carries finds this call.
+        call_id: Option<String>,
+        local_id: Option<String>,
+    },
     /// The agent's self-managed to-do list, rendered as a checklist. Each
     /// add/complete/delete finds and updates THIS agent's existing Todos
     /// block in place rather than appending a fresh one — a checklist
@@ -498,10 +507,9 @@ impl App {
             Span::styled("Strobes Agents", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
             Span::styled(format!("  v{}", env!("CARGO_PKG_VERSION")), dim),
         ])));
-        self.blocks.push(Block::Plain(Line::from(Span::styled(
-            format!("  {}", self.auth_line.trim_start_matches("✔ authenticated · ")),
-            dim,
-        ))));
+        let host = self.base.split("://").nth(1).unwrap_or(&self.base).split('/').next().unwrap_or("").to_string();
+        let tenant = self.auth_line.split("tenant: ").nth(1).and_then(|t| t.split(" · ").next()).unwrap_or("").to_string();
+        self.blocks.push(Block::Plain(Line::from(Span::styled(format!("  {tenant} · {host}"), dim))));
         self.blocks.push(Block::Plain(Line::from(vec![
             Span::styled("  ", dim),
             Span::styled("/", Style::default().fg(Color::White)),
@@ -892,60 +900,45 @@ impl App {
                 if is_todo_tool(&name) {
                     return;
                 }
-                // One compact line per tool call: "⏺ name(args)". A tool often
-                // emits an empty `start` then a detailed `local_execute` for the
-                // same call — collapse them by replacing the previous line.
-                // The server's wrapper tool (e.g. workspace_execute_shell_command)
-                // and the local execution it triggers (execute_command) are one
-                // call to the reader: a local start, or a repeated start of a
-                // call still running, enriches that call instead of adding a line.
-                let open = self.blocks.iter().rev().take(4).position(|b| matches!(b,
-                    Block::Tool { status: ToolStatus::Running, agent: a, name: n, .. }
-                        if a == &agent && (item.local || n == &name)));
-                // The server also re-announces a wrapper call (with its args)
-                // after it finished: same tool, nothing but its result and
-                // reasoning since → it's the call already on screen.
-                let open = open.or_else(|| {
-                    let label = tool_label(&name);
-                    for (back, b) in self.blocks.iter().rev().take(4).enumerate() {
-                        match b {
-                            Block::ToolResult { .. } | Block::Thinking(_) => continue,
-                            Block::Tool { agent: a, name: n, detail: d, .. }
-                                if a == &agent && tool_label(n) == label
-                                    && (d.trim() == detail.trim() || d.trim().is_empty() || detail.trim().is_empty()) =>
-                            {
-                                return Some(back);
-                            }
-                            _ => return None,
-                        }
-                    }
-                    None
-                });
-                if open.is_some() {
-                    self.flush_stream();
+                // One line per call. The server sends an arg-less "early"
+                // start while the model streams arguments, then a full start;
+                // the local execution it triggers (execute_command for
+                // workspace_execute_shell_command) and a re-announce after it
+                // finished are the same call too. Fill/skip instead of adding.
+                self.flush_stream();
+                let id = item.call_id.clone();
+                if let Some(i) = self.tool_by_id(id.as_deref()) {
+                    // Known call: an early start getting its args, or a
+                    // re-announce. Its args also tell us whether a local
+                    // execution got paired with the wrong parallel call.
+                    self.settle_call_args(i, &detail);
+                    self.follow = true;
+                    return;
                 }
-                if let Some(back) = open {
-                    let i = self.blocks.len() - 1 - back;
-                    if let Block::Tool { detail: d, .. } = &mut self.blocks[i] {
-                        if d.trim().is_empty() && !detail.trim().is_empty() {
-                            *d = detail;
+                let found = self.match_tool_start(&agent, &name, &detail, item.local);
+                if let (Some(i), Some(new_id)) = (found, id.clone()) {
+                    if let Block::Tool { call_id, local_id, .. } = &mut self.blocks[i] {
+                        if item.local && local_id.is_none() {
+                            *local_id = Some(new_id);
+                        } else if !item.local && call_id.is_none() {
+                            *call_id = Some(new_id);
                         }
                     }
-                } else if self.last_tool.as_ref() == Some(&(agent.clone(), name.clone())) {
-                    // Same call from the same agent: enrich the earlier
-                    // (often empty) start in place.
-                    if let Some(Block::Tool { detail: d, .. }) = self.blocks.last_mut() {
-                        if !detail.is_empty() {
-                            *d = detail;
+                }
+                match found {
+                    Some(i) => {
+                        if let Block::Tool { detail: d, .. } = &mut self.blocks[i] {
+                            if d.trim().is_empty() && !detail.trim().is_empty() {
+                                *d = detail;
+                            }
                         }
-                    } else {
-                        self.blocks.push(Block::Tool { name: name.clone(), detail, status: ToolStatus::Running, agent: agent.clone() });
                     }
-                } else {
-                    self.flush_stream();
-                    self.blocks.push(Block::Tool { name: name.clone(), detail, status: ToolStatus::Running, agent: agent.clone() });
-                    self.last_task = None;
-                    self.last_tool = Some((agent, name));
+                    None => {
+                        let (call_id, local_id) = if item.local { (None, id) } else { (id, None) };
+                        self.blocks.push(Block::Tool { name: name.clone(), detail, status: ToolStatus::Running, agent: agent.clone(), call_id, local_id });
+                        self.last_task = None;
+                        self.last_tool = Some((agent, name));
+                    }
                 }
                 self.follow = true;
             }
@@ -975,12 +968,13 @@ impl App {
                         return;
                     }
                 }
-                // Result rendered as a dim child block under the tool call.
+                // Result rendered as a dim child block under ITS call.
                 let d = item.detail.unwrap_or_default();
                 let body = if d.is_empty() { "(ok)".to_string() } else { concise_tool_result(&d) };
                 self.flush_stream();
-                self.finish_last_tool(&agent, true); // dot → green
-                self.push_tool_result(body, false);
+                if !self.attach_by_id(item.call_id.as_deref(), &body, false) {
+                    self.attach_tool_result(&agent, &name, body, false);
+                }
                 self.last_tool = None;
                 self.follow = true;
             }
@@ -989,9 +983,12 @@ impl App {
                     self.last_tool = None;
                 }
                 let agent = item.agent.unwrap_or_else(|| "agent".into());
+                let name = item.tool_name.unwrap_or_default();
                 self.flush_stream();
-                self.finish_last_tool(&agent, false); // dot → red
-                self.push_tool_result(truncate(&item.detail.unwrap_or_default(), 600), true);
+                let text = truncate(&item.detail.unwrap_or_default(), 600);
+                if !self.attach_by_id(item.call_id.as_deref(), &text, true) {
+                    self.attach_tool_result(&agent, &name, text, true);
+                }
                 self.last_tool = None;
                 self.follow = true;
             }
@@ -1092,7 +1089,7 @@ impl App {
                     s.len().hash(&mut h);
                 }
                 Block::Plain(_) => 3u8.hash(&mut h),
-                Block::Tool { name, detail, status, agent } => {
+                Block::Tool { name, detail, status, agent, .. } => {
                     4u8.hash(&mut h);
                     name.len().hash(&mut h);
                     detail.len().hash(&mut h);
@@ -1178,7 +1175,7 @@ impl App {
                 }
                 Block::Thinking(s) => self.render_thinking(s, &mut out),
                 Block::Plain(l) => out.push(l.clone()),
-                Block::Tool { name, detail, status, agent: _ } => {
+                Block::Tool { name, detail, status, .. } => {
                     // Dot: blinks while running, green when done, red on failure.
                     let dot_style = match status {
                         ToolStatus::Running => {
@@ -1275,29 +1272,8 @@ impl App {
             if s.thinking {
                 if self.show_thinking {
                     self.render_thinking(&s.buf, &mut out);
-                } else {
-                    // Collapsed: animated dot + elapsed time + live token count.
-                    let on = (self.spinner / 3) % 2 == 0;
-                    let dot_style = Style::default()
-                        .fg(if on { Color::Magenta } else { Color::DarkGray })
-                        .add_modifier(Modifier::BOLD);
-                    let text_style = Style::default()
-                        .fg(Color::DarkGray)
-                        .add_modifier(Modifier::ITALIC);
-                    let el = self
-                        .run_started
-                        .map(|t| format!("  {}", fmt_elapsed(t.elapsed())))
-                        .unwrap_or_default();
-                    let tok = if self.run_tokens > 0 {
-                        format!("  {}", fmt_tokens(self.run_tokens))
-                    } else {
-                        String::new()
-                    };
-                    out.push(Line::from(vec![
-                        Span::styled("✻ ", dot_style),
-                        Span::styled(format!("thinking…{el}{tok}"), text_style),
-                    ]));
                 }
+                // Collapsed thinking shows on the activity line instead.
             } else {
                 let first = cur_agent.as_deref() != Some(s.agent.as_str());
                 if first {
@@ -1866,7 +1842,20 @@ impl App {
                 parts.push(format!("↓ {}", fmt_tokens(self.run_tokens)));
             }
             parts.push("esc to interrupt".into());
-            let what = self.task_label.clone().map(|t| truncate(&t, 48)).unwrap_or_else(|| "Working…".into());
+            // What the agent is doing right now, most specific first.
+            let running_tool = self.blocks.iter().rev().take(3).find_map(|b| match b {
+                Block::Tool { name, status: ToolStatus::Running, .. } => Some(tool_label(name)),
+                _ => None,
+            });
+            let what = if let Some(t) = running_tool {
+                format!("Running {t}…")
+            } else if matches!(&self.stream, Some(s) if s.thinking) {
+                "Thinking…".to_string()
+            } else if self.stream.is_some() {
+                "Writing…".to_string()
+            } else {
+                self.task_label.clone().map(|t| format!("{}…", truncate(&t, 48))).unwrap_or_else(|| "Working…".into())
+            };
             (what, format!(" ({})", parts.join(" · ")))
         } else if !self.connected && !self.status.is_empty() && self.status != "connecting…" {
             return Some(Line::from(Span::styled(
@@ -2263,8 +2252,11 @@ impl App {
                     // Same wrapper/local pairing as the live path: one call, one line.
                     let dup = self.blocks.iter().rev().take(3).any(|b| matches!(b,
                         Block::Tool { agent: a, detail: d, .. } if a == &agent && (d == &args || args.trim().is_empty())));
-                    if !dup {
-                        self.blocks.push(Block::Tool { name, detail: args, status: ToolStatus::Done, agent: agent.clone() });
+                    let cid = Some(pstr("callId")).filter(|c| !c.is_empty());
+                    if let Some(i) = self.tool_by_id(cid.as_deref()) {
+                        self.settle_call_args(i, &args);
+                    } else if !dup || cid.is_some() {
+                        self.blocks.push(Block::Tool { name, detail: args, status: ToolStatus::Done, agent: agent.clone(), call_id: cid, local_id: None });
                     }
                 }
                 "tool.output" => {
@@ -2273,11 +2265,17 @@ impl App {
                         None => "(ok)".to_string(),
                     };
                     let body = if body.is_empty() { "(ok)".to_string() } else { body };
-                    self.push_tool_result(body, false);
+                    let cid = pstr("callId");
+                    if !self.attach_by_id(Some(&cid), &body, false) {
+                        self.push_tool_result(body, false);
+                    }
                 }
                 "tool.failed" => {
-                    self.finish_last_tool(&agent, false);
-                    self.push_tool_result(pstr("error"), true);
+                    let cid = pstr("callId");
+                    if !self.attach_by_id(Some(&cid), &pstr("error"), true) {
+                        self.finish_last_tool(&agent, false);
+                        self.push_tool_result(pstr("error"), true);
+                    }
                 }
                 t if t.starts_with("task.") => {
                     let title = pstr("title");
@@ -2739,6 +2737,8 @@ impl App {
             detail: cmd.to_string(),
             status: ToolStatus::Running,
             agent: "__user__".into(),
+            call_id: None,
+            local_id: None,
         });
         self.follow = true;
         self.pinned = false;
@@ -2749,6 +2749,128 @@ impl App {
         self.finish_last_tool("__user__", ok);
         let text = if output.trim().is_empty() { "(no output)".to_string() } else { output };
         self.blocks.push(Block::ToolResult { text, failed: !ok });
+        self.follow = true;
+    }
+
+    /// The call an event's id refers to (server call id or local request id).
+    fn tool_by_id(&self, id: Option<&str>) -> Option<usize> {
+        let id = id.filter(|s| !s.is_empty())?;
+        let lo = self.blocks.len().saturating_sub(200);
+        (lo..self.blocks.len()).rev().find(|&i| matches!(&self.blocks[i],
+            Block::Tool { call_id, local_id, .. }
+                if call_id.as_deref() == Some(id) || local_id.as_deref() == Some(id)))
+    }
+
+    /// A known call announced its real args. Fill them in; if a local
+    /// execution with *those* args was paired with a different parallel call,
+    /// swap the two calls' server ids so each result lands where it belongs.
+    fn settle_call_args(&mut self, i: usize, args: &str) {
+        let args = args.trim();
+        if args.is_empty() {
+            return;
+        }
+        let (cur, label, agent) = match &self.blocks[i] {
+            Block::Tool { detail, name, agent, .. } => (detail.trim().to_string(), tool_label(name), agent.clone()),
+            _ => return,
+        };
+        if cur.is_empty() {
+            if let Block::Tool { detail, .. } = &mut self.blocks[i] {
+                *detail = args.to_string();
+            }
+            return;
+        }
+        if cur == args {
+            return;
+        }
+        let lo = self.blocks.len().saturating_sub(40);
+        let other = (lo..self.blocks.len()).find(|&j| j != i && matches!(&self.blocks[j],
+            Block::Tool { detail, name, agent: a, .. }
+                if detail.trim() == args && tool_label(name) == label && a == &agent));
+        if let Some(j) = other {
+            let ci = match &self.blocks[i] { Block::Tool { call_id, .. } => call_id.clone(), _ => None };
+            let cj = match &self.blocks[j] { Block::Tool { call_id, .. } => call_id.clone(), _ => None };
+            if let Block::Tool { call_id, .. } = &mut self.blocks[i] { *call_id = cj; }
+            if let Block::Tool { call_id, .. } = &mut self.blocks[j] { *call_id = ci; }
+        }
+    }
+
+    /// Put a result under the call with this id. False if no call has it.
+    fn attach_by_id(&mut self, id: Option<&str>, text: &str, failed: bool) -> bool {
+        let Some(i) = self.tool_by_id(id) else { return false };
+        if let Block::Tool { status, .. } = &mut self.blocks[i] {
+            if *status == ToolStatus::Running || failed {
+                *status = if failed { ToolStatus::Failed } else { ToolStatus::Done };
+            }
+        }
+        // One result per call: the wrapper and its local mirror both report.
+        if !matches!(self.blocks.get(i + 1), Some(Block::ToolResult { .. })) {
+            self.blocks.insert(i + 1, Block::ToolResult { text: text.to_string(), failed });
+        }
+        self.follow = true;
+        true
+    }
+
+    /// Index of an on-screen call that a new tool start belongs to, if any.
+    fn match_tool_start(&self, agent: &str, name: &str, detail: &str, local: bool) -> Option<usize> {
+        let label = tool_label(name);
+        let lo = self.blocks.len().saturating_sub(40);
+        let same = |n: &str| n == name || tool_label(n) == label;
+        // Oldest first, so parallel calls of one tool fill in order.
+        let running = (lo..self.blocks.len()).find(|&i| matches!(&self.blocks[i],
+            Block::Tool { status: ToolStatus::Running, agent: a, name: n, detail: d, local_id: l, call_id: c, .. }
+                if a == agent && same(n)
+                    && (if local { l.is_none() } else { c.is_none() })
+                    && (d.trim().is_empty() || (local && d.trim() == detail.trim()) || (local && detail.trim().is_empty()))));
+        if running.is_some() {
+            return running;
+        }
+        if local {
+            // A local execution whose wrapper already has its args.
+            return (lo..self.blocks.len()).find(|&i| matches!(&self.blocks[i],
+                Block::Tool { status: ToolStatus::Running, agent: a, name: n, local_id: None, .. } if a == agent && same(n)));
+        }
+        // Re-announce of a finished call: same tool and args, and nobody has
+        // spoken since.
+        for i in (lo..self.blocks.len()).rev() {
+            match &self.blocks[i] {
+                Block::User(_) | Block::Assistant { .. } => return None,
+                Block::Tool { agent: a, name: n, detail: d, status, .. }
+                    if *status != ToolStatus::Running && a == agent && same(n)
+                        && (d.trim() == detail.trim() || detail.trim().is_empty()) => return Some(i),
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// Put a result under the call it answers (oldest running call of that
+    /// tool from that agent) and settle its dot; a duplicate report of the
+    /// same output (wrapper + local mirror) is dropped.
+    fn attach_tool_result(&mut self, agent: &str, name: &str, text: String, failed: bool) {
+        let label = tool_label(name);
+        let lo = self.blocks.len().saturating_sub(40);
+        let target = (lo..self.blocks.len()).find(|&i| matches!(&self.blocks[i],
+            Block::Tool { status: ToolStatus::Running, agent: a, name: n, .. }
+                if a == agent && (n == name || tool_label(n) == label)))
+;
+        let Some(i) = target else {
+            // No call waiting: this is the second report of a finished call
+            // (wrapper + its local mirror) if that call already shows it.
+            let shown = (lo..self.blocks.len()).rev().any(|i| matches!(&self.blocks[i],
+                Block::Tool { agent: a, name: n, .. } if a == agent && tool_label(n) == label)
+                && matches!(self.blocks.get(i + 1), Some(Block::ToolResult { text: t, .. }) if t.trim() == text.trim()));
+            if !shown {
+                self.push_tool_result(text, failed);
+            }
+            return;
+        };
+        if let Block::Tool { status, .. } = &mut self.blocks[i] {
+            *status = if failed { ToolStatus::Failed } else { ToolStatus::Done };
+        }
+        let dup = matches!(self.blocks.get(i + 1), Some(Block::ToolResult { text: t, .. }) if t.trim() == text.trim());
+        if !dup {
+            self.blocks.insert(i + 1, Block::ToolResult { text, failed });
+        }
         self.follow = true;
     }
 
@@ -3128,6 +3250,128 @@ mod md_tests {
 #[cfg(test)]
 mod input_editor_tests {
     use super::*;
+
+    fn tool_ev(kind: &str, name: &str, detail: &str, local: bool) -> StreamItem {
+        StreamItem {
+            kind: kind.into(),
+            agent: Some("Strobes AI Supervisor".into()),
+            text: None,
+            tool_name: Some(name.into()),
+            detail: Some(detail.into()),
+            status: None,
+            local,
+            task_id: None, call_id: None,
+        }
+    }
+
+    /// (label, detail, result) for every tool call on screen, in order.
+    fn calls(a: &App) -> Vec<(String, String, Option<String>)> {
+        let mut out = Vec::new();
+        for (i, b) in a.blocks.iter().enumerate() {
+            if let Block::Tool { name, detail, .. } = b {
+                let r = match a.blocks.get(i + 1) {
+                    Some(Block::ToolResult { text, .. }) => Some(text.clone()),
+                    _ => None,
+                };
+                out.push((tool_label(name), detail.clone(), r));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn wrapper_local_and_reannounce_render_as_one_call() {
+        // The exact sequence the backend sends for one shell command.
+        let mut a = app();
+        a.on_stream(tool_ev("tool_start", "workspace_execute_shell_command", "", false));
+        a.on_stream(tool_ev("tool_start", "execute_command", "echo hi", true));
+        a.on_stream(tool_ev("tool_output", "execute_command", "\"hi\"", false));
+        a.on_stream(tool_ev("tool_start", "workspace_execute_shell_command", "echo hi", false));
+        a.on_stream(tool_ev("tool_output", "workspace_execute_shell_command", "\"hi\"", false));
+        assert_eq!(calls(&a), vec![("Shell".into(), "echo hi".into(), Some("hi".into()))]);
+    }
+
+    fn tool_id(kind: &str, name: &str, detail: &str, local: bool, id: &str) -> StreamItem {
+        StreamItem { call_id: Some(id.into()), ..tool_ev(kind, name, detail, local) }
+    }
+
+    #[test]
+    fn parallel_shell_calls_pair_results_by_id() {
+        // Captured from the backend: locals run (and finish) in the opposite
+        // order to the wrapper calls' announcement.
+        let mut a = app();
+        let w = "workspace_execute_shell_command";
+        a.on_stream(tool_id("tool_start", w, "", false, "A"));
+        a.on_stream(tool_id("tool_start", w, "", false, "B"));
+        a.on_stream(tool_id("tool_start", "execute_command", "date +%Y", true, "L1"));
+        a.on_stream(tool_id("tool_start", "execute_command", "uname -s", true, "L2"));
+        a.on_stream(tool_id("tool_output", "execute_command", "\"2026\"", false, "L1"));
+        a.on_stream(tool_id("tool_output", "execute_command", "\"Darwin\"", false, "L2"));
+        a.on_stream(tool_id("tool_start", w, "uname -s", false, "A"));
+        a.on_stream(tool_id("tool_start", w, "date +%Y", false, "B"));
+        a.on_stream(tool_id("tool_output", w, "\"2026\"", false, "B"));
+        a.on_stream(tool_id("tool_output", w, "\"Darwin\"", false, "A"));
+        let mut c = calls(&a);
+        c.sort();
+        assert_eq!(c, vec![
+            ("Shell".into(), "date +%Y".into(), Some("2026".into())),
+            ("Shell".into(), "uname -s".into(), Some("Darwin".into())),
+        ]);
+    }
+
+    #[test]
+    fn parallel_calls_keep_their_own_results() {
+        let mut a = app();
+        // Early (arg-less) starts for three parallel calls, then full ones.
+        for _ in 0..3 {
+            a.on_stream(tool_ev("tool_start", "complete_task", "", false));
+        }
+        for t in ["t1", "t2", "t3"] {
+            a.on_stream(tool_ev("tool_start", "complete_task", t, false));
+        }
+        a.on_stream(tool_ev("tool_start", "write_table", "todos", false));
+        a.on_stream(tool_ev("tool_output", "write_table", "\"no table\"", false));
+        for t in ["done 1", "done 2", "done 3"] {
+            a.on_stream(tool_ev("tool_output", "complete_task", &format!("\"{t}\""), false));
+        }
+        let c = calls(&a);
+        assert_eq!(c.len(), 4, "{c:?}");
+        assert_eq!(c[0], ("Complete task".into(), "t1".into(), Some("done 1".into())));
+        assert_eq!(c[2], ("Complete task".into(), "t3".into(), Some("done 3".into())));
+        assert_eq!(c[3], ("Write table".into(), "todos".into(), Some("no table".into())));
+    }
+
+    #[test]
+    fn replayed_segment_token_is_dropped() {
+        let mut a = app();
+        let tok = |t: &str| StreamItem {
+            kind: "token".into(), agent: Some("Strobes AI Supervisor".into()), text: Some(t.into()),
+            tool_name: None, detail: None, status: None, local: false, task_id: None, call_id: None,
+        };
+        a.on_stream(tok("Hello there, "));
+        a.on_stream(tok("friend."));
+        a.on_stream(tok("Hello there, friend."));
+        assert_eq!(a.stream.as_ref().map(|s| s.buf.as_str()), Some("Hello there, friend."));
+    }
+
+    #[test]
+    fn builtin_commands_resolve_aliases() {
+        assert_eq!(builtin_command("clear"), Some("new"));
+        assert_eq!(builtin_command("quit"), Some("exit"));
+        assert_eq!(builtin_command("api-pentest"), None);
+    }
+
+    #[test]
+    fn big_paste_becomes_placeholder_and_expands() {
+        let mut a = app();
+        let big = (1..=10).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        a.input_insert_str("see: ");
+        a.input_paste(&big);
+        assert_eq!(a.input, "see: [Pasted text #1 +10 lines]");
+        assert_eq!(a.expand_pastes(&a.input.clone()), format!("see: {big}"));
+        a.input_paste("small");
+        assert!(a.input.ends_with("small"));
+    }
 
     fn app() -> App {
         App::new("t".into(), "http://x".into(), "ten".into(), "org".into())

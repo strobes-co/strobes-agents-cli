@@ -32,6 +32,9 @@ pub struct StreamItem {
     pub status: Option<String>,
     pub local: bool,
     pub task_id: Option<String>,
+    /// Tool-call id (`callId` on server tool events, `requestId` on local
+    /// executions) so results land under the call they answer.
+    pub call_id: Option<String>,
 }
 
 /// A single form field requested by `request_human_input`.
@@ -563,7 +566,7 @@ fn handle_frame(v: Value, app_tx: &mpsc::UnboundedSender<AppEvent>, out_tx: &mps
                 let _ = app_tx.send(AppEvent::Stream(StreamItem {
                     kind: "note".into(), agent: None,
                     text: Some("queued — will be injected after the current turn".into()),
-                    tool_name: None, detail: None, status: None, local: false, task_id: None,
+                    tool_name: None, detail: None, status: None, local: false, task_id: None, call_id: None,
                 }));
             } else {
                 let _ = app_tx.send(AppEvent::RunStarted);
@@ -626,7 +629,7 @@ fn handle_frame(v: Value, app_tx: &mpsc::UnboundedSender<AppEvent>, out_tx: &mps
             detail: Some(arg_summary),
             status: Some("local_execute".into()),
             local: true,
-            task_id: None,
+            task_id: None, call_id: Some(request_id.clone()).filter(|r| !r.is_empty()),
         }));
         let app_tx = app_tx.clone();
         let out_tx = out_tx.clone();
@@ -676,7 +679,7 @@ fn handle_frame(v: Value, app_tx: &mpsc::UnboundedSender<AppEvent>, out_tx: &mps
         );
         let _ = app_tx.send(AppEvent::Stream(StreamItem {
             kind: "approval".into(), agent, text: sval(&b, "preview"),
-            tool_name: None, detail: sval(&b, "module"), status: Some("requested".into()), local: false, task_id: None,
+            tool_name: None, detail: sval(&b, "module"), status: Some("requested".into()), local: false, task_id: None, call_id: None,
         }));
         return;
     }
@@ -705,7 +708,7 @@ fn handle_frame(v: Value, app_tx: &mpsc::UnboundedSender<AppEvent>, out_tx: &mps
             Some(other) => {
                 let _ = app_tx.send(AppEvent::Stream(StreamItem {
                     kind: "note".into(), agent: None, text: Some(format!("interrupt {other}")),
-                    tool_name: None, detail: None, status: None, local: false, task_id: None,
+                    tool_name: None, detail: None, status: None, local: false, task_id: None, call_id: None,
                 }));
             }
             None => {}
@@ -736,7 +739,7 @@ fn handle_frame(v: Value, app_tx: &mpsc::UnboundedSender<AppEvent>, out_tx: &mps
                 let _ = app_tx.send(AppEvent::Stream(StreamItem {
                     kind: "task".into(), agent, text: Some(title),
                     tool_name: None, detail: None, status: Some(status),
-                    local: false, task_id: tid,
+                    local: false, task_id: tid, call_id: None,
                 }));
             }
         }
@@ -753,12 +756,12 @@ fn handle_frame(v: Value, app_tx: &mpsc::UnboundedSender<AppEvent>, out_tx: &mps
         "token" => Some(StreamItem {
             kind: "token".into(), agent,
             text: sval(&v, "content").or_else(|| sval(&b, "text")).or_else(|| sval(&b, "content")),
-            tool_name: None, detail: None, status: None, local: false, task_id: None,
+            tool_name: None, detail: None, status: None, local: false, task_id: None, call_id: None,
         }),
         "thinking" => Some(StreamItem {
             kind: "thinking".into(), agent,
             text: sval(&v, "content").or_else(|| sval(&b, "text")).or_else(|| sval(&b, "content")),
-            tool_name: None, detail: None, status: None, local: false, task_id: None,
+            tool_name: None, detail: None, status: None, local: false, task_id: None, call_id: None,
         }),
         "tool" => {
             let name = sval(&b, "toolName");
@@ -767,7 +770,7 @@ fn handle_frame(v: Value, app_tx: &mpsc::UnboundedSender<AppEvent>, out_tx: &mps
                     let detail = tool_detail(name.as_deref().unwrap_or(""), b.get("arguments").unwrap_or(&Value::Null));
                     Some(StreamItem {
                         kind: "tool_start".into(), agent, text: None, tool_name: name,
-                        detail: Some(detail), status: Some("start".into()), local: false, task_id: None,
+                        detail: Some(detail), status: Some("start".into()), local: false, task_id: None, call_id: sval(&b, "callId").or_else(|| sval(&b, "call_id")).or_else(|| sval(&b, "requestId")),
                     })
                 }
                 Some("output") => {
@@ -790,12 +793,12 @@ fn handle_frame(v: Value, app_tx: &mpsc::UnboundedSender<AppEvent>, out_tx: &mps
                     Some(StreamItem {
                         kind: "tool_output".into(), agent, text: None, tool_name: name,
                         detail: Some(detail),
-                        status: b.get("durationMs").map(|d| format!("{d}ms")), local: false, task_id: None,
+                        status: b.get("durationMs").map(|d| format!("{d}ms")), local: false, task_id: None, call_id: sval(&b, "callId").or_else(|| sval(&b, "call_id")).or_else(|| sval(&b, "requestId")),
                     })
                 }
                 Some("failed") => Some(StreamItem {
                     kind: "tool_failed".into(), agent, text: None, tool_name: name,
-                    detail: sval(&b, "error"), status: Some("failed".into()), local: false, task_id: None,
+                    detail: sval(&b, "error"), status: Some("failed".into()), local: false, task_id: None, call_id: sval(&b, "callId").or_else(|| sval(&b, "call_id")).or_else(|| sval(&b, "requestId")),
                 }),
                 _ => None,
             }
@@ -804,23 +807,23 @@ fn handle_frame(v: Value, app_tx: &mpsc::UnboundedSender<AppEvent>, out_tx: &mps
             kind: "task".into(), agent,
             text: sval(&b, "title").or_else(|| sval(&b, "taskId")),
             tool_name: None, detail: sval(&b, "error"), status: sval(&b, "status"), local: false,
-            task_id: sval(&v, "taskId").or_else(|| sval(&b, "taskId")),
+            task_id: sval(&v, "taskId").or_else(|| sval(&b, "taskId")), call_id: None,
         }),
         "artifact" => Some(StreamItem {
             kind: "note".into(), agent,
             text: Some(format!("artifact {}: {}", sval(&b, "status").unwrap_or_default(), sval(&b, "name").unwrap_or_default())),
-            tool_name: None, detail: sval(&b, "downloadUrl"), status: None, local: false, task_id: None,
+            tool_name: None, detail: sval(&b, "downloadUrl"), status: None, local: false, task_id: None, call_id: None,
         }),
         "system" => {
             let kind = sval(&b, "type").unwrap_or_default();
             Some(StreamItem {
                 kind: "system".into(), agent, text: Some(kind),
-                tool_name: None, detail: None, status: None, local: false, task_id: None,
+                tool_name: None, detail: None, status: None, local: false, task_id: None, call_id: None,
             })
         }
         s if s.starts_with("run.") => Some(StreamItem {
             kind: "system".into(), agent, text: Some(s.to_string()),
-            tool_name: None, detail: None, status: None, local: false, task_id: None,
+            tool_name: None, detail: None, status: None, local: false, task_id: None, call_id: None,
         }),
         _ => None,
     };

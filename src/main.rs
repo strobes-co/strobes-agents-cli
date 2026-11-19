@@ -1981,26 +1981,21 @@ fn spawn_workspace_sync(
     std::env::set_var("STROBES_AI_SANDBOX", &dir);
     std::env::set_var("STROBES_AI_WORKSPACE_ID", &ws_id);
 
+    // Already mirrored: nothing worth saying (/files shows them).
     if workspace_is_synced(&dir) {
-        let _ = tx.send(pulse::AppEvent::Notice(format!(
-            "workspace files at {} (cached)", dir.display()
-        )));
         return;
     }
 
     tokio::spawn(async move {
-        let _ = tx.send(pulse::AppEvent::Notice("syncing workspace files locally…".into()));
-        match sync_workspace_sandbox(&profile, &ws_id).await {
-            Ok(WorkspaceSyncOutcome::Synced(n)) => {
-                let _ = tx.send(pulse::AppEvent::Notice(format!(
-                    "✔ synced {n} workspace files → {}", dir.display()
-                )));
+        // Progress on the activity line, not the transcript.
+        let _ = tx.send(pulse::AppEvent::Progress(Some("Syncing workspace files…".into())));
+        let r = sync_workspace_sandbox(&profile, &ws_id).await;
+        let _ = tx.send(pulse::AppEvent::Progress(None));
+        match r {
+            Ok(WorkspaceSyncOutcome::Synced(n)) if n > 0 => {
+                let _ = tx.send(pulse::AppEvent::Notice(format!("synced {n} workspace files (/files to browse)")));
             }
-            Ok(WorkspaceSyncOutcome::Empty) => {
-                let _ = tx.send(pulse::AppEvent::Notice(
-                    "workspace has no files yet — nothing to sync".into(),
-                ));
-            }
+            Ok(_) => {}
             Err(e) => { let _ = tx.send(pulse::AppEvent::Error(format!("workspace sync failed: {e}"))); }
         }
     });
