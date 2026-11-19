@@ -407,6 +407,8 @@ pub const BUILTIN_COMMANDS: &[(&str, &str)] = &[
     ("thinking", "Show or hide the agent's reasoning"),
     ("markdown", "Toggle rendered / raw markdown"),
     ("status", "Show tenant, workspace, chat and usage"),
+    ("login", "Sign in through the browser (switch org/workspace)"),
+    ("logout", "Sign out of this tenant"),
     ("exit", "Quit (alias /quit)"),
 ];
 
@@ -609,7 +611,7 @@ impl App {
     fn push_banner(&mut self) {
         let dim = Style::default().fg(Color::DarkGray);
         self.blocks.push(Block::Plain(Line::from(vec![
-            Span::styled("✻ ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::styled("✦ ", Style::default().fg(STROBES_GREEN).add_modifier(Modifier::BOLD)),
             Span::styled("Strobes Agents", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
             Span::styled(format!("  v{}", env!("CARGO_PKG_VERSION")), dim),
         ])));
@@ -1667,7 +1669,7 @@ impl App {
         let body = Style::default()
             .fg(Color::DarkGray)
             .add_modifier(Modifier::BOLD | Modifier::ITALIC);
-        out.push(Line::from(Span::styled("✻ thinking", header)));
+        out.push(Line::from(Span::styled("✦ thinking", header)));
         for l in s.split('\n') {
             out.push(Line::from(Span::styled(format!("  {l}"), body)));
         }
@@ -2211,10 +2213,9 @@ impl App {
     }
 
     /// The line above the prompt while something is in flight:
-    /// "✻ Working… (12s · ◈ 0.012 cr · esc to interrupt)". None when idle.
+    /// "✦ Working… (12s · esc to interrupt)". None when idle.
     fn activity_line(&self) -> Option<Line<'static>> {
-        const SPIN: [&str; 6] = ["✻", "✺", "✹", "✸", "✷", "✶"];
-        let glyph = SPIN[(self.spinner / 2) % SPIN.len()];
+        let (glyph, glyph_style) = strobie_frame(self.spinner);
         let (label, extra) = if let Some(msg) = &self.loading {
             (format!("{msg}…"), String::new())
         } else if let Some(msg) = &self.busy {
@@ -2252,8 +2253,8 @@ impl App {
             return None;
         };
         Some(Line::from(vec![
-            Span::styled(format!(" {glyph} "), Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
-            Span::styled(label, Style::default().fg(Color::Magenta)),
+            Span::styled(format!(" {glyph} "), glyph_style),
+            Span::styled(label, Style::default().fg(STROBES_GREEN)),
             Span::styled(extra, Style::default().fg(Color::DarkGray)),
         ]))
     }
@@ -3546,7 +3547,7 @@ fn default_choice(p: &Pending) -> usize {
 fn hang_indent(text: &str) -> usize {
     let ws = text.chars().take_while(|c| *c == ' ').count();
     let rest = &text[ws..];
-    for m in ["⏺ ", "⎿  ", "> ", "• ", "- ", "* ", "◆ ", "? ", "✻ "] {
+    for m in ["⏺ ", "⎿  ", "> ", "• ", "- ", "* ", "◆ ", "? ", "✦ "] {
         if rest.starts_with(m) {
             return ws + m.chars().count();
         }
@@ -3651,7 +3652,7 @@ pub fn set_terminal_title(title: &str) {
     let t = if title.trim().is_empty() || title == "CLI session" {
         "strobes".to_string()
     } else {
-        format!("✻ {}", truncate(title.trim(), 40))
+        format!("✦ {}", truncate(title.trim(), 40))
     };
     let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::SetTitle(t));
 }
@@ -3661,6 +3662,23 @@ fn is_cancel_receipt(md: &str) -> bool {
     // e.g. "\n\n---\n**Run cancelled.** Completed 0 operations …"
     let t = md.trim().trim_start_matches(|c: char| matches!(c, '─' | '-' | '*' | '_') || c.is_whitespace());
     t.starts_with("Run cancelled") || t.starts_with("Run canceled")
+}
+
+/// Strobes brand green (#42BE65) and its glow tint (#6FDC8C).
+pub const STROBES_GREEN: Color = Color::Rgb(66, 190, 101);
+pub const STROBES_GLOW: Color = Color::Rgb(111, 220, 140);
+
+/// Strobie — the Strobes mascot, a green four-point star — as the working
+/// indicator: it holds, then twinkles (outline ✧ + glow) like a blink.
+/// `tick` advances every 120 ms.
+pub fn strobie_frame(tick: usize) -> (&'static str, Style) {
+    const FRAMES: [(&str, bool); 8] = [
+        ("✦", false), ("✦", false), ("✦", false), ("✦", true),
+        ("✧", true), ("✦", true), ("✦", false), ("✦", false),
+    ];
+    let (g, glow) = FRAMES[tick % FRAMES.len()];
+    let color = if glow { STROBES_GLOW } else { STROBES_GREEN };
+    (g, Style::default().fg(color).add_modifier(Modifier::BOLD))
 }
 
 /// The orchestrator is "the assistant" — it needs no name tag; sub-agents do.
@@ -3736,7 +3754,7 @@ fn win_glyph(c: char) -> Option<&'static str> {
         return None;
     }
     Some(match c {
-        '●' | '◆' | '⏺' | '◇' | '✻' | '✺' | '✹' | '✸' | '✷' | '✶' | '◈' | '⛁' | '⊞' | '◐' | '★' => "*",
+        '●' | '◆' | '⏺' | '◇' | '✻' | '✺' | '✹' | '✸' | '✷' | '✶' | '✦' | '✧' | '◈' | '⛁' | '⊞' | '◐' | '★' => "*",
         '○' => "o",
         '⎿' => "L",
         '▷' | '➤' | '›' | '❯' | '↪' => ">",

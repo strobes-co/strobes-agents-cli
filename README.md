@@ -98,7 +98,22 @@ cp target/release/strobes /usr/local/bin/
 Requirements: **Rust** (`rustup`). Chrome/Chromium is optional — only needed
 for the `browser_*` tools in chat and DAST scanning.
 
-## Configure
+## Sign in
+
+```bash
+strobes login            # opens your browser: pick the organization and workspace, click Authorize
+strobes login --key      # headless/CI: paste a MasterKey instead
+strobes logout
+```
+
+`strobes login` asks for your Strobes URL (default `https://app.strobes.co`, then
+whatever you used last), shows a code, and opens the browser. Confirm the code,
+choose the organization and workspace, and the CLI is configured — no keys to
+copy. Inside the chat, `/login` switches org/workspace the same way. Set
+`STROBES_NO_BROWSER=1` to just print the link (SSH), and `--web-url` /
+`STROBES_WEB_URL` when the web app isn't served from the API host (local dev).
+
+## Configure (MasterKey)
 
 Get a MasterKey from **Strobes UI → Organization → API access**:
 
@@ -374,6 +389,7 @@ on your machine. Type `/` for commands and `?` for shortcuts.
 | `/model` | Choose the AI model |
 | `/findings` · `/approvals` · `/files` | Browse the workspace |
 | `/copy` · `/status` · `/thinking` · `/exit` | Copy transcript · where you are · show reasoning · quit |
+| `/login` · `/logout` | Sign in through the browser (switch org/workspace) · sign out |
 | `!<command>` | Run a shell command locally in the agent's sandbox |
 | `@<file>` | Mention a file from the current folder (inserts its path) |
 

@@ -34,6 +34,13 @@ pub struct Profile {
     /// other, so this is its own explicit field rather than a guess.
     #[serde(default)]
     pub analyzer_registry_url: Option<String>,
+    /// The Strobes URL last used with `strobes login` (e.g.
+    /// https://app.strobes.co) — the default next time.
+    #[serde(default)]
+    pub login_url: Option<String>,
+    /// Signed-in user (from browser login), shown by `strobes status`.
+    #[serde(default)]
+    pub email: Option<String>,
 }
 
 fn default_deployment() -> String {

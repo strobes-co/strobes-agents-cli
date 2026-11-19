@@ -231,9 +231,18 @@ enum Cmd {
         #[arg(long)]
         new: bool,
     },
-    /// Configure credentials interactively (or pass flags to skip prompts).
+    /// Sign in through the browser (or `--key` to paste a MasterKey).
     Login {
-        /// Deployment base URL, e.g. https://app.strobes.co
+        /// Paste a MasterKey instead of signing in through the browser.
+        #[arg(long)]
+        key: bool,
+        /// Strobes URL to sign in to (default: your last one, else https://app.strobes.co).
+        #[arg(long, value_name = "URL")]
+        url: Option<String>,
+        /// Web app URL, when it isn't the API host (e.g. http://localhost:3000).
+        #[arg(long, value_name = "URL")]
+        web_url: Option<String>,
+        /// Deployment base URL, e.g. https://app.strobes.co (with --key).
         #[arg(long)]
         base_url: Option<String>,
         /// Organization UUID.
@@ -253,6 +262,8 @@ enum Cmd {
         #[arg(long)]
         no_verify: bool,
     },
+    /// Forget this tenant's credentials.
+    Logout,
     /// Update the CLI to the latest release (downloads + replaces the binary).
     Update {
         /// Reinstall even if already on the latest version.
@@ -1008,9 +1019,8 @@ async fn main() -> Result<()> {
         // continue straight into the chat.
         let mut profile = profile;
         if !profile.is_complete() {
-            println!("Welcome to Strobes Agents! Let's connect to your organization.");
-            println!("Get a MasterKey from Strobes → Organization → API access.\n");
-            cmd_login(&mut cfg, &tenant, None, None, None, None, None, false).await?;
+            println!("Welcome to Strobes Agents! Let's sign you in.\n");
+            browser_login(&mut cfg, &tenant, None, None).await?;
             cfg = Config::load();
             profile = cfg.profile_for(&tenant);
             if !profile.is_complete() {
@@ -1020,7 +1030,37 @@ async fn main() -> Result<()> {
         }
         let mut terminal = ratatui::init();
         enable_mouse();
-        let r = chat_flow(&mut terminal, &mut cfg, &tenant, profile, launch, cli.workspace.clone(), cli.model, None, initial).await;
+        let mut r = chat_flow(&mut terminal, &mut cfg, &tenant, profile, launch, cli.workspace.clone(), cli.model, None, initial).await;
+        // `/login` / `/logout` leave the TUI to run in the plain terminal.
+        loop {
+            let after = AFTER_CHAT.lock().unwrap().take();
+            match after {
+                Some(AfterChat::Login) => {
+                    disable_mouse();
+                    ratatui::restore();
+                    match browser_login(&mut cfg, &tenant, None, None).await {
+                        Ok(()) => {
+                            cfg = Config::load();
+                            let profile = cfg.profile_for(&tenant);
+                            terminal = ratatui::init();
+                            enable_mouse();
+                            r = chat_flow(&mut terminal, &mut cfg, &tenant, profile, Launch::Fresh, None, cli.model, None, None).await;
+                        }
+                        Err(e) => {
+                            eprintln!("  {e}");
+                            return Ok(());
+                        }
+                    }
+                }
+                Some(AfterChat::Logout) => {
+                    disable_mouse();
+                    ratatui::restore();
+                    let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::SetTitle(""));
+                    return cmd_logout(&mut cfg, &tenant);
+                }
+                None => break,
+            }
+        }
         disable_mouse();
         ratatui::restore();
         let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::SetTitle(""));
@@ -1028,9 +1068,15 @@ async fn main() -> Result<()> {
     }
 
     match cli.cmd.unwrap() {
-        Cmd::Login { base_url, org_id, master_key, deployment, analyzer_registry_url, no_verify } => {
-            cmd_login(&mut cfg, &tenant, base_url, org_id, master_key, deployment, analyzer_registry_url, no_verify).await
+        Cmd::Login { key, url, web_url, base_url, org_id, master_key, deployment, analyzer_registry_url, no_verify } => {
+            // Any key-style flag (or --key) keeps the paste-a-MasterKey flow.
+            if key || base_url.is_some() || org_id.is_some() || master_key.is_some() {
+                cmd_login(&mut cfg, &tenant, base_url, org_id, master_key, deployment, analyzer_registry_url, no_verify).await
+            } else {
+                browser_login(&mut cfg, &tenant, url, web_url).await
+            }
         }
+        Cmd::Logout => cmd_logout(&mut cfg, &tenant),
         Cmd::Update { force } => cmd_update(force).await,
         Cmd::Tenants => cmd_tenants(&cfg),
         Cmd::Credits { workspace, thread } => cmd_credits(&profile, workspace, thread).await,
@@ -7480,6 +7526,218 @@ fn prompt_line(label: &str, current: &str, secret: bool) -> Result<String> {
 
 /// Configure the active profile's credentials. Any field passed as a flag is
 /// used verbatim; the rest are prompted for interactively.
+/// Set by `/login` and `/logout` inside the chat: leave the TUI, then do it.
+static AFTER_CHAT: std::sync::Mutex<Option<AfterChat>> = std::sync::Mutex::new(None);
+
+#[derive(Clone, Copy, PartialEq)]
+enum AfterChat {
+    Login,
+    Logout,
+}
+
+/// API root (`…/api/v1`) for a Strobes URL the user typed.
+fn api_v1_for(url: &str) -> String {
+    let mut u = url.trim().trim_end_matches('/').to_string();
+    if !u.starts_with("http://") && !u.starts_with("https://") {
+        u = format!("https://{u}");
+    }
+    if u.ends_with("/api") { format!("{u}/v1") } else { format!("{u}/api/v1") }
+}
+
+/// Web app URL for a Strobes URL (same host unless overridden).
+fn web_for(url: &str) -> String {
+    let mut u = url.trim().trim_end_matches('/').to_string();
+    if !u.starts_with("http://") && !u.starts_with("https://") {
+        u = format!("https://{u}");
+    }
+    u.trim_end_matches("/api").to_string()
+}
+
+fn open_browser(url: &str) -> bool {
+    // Headless/SSH sessions (and tests) just print the link.
+    if std::env::var("STROBES_NO_BROWSER").is_ok() {
+        return false;
+    }
+    let cmd = if cfg!(target_os = "macos") {
+        ("open", vec![url])
+    } else if cfg!(windows) {
+        ("cmd", vec!["/C", "start", "", url])
+    } else {
+        ("xdg-open", vec![url])
+    };
+    std::process::Command::new(cmd.0)
+        .args(cmd.1)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// `strobes login`: sign in through the browser — approve, pick the org and
+/// workspace in the web app, and the CLI is configured. (Server side:
+/// strobes/agents/views/cli_auth_views.py.)
+async fn browser_login(cfg: &mut Config, tenant: &str, url: Option<String>, web_url: Option<String>) -> Result<()> {
+    use std::io::{IsTerminal, Write};
+    let current = cfg.profile_for(tenant);
+    let remembered = current.login_url.clone().filter(|u| !u.is_empty());
+    let url = match url {
+        Some(u) => u,
+        None if std::io::stdin().is_terminal() => {
+            let def = remembered.clone().unwrap_or_else(|| "https://app.strobes.co".into());
+            let typed = prompt_line("Strobes URL", &def, false)?;
+            if typed.trim().is_empty() { def } else { typed }
+        }
+        None => remembered.unwrap_or_else(|| "https://app.strobes.co".into()),
+    };
+    let api = api_v1_for(&url);
+    let web = web_url
+        .or_else(|| std::env::var("STROBES_WEB_URL").ok().filter(|w| !w.is_empty()))
+        .map(|w| w.trim_end_matches('/').to_string())
+        .unwrap_or_else(|| web_for(&url));
+    let insecure = !current.verify_tls || std::env::var("STROBES_INSECURE").is_ok();
+    let http = reqwest::Client::builder()
+        .danger_accept_invalid_certs(insecure)
+        .user_agent(concat!("strobes-cli/", env!("CARGO_PKG_VERSION")))
+        .timeout(std::time::Duration::from_secs(20))
+        .build()?;
+
+    let host = std::process::Command::new("hostname").output().ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    let who = std::env::var("USER").or_else(|_| std::env::var("USERNAME")).unwrap_or_default();
+    let client_name = match (who.is_empty(), host.is_empty()) {
+        (false, false) => format!("{who}@{host}"),
+        (true, false) => host,
+        _ => "strobes CLI".into(),
+    };
+    let start: serde_json::Value = match http
+        .post(format!("{api}/cli/auth/device/"))
+        .json(&serde_json::json!({ "client_name": client_name }))
+        .send()
+        .await
+    {
+        Ok(r) if r.status().is_success() => r.json().await?,
+        Ok(r) if r.status().as_u16() == 404 => {
+            return Err(anyhow!(
+                "{url} doesn't support browser sign-in yet — use `strobes login --key` with a MasterKey"
+            ))
+        }
+        Ok(r) => return Err(anyhow!("couldn't start sign-in at {url} (HTTP {})", r.status())),
+        Err(e) => return Err(anyhow!("couldn't reach {url}: {e}")),
+    };
+    let s = |k: &str| start.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let (device_code, user_code) = (s("device_code"), s("user_code"));
+    let link = format!("{web}{}", s("verification_path"));
+    let interval = start.get("interval").and_then(|v| v.as_u64()).unwrap_or(2).max(1);
+    let expires = start.get("expires_in").and_then(|v| v.as_u64()).unwrap_or(600);
+
+    let opened = open_browser(&link);
+    println!();
+    println!("  {}", if opened { "Opened your browser to sign in." } else { "Open this link to sign in:" });
+    println!("  \x1b[4m{link}\x1b[0m");
+    println!();
+    println!("  Confirm the code matches:  \x1b[1m{user_code}\x1b[0m");
+    println!("  Then pick your organization and workspace, and click Authorize.");
+    println!();
+
+    const SPIN: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(expires);
+    let mut tick = 0usize;
+    let mut next_poll = std::time::Instant::now();
+    let creds = loop {
+        if std::time::Instant::now() >= deadline {
+            print!("\r\x1b[2K");
+            return Err(anyhow!("sign-in timed out — run `strobes login` again"));
+        }
+        print!("\r\x1b[2K  {} Waiting for you to authorize in the browser… (Ctrl-C to cancel)", SPIN[tick % SPIN.len()]);
+        let _ = std::io::stdout().flush();
+        tick += 1;
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                print!("\r\x1b[2K");
+                return Err(anyhow!("sign-in cancelled"));
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+        }
+        if std::time::Instant::now() < next_poll {
+            continue;
+        }
+        next_poll = std::time::Instant::now() + std::time::Duration::from_secs(interval);
+        let resp = http
+            .post(format!("{api}/cli/auth/device/token/"))
+            .json(&serde_json::json!({ "device_code": device_code }))
+            .send()
+            .await;
+        let Ok(resp) = resp else { continue }; // transient network error: keep waiting
+        let ok = resp.status().is_success();
+        let body: serde_json::Value = resp.json().await.unwrap_or_default();
+        if ok {
+            break body;
+        }
+        match body.get("error").and_then(|e| e.as_str()).unwrap_or("") {
+            "authorization_pending" | "" => {}
+            "access_denied" => {
+                print!("\r\x1b[2K");
+                return Err(anyhow!("sign-in was denied in the browser"));
+            }
+            "expired_token" => {
+                print!("\r\x1b[2K");
+                return Err(anyhow!("sign-in expired — run `strobes login` again"));
+            }
+            other => {
+                print!("\r\x1b[2K");
+                return Err(anyhow!("sign-in failed: {other}"));
+            }
+        }
+    };
+    print!("\r\x1b[2K");
+
+    let g = |k: &str| creds.get(k).and_then(|v| v.as_str()).map(String::from);
+    let api_base = g("api_base_url").unwrap_or_else(|| api.trim_end_matches("/v1").to_string());
+    let had_default = cfg.has_default();
+    {
+        let p = cfg.profile_mut(tenant);
+        let same_org = p.org_id == g("organization_id").unwrap_or_default();
+        p.base_url = api_base.trim_end_matches('/').to_string();
+        // The API root ends in /api, so requests go to <root>/v1/…
+        p.deployment = if p.base_url.ends_with("/api") { "direct".into() } else { String::new() };
+        p.org_id = g("organization_id").unwrap_or_default();
+        p.master_key = g("master_key").unwrap_or_default();
+        p.workspace_id = g("workspace_id");
+        if !same_org {
+            p.thread_id = None;
+        }
+        p.login_url = Some(url.clone());
+        p.email = g("email");
+    }
+    if !had_default {
+        cfg.current_profile = tenant.to_string();
+    }
+    cfg.save()?;
+
+    let who = g("email").map(|e| format!(" as {e}")).unwrap_or_default();
+    let ws = g("workspace_name").map(|w| format!(" · workspace {w}")).unwrap_or_default();
+    println!("  \x1b[32m✔\x1b[0m Signed in{who}{ws}");
+    println!("  Run \x1b[1mstrobes\x1b[0m to start chatting.");
+    Ok(())
+}
+
+/// `strobes logout`: drop this tenant's key (and its chat/workspace binding).
+fn cmd_logout(cfg: &mut Config, tenant: &str) -> Result<()> {
+    let p = cfg.profile_mut(tenant);
+    if p.master_key.is_empty() {
+        println!("Not signed in.");
+        return Ok(());
+    }
+    p.master_key.clear();
+    p.thread_id = None;
+    p.email = None;
+    cfg.save()?;
+    println!("Signed out of '{tenant}'. Run `strobes login` to sign in again.");
+    Ok(())
+}
+
 async fn cmd_login(
     cfg: &mut Config,
     tenant: &str,
@@ -7750,6 +8008,14 @@ fn run_builtin(cmd: &str, app: &mut App, handle: &mut pulse::PulseHandle, defer:
         "markdown" => {
             app.markdown = !app.markdown;
             app.notice(if app.markdown { "rendering markdown" } else { "showing raw markdown" });
+        }
+        "login" => {
+            *AFTER_CHAT.lock().unwrap() = Some(AfterChat::Login);
+            *quit = true;
+        }
+        "logout" => {
+            *AFTER_CHAT.lock().unwrap() = Some(AfterChat::Logout);
+            *quit = true;
         }
         "exit" => *quit = true,
         _ => {}

@@ -115,11 +115,11 @@ pub fn draw_loader(f: &mut ratatui::Frame, label: &str, frame: usize, seed: usiz
     // lives — so going from "Starting chat…" to the chat doesn't jump.
     let _ = seed;
     let area = f.area();
-    const SPIN: [&str; 6] = ["✻", "✺", "✹", "✸", "✷", "✶"];
-    let glyph = SPIN[(frame / 2) % SPIN.len()];
+    // Strobie (the mascot) twinkling — same indicator as the chat.
+    let (glyph, style) = crate::app::strobie_frame(frame);
     let line = Line::from(vec![
-        Span::styled(format!(" {glyph} "), Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
-        Span::styled(format!("{label}…"), Style::default().fg(Color::Magenta)),
+        Span::styled(format!(" {glyph} "), style),
+        Span::styled(format!("{label}…"), Style::default().fg(crate::app::STROBES_GREEN)),
     ]);
     let y = area.y + area.height.saturating_sub(5);
     let rect = Rect { x: area.x, y, width: area.width, height: 1 };
