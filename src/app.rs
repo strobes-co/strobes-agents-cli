@@ -4041,12 +4041,19 @@ fn short(id: &str) -> String {
     if id.len() > 8 { format!("{}…", &id[..8]) } else { id.to_string() }
 }
 
+/// 950 tok · 12.3k tok · 2.35M tok · 1.2B tok.
 fn fmt_tokens(t: i64) -> String {
-    if t >= 1000 {
-        format!("{:.1}k tok", t as f64 / 1000.0)
-    } else {
-        format!("{t} tok")
-    }
+    let f = t as f64;
+    let (v, unit) = match t.abs() {
+        0..=999 => return format!("{t} tok"),
+        1_000..=999_949 => (f / 1e3, "k"),
+        999_950..=999_949_999 => (f / 1e6, "M"),
+        _ => (f / 1e9, "B"),
+    };
+    // Three significant figures: 2.35M, 23.5M, 235M.
+    let s = if v.abs() >= 100.0 { format!("{v:.0}") } else if v.abs() >= 10.0 { format!("{v:.1}") } else { format!("{v:.2}") };
+    let s = if s.contains('.') { s.trim_end_matches('0').trim_end_matches('.').to_string() } else { s };
+    format!("{s}{unit} tok")
 }
 
 /// Some terminals/fonts render these decorative glyphs as double-width while
@@ -4560,6 +4567,19 @@ mod input_editor_tests {
         a.input_insert_str("two");
         assert_eq!(a.input, "line one\ntwo");
         assert!(!a.input_backslash_newline());
+    }
+
+    #[test]
+    fn token_counts_scale() {
+        assert_eq!(fmt_tokens(950), "950 tok");
+        assert_eq!(fmt_tokens(1_000), "1k tok");
+        assert_eq!(fmt_tokens(12_340), "12.3k tok");
+        assert_eq!(fmt_tokens(98_900), "98.9k tok");
+        assert_eq!(fmt_tokens(271_000), "271k tok");
+        assert_eq!(fmt_tokens(999_960), "1M tok");
+        assert_eq!(fmt_tokens(2_350_900), "2.35M tok");
+        assert_eq!(fmt_tokens(23_500_000), "23.5M tok");
+        assert_eq!(fmt_tokens(1_200_000_000), "1.2B tok");
     }
 
     #[test]
