@@ -2733,7 +2733,7 @@ impl App {
 
 /// Reader-facing tool name: `workspace_execute_shell_command` → "Shell",
 /// `browser_navigate` → "Browser navigate", anything else in sentence case.
-fn tool_label(name: &str) -> String {
+pub fn tool_label(name: &str) -> String {
     let known = match name {
         "__bash__" => Some("Bash"),
         "execute_command" | "workspace_execute_shell_command" => Some("Shell"),

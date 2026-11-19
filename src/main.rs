@@ -950,7 +950,7 @@ async fn main() -> Result<()> {
                 return Err(anyhow!("-p needs a prompt: strobes -p \"your question\""));
             }
             let ws = cli.workspace.clone().or_else(|| profile.workspace_id.clone());
-            return cmd_send(&profile, prompt, ws, None, None, cli.model, None, "text", true, None, None, None, None).await;
+            return cmd_send(&profile, prompt, ws, None, None, cli.model, None, "text", true, None, None, None, None, true).await;
         }
         let launch = match (&cli.resume, cli.cont) {
             (Some(t), _) if !t.is_empty() => Launch::Thread(t.clone()),
@@ -1051,7 +1051,7 @@ async fn main() -> Result<()> {
         Cmd::Probe { thread, send, secs, model, reasoning } => cmd_probe(&profile, &thread, send, secs, model, reasoning).await,
         Cmd::Workflow { sub } => cmd_workflow(profile, sub, &tenant).await,
         Cmd::Send { message, workspace, new_workspace, title, model, reasoning, output, non_interactive, timeout, fail_on_findings, sandbox_id, agent } => {
-            cmd_send(&profile, message, workspace, new_workspace, title, model, reasoning, &output, non_interactive, timeout, fail_on_findings, sandbox_id, agent).await
+            cmd_send(&profile, message, workspace, new_workspace, title, model, reasoning, &output, non_interactive, timeout, fail_on_findings, sandbox_id, agent, false).await
         }
         Cmd::Ci { sub } => match sub {
             CiCmd::Sast { dir, output, output_file, prompt, workspace, model, reasoning, timeout, fail_on, exclude, max_mb } => {
@@ -2073,6 +2073,7 @@ async fn cmd_send(
     fail_on_findings: Option<String>,
     sandbox_id: Option<String>,
     agent: Option<String>,
+    print_mode: bool,
 ) -> Result<()> {
     require_complete(p)?;
 
@@ -2133,7 +2134,9 @@ async fn cmd_send(
     });
 
     let thread_id = client.create_thread(&thread_title, workspace_id.as_deref(), agent.as_deref()).await?;
-    eprintln!("thread: {thread_id}");
+    if !print_mode {
+        eprintln!("thread: {thread_id}");
+    }
 
     let (tx, mut rx) = mpsc::unbounded_channel::<pulse::AppEvent>();
     let handle = pulse::connect(p, &thread_id, tx, model, reasoning.clone()).await?;
@@ -2149,6 +2152,10 @@ async fn cmd_send(
         .map(|s| tokio::time::Instant::now() + std::time::Duration::from_secs(s));
 
     let mut needs_newline = false;
+    // Text of the current reply segment, to drop a server replay of the
+    // whole segment as one extra token (it would print the answer twice).
+    let mut segment = String::new();
+    let mut last_tool_line: Option<(String, String)> = None;
     let run_result: Result<()> = loop {
         let ev_opt = if let Some(dl) = deadline {
             tokio::select! {
@@ -2180,6 +2187,10 @@ async fn cmd_send(
                 pulse::AppEvent::Stream(item) => match item.kind.as_str() {
                     "token" => {
                         if let Some(text) = &item.text {
+                            if text.trim().len() >= 8 && text.trim() == segment.trim() {
+                                continue;
+                            }
+                            segment.push_str(text);
                             if json_mode {
                                 json_text.push_str(text);
                             } else {
@@ -2191,7 +2202,7 @@ async fn cmd_send(
                     }
                     "thinking" => {
                         if let Some(text) = &item.text {
-                            if !json_mode {
+                            if !json_mode && !print_mode {
                                 if needs_newline { println!(); needs_newline = false; }
                                 println!("💭 {text}");
                             }
@@ -2204,10 +2215,21 @@ async fn cmd_send(
                             json_tools.push(serde_json::json!({
                                 "name": name, "status": "running", "detail": detail
                             }));
+                        } else if print_mode {
+                            // Progress goes to stderr so stdout stays just the answer.
+                            // One line per call: skip the arg-less early start and
+                            // the local mirror of the wrapper call.
+                            let d = detail.lines().next().unwrap_or("").trim().to_string();
+                            let key = (app::tool_label(&name), d.clone());
+                            if !item.local && !d.is_empty() && last_tool_line.as_ref() != Some(&key) {
+                                eprintln!("\x1b[2m⏺ {}({})\x1b[0m", key.0, trunc(&d, 100));
+                                last_tool_line = Some(key);
+                            }
                         } else {
                             if needs_newline { println!(); needs_newline = false; }
                             if detail.is_empty() { println!("▶ {name}"); } else { println!("▶ {name}({detail})"); }
                         }
+                        segment.clear();
                     }
                     "tool_output" => {
                         let name = item.tool_name.as_deref().unwrap_or("?").to_string();
@@ -2217,7 +2239,7 @@ async fn cmd_send(
                                 last["status"] = serde_json::Value::String("done".into());
                                 last["output"] = serde_json::Value::String(detail);
                             }
-                        } else {
+                        } else if !print_mode {
                             if needs_newline { println!(); needs_newline = false; }
                             if !detail.is_empty() { println!("◀ {name}: {detail}"); }
                         }
@@ -2230,6 +2252,8 @@ async fn cmd_send(
                                 last["status"] = serde_json::Value::String("failed".into());
                                 last["error"] = serde_json::Value::String(err);
                             }
+                        } else if print_mode {
+                            eprintln!("\x1b[31m✗ {name}: {}\x1b[0m", trunc(&err, 200));
                         } else {
                             if needs_newline { println!(); needs_newline = false; }
                             println!("✗ {name}: {err}");
@@ -2237,12 +2261,13 @@ async fn cmd_send(
                     }
                     "note" | "system" => {
                         if let Some(text) = &item.text {
-                            if !json_mode {
+                            if !json_mode && !print_mode {
                                 if needs_newline { println!(); needs_newline = false; }
                                 println!("ℹ {text}");
                             }
                         }
                     }
+                    _ if print_mode => {}
                     _ => {
                         if let Some(text) = &item.text {
                             if json_mode {
