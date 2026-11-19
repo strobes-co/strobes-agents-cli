@@ -394,6 +394,20 @@ on your machine. Type `/` for commands and `?` for shortcuts.
 | `/browser` | The agent's local browser — `open <url>` to sign in, `show`/`hide`, `attach 9222`, `close` |
 | `/permissions` | Toggle: confirm approval-gated actions yourself, or approve automatically |
 | `/api [METHOD] <path> [json]` | Call the Strobes API from the chat |
+| `/agent [id]` | Start a chat with a specialist (vuln triage, threat intel, AWS pentest, …) |
+| `/attach <file>…` | Attach images, HAR files, Burp exports or logs to your next message |
+| `/artifacts` · `get`/`open <path> [--pdf]` | Files this chat produced: list, save here, open |
+| `/evidence <ev-id>…` | The request and response behind an `ev-…` id the agent cites |
+| `/memory` · `search` · `add` · `rm` | Workspace memory (start a message with `#` to save a note) |
+| `/creds <NAME> KEY=VALUE…` | Hand the agent a credential as `NAME_KEY` env vars, kept out of history (`/creds aws <id>` for stored ones) |
+| `/background <prompt>` · `/runs` | Run a prompt in the cloud on this chat and keep going · list or cancel runs |
+| `/schedule` · `add daily 09:00 <prompt>` | Recurring runs: list, add, `pause`/`resume`/`run`/`rm` |
+| `/report` · `new [csv\|threat\|cve]` · `get <name>` | Workspace reports |
+| `/fork [title]` · `/share` | Branch this chat · copy a link for a teammate |
+| `/skills` · `show` · `push <dir>` · `enable`/`disable` | Local and organization skills |
+| `/init` | Write a starter `STROBES.md` for this project |
+| `/mcp` · `trust` · `reload` | MCP servers the agent can use from here |
+| `/hooks` | Your scripts around the agent's local tool calls |
 | `!<command>` | Run a shell command locally in the agent's sandbox |
 | `@<file>` | Mention a file from the current folder (inserts its path) |
 
@@ -414,6 +428,38 @@ Agent skills (e.g. `/api-pentest`) appear in the same `/` menu after the built-i
 | `Ctrl-R` | Search prompt history |
 | `Ctrl-B` | Move the running local command to the background (the agent carries on) |
 | `Ctrl-T` · `Ctrl-Y` · `Ctrl-S` | Thinking · copy transcript · select mode (`/markdown` toggles raw markdown) |
+
+### Project instructions, local skills, MCP and hooks
+
+Like Claude Code's `CLAUDE.md`, skills, `.mcp.json` and hooks:
+
+- **`STROBES.md`** — scope, rules of engagement, test accounts. Read from your
+  config dir and from the project root down to the current folder, and sent
+  with every message (edits apply on the next turn). `/init` writes a starter.
+- **Local skills** — `.strobes/skills/<slug>/SKILL.md` (front matter `name`,
+  `description`) in the project, or `skills/` in the config dir. The agent sees
+  them as `local:<slug>` and loads one on demand; the SKILL.md and its scripts
+  stay on your machine. `/skills push <slug>` uploads one to the organization.
+- **MCP servers** — `.mcp.json` (Claude Code's format, so existing files work),
+  `.strobes/mcp.json`, or `mcp.json` in the config dir; stdio and streamable
+  HTTP. Their tools reach the agent as `server · tool (MCP)` and run here.
+  A project's servers start only after `/mcp trust` (they run commands from
+  the repo); your own `mcp.json` is trusted.
+- **Hooks** — `hooks.json` in the config dir or `.strobes/hooks.json`
+  (trusted projects), in Claude Code's format. A `PreToolUse` hook that exits 2
+  blocks the call and its stderr tells the agent why — e.g. a scope guard:
+
+  ```json
+  {"hooks": {"PreToolUse": [{"matcher": "Shell|Run code",
+    "hooks": [{"type": "command", "command": "./scope-guard.sh"}]}]}}
+  ```
+
+**Strobes in other tools:** `strobes mcp serve` is an MCP server (workspaces,
+findings, threads, `ask` the agent, read-only API), using this CLI's login:
+
+```bash
+claude mcp add strobes -- strobes mcp serve
+```
 
 ### Local commands, background jobs and the browser
 
@@ -443,6 +489,12 @@ strobes api -X POST /cli/threads/create/ -d '{"title":"x"}'
 strobes api /v1/organizations/{org}/master_key/    # explicit path
 ```
 
+The chat commands work from scripts too: `strobes agents`, `strobes skills
+push ./my-skill`, `strobes memory search cors`, `strobes runs all`,
+`strobes schedule add daily 09:00 "…"`, `strobes report new csv`,
+`strobes artifacts <thread> get report.md`, `strobes evidence <thread> ev-…`,
+`strobes mcp list`.
+
 Other commands: `strobes status`, `strobes workspaces`, `strobes threads`,
 `strobes bind --download`, `strobes pull`, `strobes export -w <id>`,
 `strobes update`. `strobes chat` still opens the workspace → thread pickers.
@@ -454,8 +506,8 @@ or set `STROBES_AI_BROWSER_AUTOINSTALL=1` to download Chrome for Testing on firs
 **Browser isolation:** parallel agents each get their own CDP tab within a
 shared Chrome process per workspace.
 
-**Model picker ids:** `4` Haiku 4.5 · `18` Sonnet 4.6 · `21` Opus 4.7
-(Bedrock), or your org's BYOM id.
+**Models:** `/model` lists your org's models (custom ones included);
+`/model sonnet` or `-m 46` picks one by name or id.
 
 ### Credits & tokens
 

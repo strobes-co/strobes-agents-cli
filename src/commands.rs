@@ -389,10 +389,26 @@ async fn evidence(args: &str, ctx: &Ctx) -> Result<String, String> {
     let mut out = String::new();
     if let Some(map) = v.get("evidence").and_then(|m| m.as_object()) {
         for (id, ev) in map {
-            out.push_str(&format!("{id}\n"));
-            let pretty = serde_json::to_string_pretty(ev).unwrap_or_default();
-            for l in pretty.lines().take(30) {
-                out.push_str(&format!("  {l}\n"));
+            let title = if s(ev, "title").is_empty() { s(ev, "kind") } else { s(ev, "title") };
+            out.push_str(&format!("{id} — {title}\n"));
+            let (req, resp) = (s(ev, "rendered_request"), s(ev, "rendered_response"));
+            if req.is_empty() && resp.is_empty() {
+                // Not an HTTP exchange: show what it carries.
+                let pretty = serde_json::to_string_pretty(ev).unwrap_or_default();
+                for l in pretty.lines().take(30) {
+                    out.push_str(&format!("  {l}\n"));
+                }
+                continue;
+            }
+            for (label, body) in [("request", req), ("response", resp)] {
+                out.push_str(&format!("  {label}\n"));
+                let lines: Vec<&str> = body.lines().collect();
+                for l in lines.iter().take(20) {
+                    out.push_str(&format!("    {}\n", l.chars().take(200).collect::<String>()));
+                }
+                if lines.len() > 20 {
+                    out.push_str(&format!("    … +{} lines\n", lines.len() - 20));
+                }
             }
         }
     }
