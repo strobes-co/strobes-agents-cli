@@ -1559,7 +1559,11 @@ impl App {
                     self.render_reply(md, first, &mut out);
                 }
                 Block::Thinking(s) => self.render_thinking(s, &mut out),
-                Block::Plain(l) => out.push(l.clone()),
+                Block::Plain(l) => {
+                    // A notice between replies: the next reply gets its ⏺ again.
+                    cur_agent = None;
+                    out.push(l.clone());
+                }
                 Block::Tool { name, detail, status, local_id, call_id, .. } => {
                     // Live tail of a running local command (rendered after the call line).
                     let live: Vec<String> = if *status == ToolStatus::Running {

@@ -136,7 +136,11 @@ impl PulseHandle {
         if let Some(e) = self.reasoning_effort.lock().ok().and_then(|e| e.clone()) {
             ctx["reasoning_effort"] = json!(e);
         }
-        let frame = json!({ "type": "send_message", "text": text, "context": ctx });
+        let mut frame = json!({ "type": "send_message", "text": text, "context": ctx });
+        let atts = take_attachments();
+        if !atts.is_empty() {
+            frame["attachments"] = json!(atts);
+        }
         let _ = self.out.send(frame.to_string());
     }
 
@@ -383,6 +387,23 @@ fn trim_code_preview(code: &str) -> String {
     } else {
         first.to_string()
     }
+}
+
+/// Files uploaded with /attach, sent with the next message.
+static PENDING_ATTACHMENTS: std::sync::Mutex<Vec<Value>> = std::sync::Mutex::new(Vec::new());
+
+pub fn queue_attachment(att: Value) {
+    if let Ok(mut v) = PENDING_ATTACHMENTS.lock() {
+        v.push(att);
+    }
+}
+
+pub fn pending_attachments() -> usize {
+    PENDING_ATTACHMENTS.lock().map(|v| v.len()).unwrap_or(0)
+}
+
+pub fn take_attachments() -> Vec<Value> {
+    PENDING_ATTACHMENTS.lock().map(|mut v| std::mem::take(&mut *v)).unwrap_or_default()
 }
 
 /// Request ids of the server's internal cells seen this session, so any

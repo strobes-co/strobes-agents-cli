@@ -353,6 +353,22 @@ enum Cmd {
         #[command(subcommand)]
         action: McpAction,
     },
+    /// Skills: list · show <slug> · push <dir> · enable|disable <slug>.
+    Skills { args: Vec<String> },
+    /// Workspace memory: [search <q> · add <text> · rm <id>].
+    Memory { args: Vec<String> },
+    /// Recurring runs: [list · add <frequency> <HH:MM> <prompt> · pause|resume|run|rm <id>].
+    Schedule { args: Vec<String> },
+    /// Agent runs: [all · cancel <id>].
+    Runs { args: Vec<String> },
+    /// Workspace reports: [list · new <csv|threat|cve> · get <name>].
+    Report { args: Vec<String> },
+    /// List the specialist agents (use one with `--agent <id>` on send).
+    Agents,
+    /// Files a chat produced: <thread> [list · get|open <path> [--pdf]].
+    Artifacts { thread: String, args: Vec<String> },
+    /// Request/response behind evidence ids: <thread> <ev-…>…
+    Evidence { thread: String, refs: Vec<String> },
     /// Update the CLI to the latest release (downloads + replaces the binary).
     Update {
         /// Reinstall even if already on the latest version.
@@ -1174,11 +1190,16 @@ async fn main() -> Result<()> {
         Cmd::Mcp { action: McpAction::List } => {
             mcp::start_all();
             mcp::wait_ready(std::time::Duration::from_secs(20)).await;
-            match commands::run("mcp", "", &commands::Ctx { profile: profile.clone(), thread_id: String::new() }).await {
-                Ok(commands::Outcome::Text(t)) => { println!("{t}"); Ok(()) }
-                Err(e) => Err(anyhow::anyhow!(e)),
-            }
+            run_command_cli(&profile, "mcp", &[], None).await
         }
+        Cmd::Skills { args } => run_command_cli(&profile, "skills", &args, None).await,
+        Cmd::Memory { args } => run_command_cli(&profile, "memory", &args, None).await,
+        Cmd::Schedule { args } => run_command_cli(&profile, "schedule", &args, None).await,
+        Cmd::Runs { args } => run_command_cli(&profile, "runs", &args, None).await,
+        Cmd::Report { args } => run_command_cli(&profile, "report", &args, None).await,
+        Cmd::Agents => run_command_cli(&profile, "agent", &[], None).await,
+        Cmd::Artifacts { thread, args } => run_command_cli(&profile, "artifacts", &args, Some(thread)).await,
+        Cmd::Evidence { thread, refs } => run_command_cli(&profile, "evidence", &refs, Some(thread)).await,
         Cmd::Update { force } => cmd_update(force).await,
         Cmd::Tenants => cmd_tenants(&cfg),
         Cmd::Credits { workspace, thread } => cmd_credits(&profile, workspace, thread).await,
@@ -7661,6 +7682,23 @@ fn web_for(url: &str) -> String {
     u.trim_end_matches("/api").to_string()
 }
 
+/// Run a chat command from the shell (`strobes skills`, `strobes runs`, …).
+async fn run_command_cli(profile: &config::Profile, name: &str, args: &[String], thread: Option<String>) -> Result<()> {
+    require_complete(profile)?;
+    let ctx = commands::Ctx { profile: profile.clone(), thread_id: thread.unwrap_or_default(), model: None };
+    match commands::run(name, &args.join(" "), &ctx).await {
+        Ok(commands::Outcome::Text(t)) => {
+            println!("{t}");
+            Ok(())
+        }
+        Ok(commands::Outcome::SwitchThread(id, note)) => {
+            println!("{note}\nthread: {id}  (strobes -r to open it)");
+            Ok(())
+        }
+        Err(e) => Err(anyhow!(e)),
+    }
+}
+
 fn open_browser(url: &str) -> bool {
     // Headless/SSH sessions (and tests) just print the link.
     if std::env::var("STROBES_NO_BROWSER").is_ok() {
@@ -8563,6 +8601,15 @@ pub async fn run_chat(
     // The user's MCP servers start in the background; their tools join the
     // next message once they're up (see /mcp).
     mcp::start_all();
+    // The org's live model list (custom models too) for /model.
+    {
+        let p = profile.clone();
+        tokio::spawn(async move {
+            if let Ok(c) = api::ApiClient::new(p) {
+                let _ = c.load_models().await;
+            }
+        });
+    }
 
     let mut profile = profile;
     let client = api::ApiClient::new(profile.clone())?;
@@ -9000,8 +9047,15 @@ pub async fn run_chat(
                                         let (n, a) = t.split_once(char::is_whitespace)?;
                                         commands::is_command(n).then(|| (n.to_string(), a.trim().to_string()))
                                     });
-                                    if let Some((n, a)) = cmd_arg {
-                                        app.remember_prompt(&text);
+                                    // `# note` → remember it for this workspace.
+                                    let memo = text.strip_prefix('#').filter(|m| !m.starts_with('#') && !m.trim().is_empty()).map(|m| m.trim().to_string());
+                                    if let Some(m) = memo {
+                                        app.input_clear();
+                                        defer = Some(Defer::Cmd("memory".into(), format!("add {m}")));
+                                    } else if let Some((n, a)) = cmd_arg {
+                                        if !commands::is_secret(&n) {
+                                            app.remember_prompt(&text);
+                                        }
                                         app.input_clear();
                                         defer = Some(Defer::Cmd(n, a));
                                     } else if let Some(a) = api_arg {
@@ -9300,10 +9354,7 @@ pub async fn run_chat(
                 }
             }
             Some(Defer::Models) => {
-                let models: Vec<(i64, String)> = api::BUILTIN_MODELS
-                    .iter()
-                    .map(|&(id, name)| (id, name.to_string()))
-                    .collect();
+                let models: Vec<(i64, String)> = api::models();
                 let current = app.current_model();
                 let items: Vec<app::OverlayItem> = models
                     .into_iter()
@@ -9329,14 +9380,18 @@ pub async fn run_chat(
             Some(Defer::Jobs) => app.open_jobs(),
             Some(Defer::Cmd(name, args)) => {
                 let dtx = defer_tx.clone();
-                let ctx = commands::Ctx { profile: profile.clone(), thread_id: app.thread_id.clone() };
+                let ctx = commands::Ctx { profile: profile.clone(), thread_id: app.thread_id.clone(), model: app.current_model() };
                 app.set_busy(&format!("/{name}…"));
                 tokio::spawn(async move {
                     let r = commands::run(&name, &args, &ctx).await;
-                    dtx.send(match r {
-                        Ok(commands::Outcome::Text(t)) => DeferResult::Notice(t),
-                        Err(e) => DeferResult::Error(e),
-                    }).ok();
+                    match r {
+                        Ok(commands::Outcome::Text(t)) => { dtx.send(DeferResult::Notice(t)).ok(); }
+                        Ok(commands::Outcome::SwitchThread(id, note)) => {
+                            dtx.send(DeferResult::Then(Defer::SwitchThread(id))).ok();
+                            dtx.send(DeferResult::Notice(note)).ok();
+                        }
+                        Err(e) => { dtx.send(DeferResult::Error(e)).ok(); }
+                    }
                 });
             }
             Some(Defer::Api(args)) => {
