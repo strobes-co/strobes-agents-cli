@@ -2007,7 +2007,7 @@ impl App {
             (what, format!(" ({})", parts.join(" · ")))
         } else if !self.connected && !self.status.is_empty() && self.status != "connecting…" {
             return Some(Line::from(Span::styled(
-                format!(" ○ {} — retrying…", self.status),
+                format!(" ○ {}", self.status),
                 Style::default().fg(Color::Red),
             )));
         } else {
@@ -2058,7 +2058,10 @@ impl App {
             Some(ws) => right.push(format!("⊞ {}", truncate(ws, 24))),
             None => right.push("no workspace".into()),
         }
-        right.push(crate::api::model_name(self.current_model).to_string());
+        right.push(match self.current_model {
+            None | Some(0) => "default model".to_string(),
+            m => crate::api::model_name(m).to_string(),
+        });
         if self.thread_credits > 0.0 {
             right.push(format!("{:.2} cr", self.thread_credits));
         }

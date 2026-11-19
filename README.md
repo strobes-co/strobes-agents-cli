@@ -375,6 +375,7 @@ on your machine. Type `/` for commands and `?` for shortcuts.
 | `/findings` · `/approvals` · `/files` | Browse the workspace |
 | `/copy` · `/status` · `/thinking` · `/exit` | Copy transcript · where you are · show reasoning · quit |
 | `!<command>` | Run a shell command locally in the agent's sandbox |
+| `@<file>` | Mention a file from the current folder (inserts its path) |
 
 Agent skills (e.g. `/api-pentest`) appear in the same `/` menu after the built-ins.
 
@@ -387,6 +388,7 @@ Agent skills (e.g. `/api-pentest`) appear in the same `/` menu after the built-i
 | `Ctrl-C` | Interrupt · clear the prompt · press twice to quit (`Ctrl-D` quits too) |
 | `↑` / `↓` | Previous prompts (history is kept across sessions) |
 | `PgUp` / `PgDn`, mouse wheel | Scroll the chat |
+| Paste | Long pastes collapse to `[Pasted text #1 +40 lines]` and are sent in full |
 | `Ctrl-O` | Expand tool output |
 | `Ctrl-P` · `Ctrl-W` · `Ctrl-F` · `Ctrl-A` | Model · workspaces · findings · approvals |
 | `Ctrl-T` · `Ctrl-R` · `Ctrl-Y` · `Ctrl-S` | Thinking · raw markdown · copy transcript · select mode |
