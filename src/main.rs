@@ -7494,7 +7494,8 @@ async fn cmd_login(
     let had_default = cfg.has_default();
     let cur = cfg.profile_mut(&pname).clone();
     let interactive = base_url.is_none() && org_id.is_none() && master_key.is_none();
-    if interactive {
+    // Only mention keeping values when there are values to keep.
+    if interactive && !cur.base_url.is_empty() {
         println!("Configuring tenant '{pname}' — press Enter to keep the current value.");
     }
 
