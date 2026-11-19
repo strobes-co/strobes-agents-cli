@@ -1058,6 +1058,11 @@ impl App {
         self.record_answer(&label, value)
     }
 
+    /// The approval id when the open prompt is an approval request.
+    pub fn pending_approval_id(&self) -> Option<String> {
+        self.pending.as_ref().and_then(|p| p.id.strip_prefix("approval:").map(String::from))
+    }
+
     /// Stop answering: the run is cancelled by the caller.
     pub fn decline_interrupt(&mut self) {
         if self.pending.take().is_some() {

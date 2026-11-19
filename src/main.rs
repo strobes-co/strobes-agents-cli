@@ -8754,8 +8754,18 @@ pub async fn run_chat(
                                         answer_pending(&handle, &id, data, &mut app);
                                     }
                                 }
-                                KeyCode::Esc => { app.decline_interrupt(); handle.cancel(); }
-                                KeyCode::Char('c') if ctrl => { app.decline_interrupt(); handle.cancel(); }
+                                // Esc on an approval answers No (the run goes on);
+                                // on an agent question it stops the run.
+                                KeyCode::Esc | KeyCode::Char('c') if k.code == KeyCode::Esc || ctrl => {
+                                    if let Some(ap) = app.pending_approval_id() {
+                                        handle.respond_approval(&ap, false);
+                                        app.decline_interrupt();
+                                        app.running = true;
+                                    } else {
+                                        app.decline_interrupt();
+                                        handle.cancel();
+                                    }
+                                }
                                 _ => {}
                             }
                         } else if app.awaiting_input() {
