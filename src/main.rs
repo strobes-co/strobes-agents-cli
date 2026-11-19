@@ -112,7 +112,7 @@ struct Cli {
     #[arg(long, visible_alias = "profile", global = true)]
     tenant: Option<String>,
     /// Start the chat with this prompt (quotes optional).
-    #[arg(value_name = "PROMPT", trailing_var_arg = true)]
+    #[arg(value_name = "PROMPT")]
     prompt: Vec<String>,
     /// Continue the most recent chat.
     #[arg(short = 'c', long = "continue")]
@@ -150,8 +150,8 @@ fn subcommand_first(args: Vec<String>) -> Vec<String> {
             continue;
         }
         if a.starts_with('-') {
-            i += 1;
-            continue;
+            // Any other flag: the words after it are a prompt, not a command.
+            return args;
         }
         if i > 1 && is_sub(a) {
             let mut out = vec![args[0].clone()];
@@ -162,6 +162,41 @@ fn subcommand_first(args: Vec<String>) -> Vec<String> {
         return args;
     }
     args
+}
+
+/// A tool output squeezed to one capped line, for `strobes send` logs/JSON.
+fn one_line(s: &str, limit: usize) -> String {
+    let t = s.replace("\\n", " ").replace('\n', " ");
+    if t.chars().count() > limit {
+        format!("{}…", t.chars().take(limit).collect::<String>())
+    } else {
+        t
+    }
+}
+
+/// Should `-p` read stdin into the prompt? With no prompt given, any
+/// non-terminal stdin is the input. With a prompt, only a pipe that already
+/// has data (`cat log | strobes -p "triage"`) — never a redirected file a
+/// shell loop is reading from, nor an idle pipe that would block forever.
+fn piped_stdin_ready(no_prompt: bool) -> bool {
+    use std::io::IsTerminal;
+    if std::io::stdin().is_terminal() {
+        return false;
+    }
+    if no_prompt {
+        return true;
+    }
+    #[cfg(unix)]
+    unsafe {
+        let mut st: libc::stat = std::mem::zeroed();
+        if libc::fstat(0, &mut st) != 0 || (st.st_mode & libc::S_IFMT) != libc::S_IFIFO {
+            return false;
+        }
+        let mut pfd = libc::pollfd { fd: 0, events: libc::POLLIN, revents: 0 };
+        libc::poll(&mut pfd, 1, 200) > 0 && (pfd.revents & libc::POLLIN) != 0
+    }
+    #[cfg(not(unix))]
+    false
 }
 
 /// How the interactive chat picks its thread at launch.
@@ -938,8 +973,8 @@ async fn main() -> Result<()> {
         let mut prompt = cli.prompt.join(" ").trim().to_string();
         if cli.print {
             // Piped stdin is part of the prompt (`cat log | strobes -p "triage"`).
-            use std::io::{IsTerminal, Read};
-            if !std::io::stdin().is_terminal() {
+            use std::io::Read;
+            if piped_stdin_ready(prompt.is_empty()) {
                 let mut buf = String::new();
                 let _ = std::io::stdin().read_to_string(&mut buf);
                 if !buf.trim().is_empty() {
@@ -1116,7 +1151,8 @@ async fn chat_flow(
     let mut initial_msg: Option<String> = prompt;
     let thread_id = match launch {
         Launch::Thread(t) => t,
-        Launch::Continue => match profile.thread_id.clone() {
+        // The last chat only if it belongs to the workspace asked for.
+        Launch::Continue => match reusable.clone() {
             Some(t) => t,
             None => fresh_thread(terminal, &profile, None).await?,
         },
@@ -2110,14 +2146,15 @@ async fn cmd_send(
     // directory that had nothing to do with the bound workspace's files.
     if sandbox_id.is_none() {
         if let Some(ws) = &workspace_id {
-            eprintln!("syncing workspace files locally…");
+            if !print_mode { eprintln!("syncing workspace files locally…"); }
             match sync_workspace_sandbox(p, ws).await {
-                Ok(WorkspaceSyncOutcome::Synced(n)) => {
+                Ok(WorkspaceSyncOutcome::Synced(n)) if !print_mode => {
                     eprintln!("sandbox: {} ({n} file(s))", workspace_sandbox_path(ws).display());
                 }
-                Ok(WorkspaceSyncOutcome::Empty) => {
+                Ok(WorkspaceSyncOutcome::Empty) if !print_mode => {
                     eprintln!("sandbox: {} (workspace has no files yet)", workspace_sandbox_path(ws).display());
                 }
+                Ok(_) => {}
                 Err(e) => eprintln!("warning: workspace sync failed ({e}) — local tools will use an empty sandbox"),
             }
         }
@@ -2232,11 +2269,11 @@ async fn cmd_send(
                         if json_mode {
                             if let Some(last) = json_tools.iter_mut().rev().find(|t| t["name"] == name && t["status"] == "running") {
                                 last["status"] = serde_json::Value::String("done".into());
-                                last["output"] = serde_json::Value::String(detail);
+                                last["output"] = serde_json::Value::String(one_line(&detail, 600));
                             }
                         } else if !print_mode {
                             if needs_newline { println!(); needs_newline = false; }
-                            if !detail.is_empty() { println!("◀ {name}: {detail}"); }
+                            if !detail.is_empty() { println!("◀ {name}: {}", one_line(&detail, 600)); }
                         }
                     }
                     "tool_failed" => {
@@ -7728,8 +7765,8 @@ enum DeferResult {
     OpenOverlay(app::OverlayKind, String, Vec<app::OverlayItem>),
     /// Chain another deferred action (e.g. bind a workspace → new chat).
     Then(Defer),
-    /// A `!cmd` finished: (output, success).
-    Bash(String, bool),
+    /// A `!cmd` finished: (call id, output, success).
+    Bash(String, String, bool),
     Notice(String),
     Error(String),
 }
@@ -8249,7 +8286,9 @@ pub async fn run_chat(
                                         app.input_clear();
                                         defer = Some(Defer::Bash(cmd.to_string()));
                                     } else if !text.is_empty() {
-                                        app.remember_prompt(&text);
+                                        // History keeps the full text: paste bodies
+                                        // don't outlive this prompt.
+                                        app.remember_prompt(&app.expand_pastes(&text));
                                         // Dragged local file path(s) + a bound
                                         // workspace → upload instead of sending.
                                         match parse_dragged_paths(&text) {
@@ -8361,7 +8400,7 @@ pub async fn run_chat(
                 match maybe_defer {
                     Some(DeferResult::OpenOverlay(kind, title, items)) => app.open_overlay(kind, title, items),
                     Some(DeferResult::Notice(s)) => app.notice(&s),
-                    Some(DeferResult::Bash(out, ok)) => app.bash_done(out, ok),
+                    Some(DeferResult::Bash(id, out, ok)) => app.bash_done(&id, out, ok),
                     Some(DeferResult::Then(d)) => defer = Some(d),
                     Some(DeferResult::Error(e)) => app.on_app_event(pulse::AppEvent::Error(e)),
                     None => {}
@@ -8524,14 +8563,23 @@ pub async fn run_chat(
                 app.open_overlay(app::OverlayKind::Models, "Select AI model  (^P toggle)".into(), items);
             }
             Some(Defer::Bash(cmd)) => {
-                app.bash_started(&cmd);
+                let id = app.bash_started(&cmd);
                 let dtx = defer_tx.clone();
                 let mut input = serde_json::json!({ "command": cmd, "_thread_id": app.thread_id.clone() });
-                if let Some(ws) = &profile.workspace_id {
+                let ws = profile.workspace_id.clone();
+                if let Some(ws) = &ws {
                     input["_workspace_id"] = serde_json::json!(ws);
                 }
                 tokio::spawn(async move {
+                    // Same workspace mirror sync as the agent's own commands.
+                    let sandbox = local::sandbox_dir_for(input.get("_thread_id").and_then(|v| v.as_str()));
+                    if let Some(ws) = ws.as_deref() {
+                        wsync::before(ws, &sandbox).await;
+                    }
                     let r = local::run_tool("execute_command", &input).await;
+                    if let Some(ws) = ws.as_deref() {
+                        wsync::after(ws, &sandbox).await;
+                    }
                     let ok = r.error.is_none() && matches!(r.exit_code, Some(0) | None);
                     let mut out = r.output;
                     if let Some(e) = r.error {
@@ -8539,7 +8587,7 @@ pub async fn run_chat(
                     } else if let Some(code) = r.exit_code.filter(|c| *c != 0) {
                         out.push_str(&format!("\n(exit {code})"));
                     }
-                    dtx.send(DeferResult::Bash(out, ok)).ok();
+                    dtx.send(DeferResult::Bash(id, out, ok)).ok();
                 });
             }
             Some(Defer::OpenFiles) => {
@@ -9559,6 +9607,8 @@ mod tests {
         assert_eq!(a(&["strobes", "--tenant", "x", "status"]), vec!["strobes", "status", "--tenant", "x"]);
         assert_eq!(a(&["strobes", "scan", "status", "page"]), vec!["strobes", "scan", "status", "page"]);
         assert_eq!(a(&["strobes", "status"]), vec!["strobes", "status"]);
+        // After a non-global flag, a subcommand name is just the prompt.
+        assert_eq!(a(&["strobes", "-p", "login"]), vec!["strobes", "-p", "login"]);
     }
 
     #[test]

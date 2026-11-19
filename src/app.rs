@@ -349,6 +349,8 @@ pub struct App {
     /// listed lazily the first time `@` is typed.
     mention_files: Option<Vec<String>>,
     mention_sel: usize,
+    /// Counter for `!cmd` call ids.
+    bash_seq: u64,
     /// Big pastes, shown in the prompt as "[Pasted text #n +L lines]" and
     /// expanded back when the message is sent.
     pastes: Vec<String>,
@@ -431,12 +433,40 @@ fn history_path() -> Option<std::path::PathBuf> {
     dirs::config_dir().map(|d| d.join("strobes-ai").join("prompt_history"))
 }
 
-/// Prompts are stored one per line with `\n` escaped, newest last.
+/// Prompts are stored one JSON string per line, newest last (older files
+/// used a lossy `\n` escape; those lines are read the old way).
 fn load_prompt_history() -> Vec<String> {
     history_path()
         .and_then(|p| std::fs::read_to_string(p).ok())
-        .map(|s| s.lines().filter(|l| !l.is_empty()).map(|l| l.replace("\\n", "\n")).collect())
+        .map(|s| {
+            s.lines()
+                .filter(|l| !l.is_empty())
+                .map(|l| serde_json::from_str::<String>(l).unwrap_or_else(|_| l.replace("\\n", "\n")))
+                .collect()
+        })
         .unwrap_or_default()
+}
+
+/// Write the history privately (prompts can contain secrets).
+fn save_prompt_history(lines: &[String]) {
+    let Some(p) = history_path() else { return };
+    let body: String = lines.iter().map(|h| serde_json::to_string(h).unwrap_or_default() + "\n").collect();
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    if let Ok(mut f) = opts.open(&p) {
+        use std::io::Write;
+        let _ = f.write_all(body.as_bytes());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
+        }
+    }
 }
 
 /// ASCII banner shown at the top of a fresh chat transcript and the pickers.
@@ -531,6 +561,7 @@ impl App {
             pastes: Vec::new(),
             mention_files: None,
             mention_sel: 0,
+            bash_seq: 0,
             history: load_prompt_history(),
             hist_pos: None,
         };
@@ -2135,10 +2166,7 @@ impl App {
             let cut = self.history.len() - 500;
             self.history.drain(..cut);
         }
-        if let Some(p) = history_path() {
-            let body: Vec<String> = self.history.iter().map(|h| h.replace('\n', "\\n")).collect();
-            let _ = std::fs::write(p, body.join("\n") + "\n");
-        }
+        save_prompt_history(&self.history);
     }
 
     /// ↑ on an empty (or recalled) prompt: step back through sent prompts.
@@ -2992,25 +3020,29 @@ impl App {
     }
 
     /// `!cmd` bash mode: show the command as a running call.
-    pub fn bash_started(&mut self, cmd: &str) {
+    pub fn bash_started(&mut self, cmd: &str) -> String {
         self.flush_stream();
+        self.bash_seq += 1;
+        let id = format!("__bash__{}", self.bash_seq);
         self.blocks.push(Block::Tool {
             name: "__bash__".into(),
             detail: cmd.to_string(),
             status: ToolStatus::Running,
             agent: "__user__".into(),
-            call_id: None,
+            call_id: Some(id.clone()),
             local_id: None,
         });
         self.follow = true;
         self.pinned = false;
+        id
     }
 
     /// `!cmd` finished: settle the call and show its output.
-    pub fn bash_done(&mut self, output: String, ok: bool) {
-        self.finish_last_tool("__user__", ok);
+    pub fn bash_done(&mut self, id: &str, output: String, ok: bool) {
         let text = if output.trim().is_empty() { "(no output)".to_string() } else { output };
-        self.blocks.push(Block::ToolResult { text, failed: !ok });
+        if !self.attach_by_id(Some(id), &text, !ok) {
+            self.blocks.push(Block::ToolResult { text, failed: !ok });
+        }
         self.follow = true;
     }
 
@@ -3154,8 +3186,9 @@ impl App {
     /// Attach a tool's result under its call. The wrapper tool and the local
     /// execution it drives both report the same output; show it once.
     fn push_tool_result(&mut self, text: String, failed: bool) {
-        let dup = self.blocks.iter().rev().take(3).any(|b| matches!(b,
-            Block::ToolResult { text: t, .. } if t.trim() == text.trim()));
+        // Only a report repeated back-to-back is a duplicate; another call
+        // that happens to return the same text keeps its own result.
+        let dup = matches!(self.blocks.last(), Some(Block::ToolResult { text: t, .. }) if t.trim() == text.trim());
         if !dup {
             self.blocks.push(Block::ToolResult { text, failed });
         }
