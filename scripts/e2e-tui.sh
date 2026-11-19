@@ -63,7 +63,7 @@ echo "▸ menus"
 keys "?"; check "? shows shortcuts" "search prompt history"
 keys Escape; sleep 0.3
 keys "/"; check "/ opens the command menu with built-ins first" "/help +Show commands"
-keys "hel"; sleep 0.2; keys Enter; check "/help prints commands" "^ *Commands"
+keys "hel"; sleep 0.2; keys Enter; check "/help prints commands and shortcuts" "^ *Shortcuts"
 keys "!echo e2e-bash-ok" Enter; check "!cmd runs locally" "Bash\(echo e2e-bash-ok\)" 10
 check "!cmd output under its call" "⎿  e2e-bash-ok"
 keys Up; check "↑ recalls the last prompt" "> !echo e2e-bash-ok"

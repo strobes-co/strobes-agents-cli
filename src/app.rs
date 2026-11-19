@@ -114,7 +114,7 @@ enum Block {
     /// checklists stacked on top of each other.
     Todos { agent: String, items: Vec<TodoItem> },
     /// A tool call's result, shown as "  ⎿  first lines…" under the call.
-    ToolResult { text: String, failed: bool },
+    ToolResult { text: String, failed: bool, ms: Option<u64> },
     /// Where a sub-agent's work sits in the main transcript (index into
     /// `App::subs`). Its own text and tool calls live in that run, never
     /// interleaved with the main agent's.
@@ -378,6 +378,8 @@ pub struct App {
     context_pct: Option<f64>,
     /// Sub-agent runs, each with its own transcript (see Block::SubAgent).
     subs: Vec<SubAgentRun>,
+    /// Duration of the tool result about to be attached (one-shot).
+    next_result_ms: Option<u64>,
     /// Latest output lines of running local commands, by tool-call id.
     live_tails: HashMap<String, std::collections::VecDeque<String>>,
     live_gen: u64,
@@ -605,6 +607,7 @@ impl App {
             bash_seq: 0,
             context_pct: None,
             subs: Vec::new(),
+            next_result_ms: None,
             live_tails: HashMap::new(),
             live_gen: 0,
             replaying: false,
@@ -1292,6 +1295,7 @@ impl App {
                     }
                 }
                 // Result rendered as a dim child block under ITS call.
+                self.next_result_ms = item.status.as_deref().and_then(|s| s.trim_end_matches("ms").trim().parse::<f64>().ok()).map(|v| v as u64);
                 let d = item.detail.unwrap_or_default();
                 let body = if d.is_empty() {
                     "(ok)".to_string()
@@ -1435,7 +1439,7 @@ impl App {
                     8u8.hash(h);
                     l.len().hash(h);
                 }
-                Block::ToolResult { text, failed } => {
+                Block::ToolResult { text, failed, .. } => {
                     10u8.hash(h);
                     text.len().hash(h);
                     failed.hash(h);
@@ -1607,7 +1611,7 @@ impl App {
                     blank(&mut out);
                     out.push(rule_line(label));
                 }
-                Block::ToolResult { text, failed } => {
+                Block::ToolResult { text, failed, ms } => {
                     let style = if *failed {
                         Style::default().fg(Color::Red)
                     } else {
@@ -1620,7 +1624,17 @@ impl App {
                     }
                     for (i, l) in lines.iter().take(limit).enumerate() {
                         let lead = if i == 0 { "  ⎿  " } else { "     " };
-                        out.push(Line::from(Span::styled(format!("{lead}{}", truncate(l, 400)), style)));
+                        let mut spans = vec![Span::styled(format!("{lead}{}", truncate(l, 400)), style)];
+                        // How long slow calls took (≥ 5s) — scans, crawls, sub-agents.
+                        if let (0, Some(ms)) = (i, ms) {
+                            if *ms >= 5000 {
+                                spans.push(Span::styled(
+                                    format!("  · {}", fmt_elapsed(std::time::Duration::from_millis(*ms))),
+                                    Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+                                ));
+                            }
+                        }
+                        out.push(Line::from(spans));
                     }
                     if lines.len() > limit {
                         out.push(Line::from(Span::styled(
@@ -2786,6 +2800,7 @@ impl App {
             }
             "tool.output" if is_silent_tool(&pstr("toolName")) => {}
             "tool.output" => {
+                self.next_result_ms = p.get("durationMs").and_then(|d| d.as_f64().or_else(|| d.as_str().and_then(|s| s.parse().ok()))).map(|v| v as u64);
                 let body = match p.get("result") {
                     Some(v) => tool_summary(&pstr("toolName"), v).unwrap_or_else(|| concise_result_value(v)),
                     None => "(ok)".to_string(),
@@ -3517,7 +3532,8 @@ impl App {
     pub fn bash_done(&mut self, id: &str, output: String, ok: bool) {
         let text = if output.trim().is_empty() { "(no output)".to_string() } else { output };
         if !self.attach_by_id(Some(id), &text, !ok) {
-            self.blocks.push(Block::ToolResult { text, failed: !ok });
+            let ms = self.next_result_ms.take();
+            self.blocks.push(Block::ToolResult { text, failed: !ok, ms });
         }
         self.follow = true;
     }
@@ -3580,7 +3596,8 @@ impl App {
         }
         // One result per call: the wrapper and its local mirror both report.
         if !matches!(self.blocks.get(i + 1), Some(Block::ToolResult { .. })) {
-            self.blocks.insert(i + 1, Block::ToolResult { text: text.to_string(), failed });
+            let ms = self.next_result_ms.take();
+            self.blocks.insert(i + 1, Block::ToolResult { text: text.to_string(), failed, ms });
         }
         self.follow = true;
         true
@@ -3661,7 +3678,8 @@ impl App {
         }
         let dup = matches!(self.blocks.get(i + 1), Some(Block::ToolResult { text: t, .. }) if t.trim() == text.trim());
         if !dup {
-            self.blocks.insert(i + 1, Block::ToolResult { text, failed });
+            let ms = self.next_result_ms.take();
+            self.blocks.insert(i + 1, Block::ToolResult { text, failed, ms });
         }
         self.follow = true;
     }
@@ -3674,7 +3692,8 @@ impl App {
         // that happens to return the same text keeps its own result.
         let dup = matches!(self.blocks.last(), Some(Block::ToolResult { text: t, .. }) if t.trim() == text.trim());
         if !dup {
-            self.blocks.push(Block::ToolResult { text, failed });
+            let ms = self.next_result_ms.take();
+            self.blocks.push(Block::ToolResult { text, failed, ms });
         }
         self.follow = true;
     }
