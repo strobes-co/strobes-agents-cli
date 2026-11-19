@@ -883,6 +883,14 @@ impl App {
 
     pub fn on_app_event(&mut self, ev: AppEvent) {
         match ev {
+            AppEvent::InsertInput(text) => {
+                // Keep a space between it and whatever is already typed.
+                let before = self.input[..self.input_cursor.min(self.input.len())].chars().last();
+                if before.is_some_and(|c| !c.is_whitespace()) {
+                    self.input_insert_str(" ");
+                }
+                self.input_insert_str(&format!("{text} "));
+            }
             AppEvent::Connected => {
                 self.connected = true;
                 self.status = "connected".into();

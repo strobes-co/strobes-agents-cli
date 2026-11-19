@@ -1901,6 +1901,7 @@ async fn upload_entries_task(
     let total_bytes: u64 = sizes.iter().sum();
     let mut done_bytes: u64 = 0;
     let (mut ok, mut failed) = (0usize, 0usize);
+    let mut uploaded: Vec<String> = Vec::new();
     for (i, (path, prefix)) in entries.iter().enumerate() {
         let shown = path
             .file_name()
@@ -1921,7 +1922,10 @@ async fn upload_entries_task(
         ))));
         let local = path.to_string_lossy().to_string();
         match upload_one(&client, &ws, &local, prefix, &sync_roots).await {
-            Ok(_) => ok += 1,
+            Ok(dest) => {
+                ok += 1;
+                uploaded.push(dest);
+            }
             Err(e) => {
                 failed += 1;
                 let _ = tx.send(pulse::AppEvent::Error(format!(
@@ -1936,7 +1940,7 @@ async fn upload_entries_task(
     }
     let _ = tx.send(pulse::AppEvent::Progress(None));
     let where_to = match sync_roots.first() {
-        Some(r) => format!(" (synced to {})", r.display()),
+        Some(r) => format!(" (synced to {})", commands::short_path(r)),
         None => String::new(),
     };
     if ok > 0 {
@@ -1945,11 +1949,40 @@ async fn upload_entries_task(
             "✔ uploaded {ok}/{total} file(s) · {} to the workspace{where_to}{fail_note}",
             fmt_bytes(total_bytes)
         )));
+        // Reference what was uploaded in the prompt, the way the web app's
+        // attach does, so the next message points the agent at it.
+        let refs = upload_refs(&uploaded);
+        if !refs.is_empty() {
+            let _ = tx.send(pulse::AppEvent::InsertInput(refs));
+        }
     } else {
         let _ = tx.send(pulse::AppEvent::Notice(format!(
             "✗ no files uploaded ({failed} failed)"
         )));
     }
+}
+
+/// `[workspace file: …]` references for uploaded paths: one per file, or one
+/// per top-level folder when a whole tree was dropped.
+fn upload_refs(paths: &[String]) -> String {
+    const MAX_FILES: usize = 5;
+    let mut items: Vec<String> = if paths.len() <= MAX_FILES {
+        paths.to_vec()
+    } else {
+        let mut tops: Vec<String> = Vec::new();
+        for p in paths {
+            let top = match p.split_once('/') {
+                Some((dir, _)) => format!("{dir}/"),
+                None => p.clone(),
+            };
+            if !tops.contains(&top) {
+                tops.push(top);
+            }
+        }
+        tops
+    };
+    items.truncate(10);
+    items.iter().map(|p| format!("[workspace file: {p}]")).collect::<Vec<_>>().join(" ")
 }
 
 /// Human-readable byte count (B / KB / MB / GB, 1024-based).
@@ -7602,6 +7635,7 @@ fn describe(ev: &pulse::AppEvent) -> String {
     use pulse::AppEvent::*;
     match ev {
         Connected => "connected".into(),
+        InsertInput(t) => format!("insert: {t}"),
         Disconnected(w) => format!("disconnected: {w}"),
         RunStarted => "run started".into(),
         RunFinished(l) => format!("run finished: {l}"),
@@ -10661,6 +10695,15 @@ mod tests {
     /// The server marks its own cells `internal` and sends the agent's
     /// unwrapped input as `display`: internal cells still run but never reach
     /// the transcript; agent cells show `display`, not the wrapped input.
+    #[test]
+    fn upload_refs_name_files_or_their_folder() {
+        assert_eq!(upload_refs(&["burp.xml".into()]), "[workspace file: burp.xml]");
+        assert_eq!(upload_refs(&["a.png".into(), "b.har".into()]), "[workspace file: a.png] [workspace file: b.har]");
+        let tree: Vec<String> = (0..9).map(|i| format!("src/f{i}.py")).chain(["README.md".to_string()]).collect();
+        assert_eq!(upload_refs(&tree), "[workspace file: src/] [workspace file: README.md]");
+        assert_eq!(upload_refs(&[]), "");
+    }
+
     #[tokio::test]
     async fn local_execute_internal_and_display() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

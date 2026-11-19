@@ -50,6 +50,9 @@ pub struct Field {
 
 #[derive(Debug, Clone)]
 pub enum AppEvent {
+    /// Text to drop into the prompt at the cursor (e.g. references to files
+    /// just uploaded).
+    InsertInput(String),
     Connected,
     Disconnected(String),
     Stream(StreamItem),
