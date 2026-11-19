@@ -205,8 +205,10 @@ enum Launch {
     Fresh,
     /// Reopen the most recent chat (`-c`).
     Continue,
-    /// Show the workspace → thread pickers (`-r`, `strobes chat`).
+    /// Show the workspace → thread pickers (`strobes chat`).
     Pick,
+    /// Open the last chat with the resume list on top (`-r`).
+    ResumeList,
     /// A specific thread (`-r <id>`, `--thread`).
     Thread(String),
 }
@@ -989,7 +991,7 @@ async fn main() -> Result<()> {
         }
         let launch = match (&cli.resume, cli.cont) {
             (Some(t), _) if !t.is_empty() => Launch::Thread(t.clone()),
-            (Some(_), _) => Launch::Pick,
+            (Some(_), _) => Launch::ResumeList,
             (None, true) => Launch::Continue,
             (None, false) => Launch::Fresh,
         };
@@ -1149,6 +1151,7 @@ async fn chat_flow(
     // `initial_msg` is auto-sent on connect (the launch prompt, or a new
     // workspace's setup prompt).
     let mut initial_msg: Option<String> = prompt;
+    let open_resume = matches!(launch, Launch::ResumeList);
     let thread_id = match launch {
         Launch::Thread(t) => t,
         // The last chat only if it belongs to the workspace asked for.
@@ -1157,6 +1160,10 @@ async fn chat_flow(
             None => fresh_thread(terminal, &profile, None).await?,
         },
         Launch::Fresh => fresh_thread(terminal, &profile, reusable.as_deref()).await?,
+        Launch::ResumeList => match reusable.clone() {
+            Some(t) => t,
+            None => fresh_thread(terminal, &profile, None).await?,
+        },
         Launch::Pick => {
             // Esc on the thread picker steps back to the workspace picker; Esc on
             // the workspace picker (or ^C anywhere) quits cleanly.
@@ -1203,7 +1210,7 @@ async fn chat_flow(
         }
         let _ = cfg.save();
     }
-    run_chat(terminal, tenant, profile, thread_id, model, reasoning, initial_msg).await
+    run_chat(terminal, tenant, profile, thread_id, model, reasoning, initial_msg, open_resume).await
 }
 
 /// A new chat thread in the profile's workspace, created behind the loader.
@@ -7881,6 +7888,7 @@ pub async fn run_chat(
     model: Option<i64>,
     reasoning: Option<String>,
     initial_msg: Option<String>,
+    open_resume: bool,
 ) -> Result<()> {
     require_complete(&profile)?;
 
@@ -7987,6 +7995,11 @@ pub async fn run_chat(
             app.running = true;
             app.status = "sending…".into();
         }
+    }
+
+    // `strobes -r`: the chat opens with the resume list on top.
+    if open_resume {
+        defer_tx.send(DeferResult::Then(Defer::Threads)).ok();
     }
 
     let mut events = EventStream::new();

@@ -354,7 +354,7 @@ jobs:
 strobes                                  # start chatting (logs you in on first run)
 strobes "find exposed admin panels on example.com"   # start with a prompt
 strobes -c                               # continue the last chat
-strobes -r                               # pick a chat to resume (or -r <thread-id>)
+strobes -r                               # resume: opens the chat list (or -r <thread-id>)
 strobes -p "summarize open findings"     # print the answer and exit — scriptable
 cat scan.log | strobes -p "triage this"  # stdin is appended to the prompt
 strobes -w <workspace-id> -m 18          # pick workspace / model for this run
