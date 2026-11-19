@@ -2274,7 +2274,7 @@ async fn cmd_send(
                 pulse::AppEvent::Stream(item) => match item.kind.as_str() {
                     "token" => {
                         if let Some(text) = &item.text {
-                            if text.trim().len() >= 8 && text.trim() == segment.trim() {
+                            if text.trim().len() >= 8 && (text.trim() == segment.trim() || app::is_replay(&segment, text)) {
                                 continue;
                             }
                             segment.push_str(text);

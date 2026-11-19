@@ -749,6 +749,10 @@ impl App {
             return;
         }
         if let Some(Block::Assistant { agent: prev_agent, md: prev_md }) = self.blocks.last_mut() {
+            // A segment the server sent twice (whole, or just its last chunk).
+            if *prev_agent == agent && is_replay(prev_md, &md) {
+                return;
+            }
             if *prev_agent == agent {
                 prev_md.push_str("\n\n");
                 prev_md.push_str(&md);
@@ -814,10 +818,10 @@ impl App {
         // the whole text. Appending it would print the answer twice.
         if text.trim().len() >= 8 {
             let replay = match &self.stream {
-                Some(s) if s.thinking == thinking => s.buf.trim() == text.trim(),
+                Some(s) if s.thinking == thinking => is_replay(&s.buf, &text),
                 Some(_) => false,
                 None => matches!(self.blocks.last(),
-                    Some(Block::Assistant { md, .. }) if !thinking && md.trim() == text.trim())
+                    Some(Block::Assistant { md, .. }) if !thinking && is_replay(md, &text))
                     || matches!(self.blocks.last(), Some(Block::Thinking(t)) if thinking && t.trim() == text.trim()),
             };
             if replay {
@@ -3657,6 +3661,15 @@ pub fn set_terminal_title(title: &str) {
     let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::SetTitle(t));
 }
 
+/// Is `chunk` a server re-send of text already shown? Older servers race two
+/// flushes of the same buffer, re-sending the whole segment or just its last
+/// chunk, so the same words land twice in a row. Short chunks are never
+/// treated as replays (they legitimately repeat: "a", " the", "\n").
+pub fn is_replay(shown: &str, chunk: &str) -> bool {
+    let c = chunk.trim();
+    c.chars().count() >= 12 && shown.trim_end().ends_with(c)
+}
+
 /// The server's "──── Run cancelled. Completed N operations…" message.
 fn is_cancel_receipt(md: &str) -> bool {
     // e.g. "\n\n---\n**Run cancelled.** Completed 0 operations …"
@@ -4275,6 +4288,28 @@ mod input_editor_tests {
         let joined: String = a.build_lines(100).iter()
             .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>()).collect::<Vec<_>>().join("\n");
         assert!(joined.contains("Result: admin."), "{joined}");
+    }
+
+    #[test]
+    fn replayed_last_chunk_is_dropped() {
+        let mut a = app();
+        let tok = |t: &str| StreamItem {
+            kind: "token".into(), agent: Some("Strobes AI Supervisor".into()), text: Some(t.into()),
+            tool_name: None, detail: None, status: None, local: false, task_id: None, call_id: None,
+        };
+        a.on_stream(tok("What would you like to do?"));
+        a.on_stream(tok("\n\nJust let me know how you'd like to proceed!"));
+        a.on_stream(tok("\n\nJust let me know how you'd like to proceed!"));
+        assert_eq!(a.stream.as_ref().unwrap().buf.matches("proceed!").count(), 1);
+        // Short pieces that genuinely repeat still get through.
+        a.on_stream(tok(" ok"));
+        a.on_stream(tok(" ok"));
+        assert!(a.stream.as_ref().unwrap().buf.ends_with(" ok ok"));
+        // History: a segment persisted twice renders once.
+        let mut h = app();
+        h.push_assistant("Strobes AI Supervisor".into(), "Hi!\n\nJust let me know how you'd like to proceed!".into());
+        h.push_assistant("Strobes AI Supervisor".into(), "Just let me know how you'd like to proceed!".into());
+        assert_eq!(h.transcript_plaintext().matches("proceed!").count(), 1);
     }
 
     #[test]
