@@ -78,6 +78,8 @@ enum ToolStatus {
 /// One transcript entry.
 /// Max lines of a code/command tool call shown before a "ctrl+o" hint.
 const CODE_PREVIEW_LINES: usize = 5;
+/// Lines of a tool's output shown under the call before "+N lines".
+const RESULT_PREVIEW_LINES: usize = 3;
 
 enum Block {
     User(String),
@@ -100,6 +102,8 @@ enum Block {
     /// per item, so a 5-item list rendered as 5 growing, near-duplicate
     /// checklists stacked on top of each other.
     Todos { agent: String, items: Vec<TodoItem> },
+    /// A tool call's result, shown as "  ⎿  first lines…" under the call.
+    ToolResult { text: String, failed: bool },
 }
 
 #[derive(Clone)]
@@ -319,6 +323,65 @@ pub struct App {
     /// `lines_fingerprint` against a cheap content hash each frame instead.
     lines_cache: Vec<Line<'static>>,
     lines_fingerprint: u64,
+    /// `?` on an empty prompt shows the shortcuts panel under the input.
+    pub show_help: bool,
+    /// One-shot footer hint ("Press Ctrl-C again to exit", …) and when it
+    /// was armed; it expires after a couple of seconds.
+    armed: Option<(Armed, std::time::Instant)>,
+    /// Previously sent prompts (oldest first) for ↑/↓ recall.
+    history: Vec<String>,
+    /// Position while browsing `history`, plus the draft it replaced.
+    hist_pos: Option<(usize, String)>,
+}
+
+/// A key that needs a second press to act.
+#[derive(Clone, Copy, PartialEq)]
+pub enum Armed {
+    Quit,
+    ClearInput,
+}
+
+/// Client-side slash commands, handled by the CLI itself (never sent to the
+/// agent). Listed first in the `/` menu.
+pub const BUILTIN_COMMANDS: &[(&str, &str)] = &[
+    ("help", "Show commands and keyboard shortcuts"),
+    ("new", "Start a new chat (alias /clear)"),
+    ("resume", "Switch to another chat in this workspace"),
+    ("workspace", "Switch or bind a workspace"),
+    ("model", "Choose the AI model"),
+    ("findings", "Browse this workspace's findings"),
+    ("approvals", "Review pending approvals"),
+    ("files", "Browse the workspace's local files"),
+    ("copy", "Copy the transcript to the clipboard"),
+    ("thinking", "Show or hide the agent's reasoning"),
+    ("status", "Show tenant, workspace, chat and usage"),
+    ("exit", "Quit (alias /quit)"),
+];
+
+/// Resolve a typed `/name` to a built-in command (aliases included).
+pub fn builtin_command(name: &str) -> Option<&'static str> {
+    let n = match name {
+        "clear" | "reset" => "new",
+        "quit" | "q" => "exit",
+        "threads" | "chats" => "resume",
+        "workspaces" | "ws" => "workspace",
+        "models" => "model",
+        "?" | "h" => "help",
+        other => other,
+    };
+    BUILTIN_COMMANDS.iter().find(|(c, _)| *c == n).map(|(c, _)| *c)
+}
+
+fn history_path() -> Option<std::path::PathBuf> {
+    dirs::config_dir().map(|d| d.join("strobes-ai").join("prompt_history"))
+}
+
+/// Prompts are stored one per line with `\n` escaped, newest last.
+fn load_prompt_history() -> Vec<String> {
+    history_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|s| s.lines().filter(|l| !l.is_empty()).map(|l| l.replace("\\n", "\n")).collect())
+        .unwrap_or_default()
 }
 
 /// ASCII banner shown at the top of a fresh chat transcript and the pickers.
@@ -408,10 +471,15 @@ impl App {
             // practice, but even if it did, an empty cache just means the
             // first draw does one harmless extra rebuild.
             lines_fingerprint: 0,
+            show_help: false,
+            armed: None,
+            history: load_prompt_history(),
+            hist_pos: None,
         };
         let org = if org_id.len() > 8 { &org_id[..8] } else { &org_id };
         app.auth_line = format!("✔ authenticated · tenant: {tenant} · {} · org {org}", app.base);
         app.push_banner();
+        app.set_slash_commands(Vec::new());
         app
     }
 
@@ -420,15 +488,25 @@ impl App {
     /// when the chat opens and again whenever the transcript is cleared for
     /// another thread, so the logo is always the very first thing in it.
     fn push_banner(&mut self) {
-        const LEFT: &str = "   ";
-        for line in banner_spans(LEFT) {
-            self.blocks.push(Block::Plain(line));
-        }
+        let dim = Style::default().fg(Color::DarkGray);
+        self.blocks.push(Block::Plain(Line::from(vec![
+            Span::styled("✻ ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::styled("Strobes Agents", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("  v{}", env!("CARGO_PKG_VERSION")), dim),
+        ])));
         self.blocks.push(Block::Plain(Line::from(Span::styled(
-            format!("{LEFT}{}", self.auth_line),
-            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+            format!("  {}", self.auth_line.trim_start_matches("✔ authenticated · ")),
+            dim,
         ))));
-        self.sys("Enter: send · Ctrl-C: cancel/quit · Esc: quit · PgUp/PgDn: scroll · Ctrl-T: thinking · Ctrl-R: markdown · Ctrl-O: full code");
+        self.blocks.push(Block::Plain(Line::from(vec![
+            Span::styled("  ", dim),
+            Span::styled("/", Style::default().fg(Color::White)),
+            Span::styled(" commands · ", dim),
+            Span::styled("?", Style::default().fg(Color::White)),
+            Span::styled(" shortcuts · ", dim),
+            Span::styled("esc", Style::default().fg(Color::White)),
+            Span::styled(" interrupts the agent", dim),
+        ])));
     }
 
     // ---- transcript mutation -------------------------------------------
@@ -606,6 +684,20 @@ impl App {
     }
 
     fn feed(&mut self, agent: Option<String>, text: String, thinking: bool) {
+        // The server can replay a finished segment as one more token carrying
+        // the whole text. Appending it would print the answer twice.
+        if text.trim().len() >= 8 {
+            let replay = match &self.stream {
+                Some(s) if s.thinking == thinking => s.buf.trim() == text.trim(),
+                Some(_) => false,
+                None => matches!(self.blocks.last(),
+                    Some(Block::Assistant { md, .. }) if !thinking && md.trim() == text.trim())
+                    || matches!(self.blocks.last(), Some(Block::Thinking(t)) if thinking && t.trim() == text.trim()),
+            };
+            if replay {
+                return;
+            }
+        }
         match &mut self.stream {
             Some(s) if s.thinking == thinking => s.buf.push_str(&text),
             _ => {
@@ -664,7 +756,15 @@ impl App {
                 self.last_elapsed = self.run_started.take().map(|t| t.elapsed());
                 let took = self.last_elapsed.map(|d| format!(" · {}", fmt_elapsed(d))).unwrap_or_default();
                 self.status = format!("idle ({label}){took}");
-                self.rule(&label);
+                if label != "completed" {
+                    self.flush_stream();
+                    let msg = match label.as_str() {
+                        "cancelled" | "canceled" | "interrupted" => "  ⎿  Interrupted · what should I do instead?".to_string(),
+                        other => format!("  ⎿  Run {other}"),
+                    };
+                    self.blocks.push(Block::Plain(Line::from(Span::styled(msg, Style::default().fg(Color::Red)))));
+                }
+                self.follow = true;
             }
             AppEvent::Notice(n) => self.notice(&n),
             AppEvent::Progress(Some(msg)) => self.set_busy(msg),
@@ -791,7 +891,43 @@ impl App {
                 // One compact line per tool call: "⏺ name(args)". A tool often
                 // emits an empty `start` then a detailed `local_execute` for the
                 // same call — collapse them by replacing the previous line.
-                if self.last_tool.as_ref() == Some(&(agent.clone(), name.clone())) {
+                // The server's wrapper tool (e.g. workspace_execute_shell_command)
+                // and the local execution it triggers (execute_command) are one
+                // call to the reader: a local start, or a repeated start of a
+                // call still running, enriches that call instead of adding a line.
+                let open = self.blocks.iter().rev().take(4).position(|b| matches!(b,
+                    Block::Tool { status: ToolStatus::Running, agent: a, name: n, .. }
+                        if a == &agent && (item.local || n == &name)));
+                // The server also re-announces a wrapper call (with its args)
+                // after it finished: same tool, nothing but its result and
+                // reasoning since → it's the call already on screen.
+                let open = open.or_else(|| {
+                    let label = tool_label(&name);
+                    for (back, b) in self.blocks.iter().rev().take(4).enumerate() {
+                        match b {
+                            Block::ToolResult { .. } | Block::Thinking(_) => continue,
+                            Block::Tool { agent: a, name: n, detail: d, .. }
+                                if a == &agent && tool_label(n) == label
+                                    && (d.trim() == detail.trim() || d.trim().is_empty() || detail.trim().is_empty()) =>
+                            {
+                                return Some(back);
+                            }
+                            _ => return None,
+                        }
+                    }
+                    None
+                });
+                if open.is_some() {
+                    self.flush_stream();
+                }
+                if let Some(back) = open {
+                    let i = self.blocks.len() - 1 - back;
+                    if let Block::Tool { detail: d, .. } = &mut self.blocks[i] {
+                        if d.trim().is_empty() && !detail.trim().is_empty() {
+                            *d = detail;
+                        }
+                    }
+                } else if self.last_tool.as_ref() == Some(&(agent.clone(), name.clone())) {
                     // Same call from the same agent: enrich the earlier
                     // (often empty) start in place.
                     if let Some(Block::Tool { detail: d, .. }) = self.blocks.last_mut() {
@@ -835,16 +971,12 @@ impl App {
                         return;
                     }
                 }
-                // Result rendered as a dim child line under the tool call.
-                let ms = item.status.map(|s| format!("  ·{s}")).unwrap_or_default();
+                // Result rendered as a dim child block under the tool call.
                 let d = item.detail.unwrap_or_default();
                 let body = if d.is_empty() { "(ok)".to_string() } else { concise_tool_result(&d) };
                 self.flush_stream();
                 self.finish_last_tool(&agent, true); // dot → green
-                self.blocks.push(Block::Plain(Line::from(Span::styled(
-                    format!("  ⎿ {body}{ms}"),
-                    Style::default().fg(Color::DarkGray),
-                ))));
+                self.push_tool_result(body, false);
                 self.last_tool = None;
                 self.follow = true;
             }
@@ -855,10 +987,7 @@ impl App {
                 let agent = item.agent.unwrap_or_else(|| "agent".into());
                 self.flush_stream();
                 self.finish_last_tool(&agent, false); // dot → red
-                self.blocks.push(Block::Plain(Line::from(Span::styled(
-                    format!("  ⎿ ✗ {}", truncate(&item.detail.unwrap_or_default(), 220)),
-                    Style::default().fg(Color::Red),
-                ))));
+                self.push_tool_result(truncate(&item.detail.unwrap_or_default(), 600), true);
                 self.last_tool = None;
                 self.follow = true;
             }
@@ -979,6 +1108,11 @@ impl App {
                     8u8.hash(&mut h);
                     l.len().hash(&mut h);
                 }
+                Block::ToolResult { text, failed } => {
+                    10u8.hash(&mut h);
+                    text.len().hash(&mut h);
+                    failed.hash(&mut h);
+                }
                 Block::Todos { agent, items } => {
                     9u8.hash(&mut h);
                     agent.len().hash(&mut h);
@@ -1022,18 +1156,21 @@ impl App {
                     cur_agent = None; // next agent reply re-prints its header
                     blank(&mut out);
                     out.push(Line::from(vec![
-                        Span::styled("› ".to_string(), Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
-                        Span::styled(text.clone(), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                        Span::styled("> ".to_string(), Style::default().fg(Color::DarkGray)),
+                        Span::styled(text.clone(), Style::default().fg(Color::Gray)),
                     ]));
                     blank(&mut out);
                 }
                 Block::Assistant { agent, md } => {
-                    if cur_agent.as_deref() != Some(agent.as_str()) {
+                    let first = cur_agent.as_deref() != Some(agent.as_str());
+                    if first {
                         blank(&mut out);
-                        out.push(agent_header(agent));
+                        if !is_main_agent(agent) {
+                            out.push(agent_header(agent));
+                        }
                         cur_agent = Some(agent.clone());
                     }
-                    self.render_md(md, &mut out);
+                    self.render_reply(md, first, &mut out);
                 }
                 Block::Thinking(s) => self.render_thinking(s, &mut out),
                 Block::Plain(l) => out.push(l.clone()),
@@ -1055,14 +1192,16 @@ impl App {
                         }
                     };
                     let name_span = Span::styled(
-                        name.clone(),
-                        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                        tool_label(name),
+                        Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
                     );
                     let dot = Span::styled("⏺ ".to_string(), dot_style);
                     let code_style = Style::default().fg(Color::Gray);
                     let dim = Style::default().fg(Color::DarkGray);
 
-                    if crate::pulse::is_verbatim_tool(name) && !detail.trim().is_empty() {
+                    blank(&mut out);
+                    cur_agent = None;
+                    if crate::pulse::is_verbatim_tool(name) && detail.trim().lines().count() > 1 {
                         // Code / shell-command calls render their source in a box:
                         // the tool name on its own line, then up to
                         // CODE_PREVIEW_LINES source lines wrapped INSIDE the box
@@ -1074,9 +1213,10 @@ impl App {
                         // Other tools: "⏺ name(args)" on one line, args in a
                         // readable gray with dim parens.
                         let mut spans = vec![dot, name_span];
+                        let detail = detail.trim();
                         if !detail.is_empty() {
                             spans.push(Span::styled("(".to_string(), dim));
-                            spans.push(Span::styled(detail.clone(), code_style));
+                            spans.push(Span::styled(truncate(detail, 160), code_style));
                             spans.push(Span::styled(")".to_string(), dim));
                         }
                         out.push(Line::from(spans));
@@ -1086,6 +1226,28 @@ impl App {
                     cur_agent = None;
                     blank(&mut out);
                     out.push(rule_line(label));
+                }
+                Block::ToolResult { text, failed } => {
+                    let style = if *failed {
+                        Style::default().fg(Color::Red)
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    };
+                    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+                    let limit = if self.show_full_code { usize::MAX } else { RESULT_PREVIEW_LINES };
+                    if lines.is_empty() {
+                        out.push(Line::from(Span::styled("  ⎿  (no output)".to_string(), style)));
+                    }
+                    for (i, l) in lines.iter().take(limit).enumerate() {
+                        let lead = if i == 0 { "  ⎿  " } else { "     " };
+                        out.push(Line::from(Span::styled(format!("{lead}{}", truncate(l, 400)), style)));
+                    }
+                    if lines.len() > limit {
+                        out.push(Line::from(Span::styled(
+                            format!("     … +{} lines (ctrl+o to expand)", lines.len() - limit),
+                            Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+                        )));
+                    }
                 }
                 Block::Todos { agent: _, items } => {
                     cur_agent = None;
@@ -1133,11 +1295,14 @@ impl App {
                     ]));
                 }
             } else {
-                if cur_agent.as_deref() != Some(s.agent.as_str()) {
+                let first = cur_agent.as_deref() != Some(s.agent.as_str());
+                if first {
                     blank(&mut out);
-                    out.push(agent_header(&s.agent));
+                    if !is_main_agent(&s.agent) {
+                        out.push(agent_header(&s.agent));
+                    }
                 }
-                self.render_md(&s.buf, &mut out);
+                self.render_reply(&s.buf, first, &mut out);
             }
         }
         out.iter_mut().for_each(win_safe_line);
@@ -1154,6 +1319,25 @@ impl App {
                     Style::default().fg(Color::White),
                 )));
             }
+        }
+    }
+
+    /// An agent reply: "⏺ " on its first line, the rest indented under it.
+    fn render_reply(&self, md: &str, bullet: bool, out: &mut Vec<Line<'static>>) {
+        let start = out.len();
+        self.render_md(md, out);
+        let mut lead = bullet;
+        for l in out[start..].iter_mut() {
+            if lead && l.spans.iter().all(|s| s.content.trim().is_empty()) {
+                continue; // keep the bullet for the first visible line
+            }
+            let pre = if lead {
+                Span::styled("⏺ ", Style::default().fg(Color::White))
+            } else {
+                Span::raw("  ")
+            };
+            lead = false;
+            l.spans.insert(0, pre);
         }
     }
 
@@ -1177,13 +1361,16 @@ impl App {
         // Input box grows with the wrapped message (borders + content), capped
         // so the transcript, hint and status rows always remain on screen.
         let tw = Self::input_text_width(f.area().width);
-        let cap = f.area().height.saturating_sub(3).max(3);
+        let help = if self.show_help { self.help_lines() } else { Vec::new() };
+        let footer_h = (help.len() as u16).max(1);
+        let cap = f.area().height.saturating_sub(3 + footer_h).max(3);
         let input_h = (self.input_visual_rows(tw) + 2).clamp(3, cap);
+        let activity_h = if self.activity_line().is_some() { 1 } else { 0 };
         let chunks = Layout::vertical([
             Constraint::Min(1),
+            Constraint::Length(activity_h),
             Constraint::Length(input_h),
-            Constraint::Length(1),
-            Constraint::Length(1),
+            Constraint::Length(footer_h),
         ])
         .split(f.area());
         if self.overlay.is_some() {
@@ -1193,7 +1380,9 @@ impl App {
         } else {
             // Show tasks side panel when there are tasks and the screen is wide enough.
             let body_area = chunks[0];
-            if !self.tasks.is_empty() && body_area.width > 60 {
+            // One task ("Exploring & Planning") is just noise; the panel earns
+            // its space once the agent has a real plan.
+            if self.tasks.len() >= 2 && body_area.width > 80 {
                 let panel_w = (body_area.width / 4).clamp(22, 36);
                 let hchunks = Layout::horizontal([
                     Constraint::Min(1),
@@ -1208,9 +1397,15 @@ impl App {
                 self.draw_slash_popup(f, chunks[0]);
             }
         }
-        self.draw_input(f, chunks[1]);
-        self.draw_hint(f, chunks[2]);
-        self.draw_status(f, chunks[3]);
+        if let Some(l) = self.activity_line() {
+            f.render_widget(Paragraph::new(l), chunks[1]);
+        }
+        self.draw_input(f, chunks[2]);
+        if self.show_help {
+            f.render_widget(Paragraph::new(help), chunks[3]);
+        } else {
+            self.draw_footer(f, chunks[3]);
+        }
         // Centered animated loader, drawn LAST so it floats on top of the chat
         // UI during an in-chat fetch (overlay open, thread switch, …).
         if let Some(label) = &self.loading {
@@ -1343,6 +1538,7 @@ impl App {
         f.render_widget(panel, area);
     }
 
+    #[allow(dead_code)]
     fn draw_hint(&self, f: &mut Frame, area: Rect) {
         let text = if self.overlay.is_some() {
             let back = match self.overlay_kind() {
@@ -1384,31 +1580,10 @@ impl App {
         let lines = self.lines_cache.clone();
         // Only top + bottom bars (no left/right borders) for a cleaner, wider
         // transcript; horizontal padding keeps text off the edges.
-        let mut block = TuiBlock::default()
-            .borders(Borders::TOP | Borders::BOTTOM)
-            .title(" transcript ")
-            .border_style(Style::default().fg(Color::Cyan))
-            .padding(Padding::new(PAD_X, PAD_X, PAD_Y, PAD_Y));
-        // Top-right: where work runs — workspace · current task.
-        let mut loc: Vec<String> = Vec::new();
-        if let Some(ws) = &self.workspace_name {
-            loc.push(format!("⊞ {}", truncate(ws, 28)));
-        }
-        if let Some(t) = &self.task_label {
-            loc.push(format!("▷ {}", truncate(t, 32)));
-        }
-        if !loc.is_empty() {
-            block = block.title_top(
-                Line::from(Span::styled(
-                    format!(" {} ", loc.join("  ·  ")),
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-                ))
-                .right_aligned(),
-            );
-        }
-        // No side borders → only the horizontal padding eats into the width.
+        // No chrome around the transcript — just padding, like a terminal.
+        let block = TuiBlock::default().padding(Padding::new(PAD_X, PAD_X, PAD_Y, 0));
         let inner_w = area.width.saturating_sub(2 * PAD_X);
-        let inner_h = area.height.saturating_sub(2 + 2 * PAD_Y);
+        let inner_h = area.height.saturating_sub(PAD_Y);
 
         let para = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
         let total = para.line_count(inner_w) as u16;
@@ -1595,14 +1770,15 @@ impl App {
 
     fn draw_input(&self, f: &mut Frame, area: Rect) {
         let (title, color) = if let Some(label) = self.pending_label() {
-            (format!(" answer: {label} (Enter to submit) "), Color::Cyan)
-        } else if self.running {
-            (" message (Enter send · ^J newline · ^C cancels) ".to_string(), Color::Yellow)
+            (format!(" {label} "), Color::Cyan)
+        } else if self.input.starts_with('/') {
+            (String::new(), Color::Cyan)
         } else {
-            (" message (Enter send · ^J newline) ".to_string(), Color::Green)
+            (String::new(), Color::DarkGray)
         };
         let block = TuiBlock::default()
             .borders(Borders::ALL)
+            .border_type(ratatui::widgets::BorderType::Rounded)
             .title(title)
             .border_style(Style::default().fg(color))
             .padding(Padding::horizontal(1));
@@ -1616,10 +1792,24 @@ impl App {
             .iter()
             .enumerate()
             .map(|(i, &(s, e))| {
-                let prefix = if i == 0 { "› " } else { "  " };
+                let prefix = if i == 0 { "> " } else { "  " };
                 Line::from(win_safe(&format!("{prefix}{}", &self.input[s..e])).into_owned())
             })
             .collect();
+        // Placeholder on an empty prompt, like a search box.
+        let lines = if self.input.is_empty() && self.pending.is_none() {
+            let tip = if self.running {
+                "Type to queue a follow-up · esc to interrupt"
+            } else {
+                "Ask anything — e.g. \"find exposed admin panels on example.com\""
+            };
+            vec![Line::from(vec![
+                Span::raw("> "),
+                Span::styled(tip, Style::default().fg(Color::DarkGray)),
+            ])]
+        } else {
+            lines
+        };
 
         // Scroll so the cursor's row stays visible when the message is taller
         // than the (capped) box.
@@ -1633,6 +1823,244 @@ impl App {
         f.set_cursor_position(ratatui::layout::Position { x: cx, y: cy });
     }
 
+    /// The line above the prompt while something is in flight:
+    /// "✻ Working… (12s · ◈ 0.012 cr · esc to interrupt)". None when idle.
+    fn activity_line(&self) -> Option<Line<'static>> {
+        const SPIN: [&str; 6] = ["✻", "✺", "✹", "✸", "✷", "✶"];
+        let glyph = SPIN[(self.spinner / 2) % SPIN.len()];
+        let (label, extra) = if let Some(msg) = &self.busy {
+            (msg.clone(), String::new())
+        } else if self.running {
+            let mut parts: Vec<String> = Vec::new();
+            if let Some(t) = self.run_started {
+                parts.push(fmt_elapsed(t.elapsed()));
+            }
+            if self.run_tokens > 0 {
+                parts.push(format!("↓ {}", fmt_tokens(self.run_tokens)));
+            }
+            parts.push("esc to interrupt".into());
+            let what = self.task_label.clone().map(|t| truncate(&t, 48)).unwrap_or_else(|| "Working…".into());
+            (what, format!(" ({})", parts.join(" · ")))
+        } else if !self.connected && !self.status.is_empty() && self.status != "connecting…" {
+            return Some(Line::from(Span::styled(
+                format!(" ○ {} — retrying…", self.status),
+                Style::default().fg(Color::Red),
+            )));
+        } else {
+            return None;
+        };
+        Some(Line::from(vec![
+            Span::styled(format!(" {glyph} "), Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+            Span::styled(label, Style::default().fg(Color::Magenta)),
+            Span::styled(extra, Style::default().fg(Color::DarkGray)),
+        ]))
+    }
+
+    /// One quiet line under the prompt: a contextual hint on the left, where
+    /// the work runs (workspace · model · usage) on the right.
+    fn draw_footer(&self, f: &mut Frame, area: Rect) {
+        let dim = Style::default().fg(Color::DarkGray);
+        let left = if let Some(a) = self.armed_now() {
+            match a {
+                Armed::Quit => "  Press Ctrl-C again to exit".to_string(),
+                Armed::ClearInput => "  Esc again to clear".to_string(),
+            }
+        } else if self.overlay.is_some() {
+            let search = if self.overlay_searchable() { "type to filter · " } else { "" };
+            format!("  {search}↑↓ select · enter open · esc back")
+        } else if self.pending.is_some() {
+            "  type your answer · enter to submit".to_string()
+        } else if self.select_mode {
+            "  select mode — drag to select, ⌘C copies · ctrl+s to exit".to_string()
+        } else if self.slash_open() {
+            "  ↑↓ select · tab/enter complete · esc cancel".to_string()
+        } else if self.input.contains('\n') {
+            "  enter to send · ctrl+j newline".to_string()
+        } else if !self.input.is_empty() {
+            "  enter to send · ctrl+j newline · ctrl+c clear".to_string()
+        } else {
+            "  ? for shortcuts".to_string()
+        };
+        let mut right: Vec<String> = Vec::new();
+        match &self.workspace_name {
+            Some(ws) => right.push(format!("⊞ {}", truncate(ws, 24))),
+            None => right.push("no workspace".into()),
+        }
+        right.push(crate::api::model_name(self.current_model).to_string());
+        if self.thread_credits > 0.0 {
+            right.push(format!("{:.2} cr", self.thread_credits));
+        }
+        let right = format!("{} ", right.join(" · "));
+        let rw = (right.chars().count() as u16).min(area.width / 2);
+        let parts = Layout::horizontal([Constraint::Min(1), Constraint::Length(rw)]).split(area);
+        let lstyle = if self.armed_now().is_some() { Style::default().fg(Color::Yellow) } else { dim };
+        f.render_widget(Paragraph::new(win_safe(&left).into_owned()).style(lstyle), parts[0]);
+        f.render_widget(
+            Paragraph::new(win_safe(&right).into_owned()).style(dim).alignment(ratatui::layout::Alignment::Right),
+            parts[1],
+        );
+    }
+
+    /// The `?` shortcuts panel (replaces the footer until the next key).
+    fn help_lines(&self) -> Vec<Line<'static>> {
+        let rows: [(&str, &str, &str, &str); 6] = [
+            ("/", "commands", "ctrl+p", "model"),
+            ("esc", "interrupt the agent", "ctrl+w", "workspaces"),
+            ("ctrl+c", "clear input · twice to quit", "ctrl+f", "findings"),
+            ("ctrl+j", "newline (shift+enter on kitty)", "ctrl+o", "expand tool output"),
+            ("↑ / ↓", "previous prompts", "ctrl+t", "show thinking"),
+            ("pgup/pgdn", "scroll the chat", "ctrl+y", "copy transcript"),
+        ];
+        let key = Style::default().fg(Color::White);
+        let dim = Style::default().fg(Color::DarkGray);
+        rows.iter()
+            .map(|(k1, d1, k2, d2)| {
+                Line::from(vec![
+                    Span::styled(format!("  {k1:<10}"), key),
+                    Span::styled(format!("{d1:<34}"), dim),
+                    Span::styled(format!("{k2:<8}"), key),
+                    Span::styled(d2.to_string(), dim),
+                ])
+            })
+            .collect()
+    }
+
+    /// Arm a two-press key; the footer shows its hint until it expires.
+    pub fn arm(&mut self, a: Armed) {
+        self.armed = Some((a, std::time::Instant::now()));
+    }
+
+    /// True if `a` was armed within the last two seconds (and disarms it).
+    pub fn take_armed(&mut self, a: Armed) -> bool {
+        let hit = self.armed_now() == Some(a);
+        self.armed = None;
+        hit
+    }
+
+    pub fn disarm(&mut self) {
+        self.armed = None;
+    }
+
+    fn armed_now(&self) -> Option<Armed> {
+        self.armed
+            .filter(|(_, t)| t.elapsed() < std::time::Duration::from_secs(2))
+            .map(|(a, _)| a)
+    }
+
+    /// Record a sent prompt for ↑ recall (and persist it, capped).
+    pub fn remember_prompt(&mut self, text: &str) {
+        self.hist_pos = None;
+        if text.trim().is_empty() || self.history.last().map(|l| l == text).unwrap_or(false) {
+            return;
+        }
+        self.history.push(text.to_string());
+        if self.history.len() > 500 {
+            let cut = self.history.len() - 500;
+            self.history.drain(..cut);
+        }
+        if let Some(p) = history_path() {
+            let body: Vec<String> = self.history.iter().map(|h| h.replace('\n', "\\n")).collect();
+            let _ = std::fs::write(p, body.join("\n") + "\n");
+        }
+    }
+
+    /// ↑ on an empty (or recalled) prompt: step back through sent prompts.
+    /// Returns false when there's nothing to recall (caller scrolls instead).
+    pub fn history_prev(&mut self) -> bool {
+        if self.history.is_empty() || (self.hist_pos.is_none() && !self.input.is_empty()) {
+            return false;
+        }
+        let idx = match &self.hist_pos {
+            None => {
+                self.hist_pos = Some((self.history.len() - 1, self.input.clone()));
+                self.history.len() - 1
+            }
+            Some((0, _)) => return true,
+            Some((i, d)) => {
+                let i = i - 1;
+                self.hist_pos = Some((i, d.clone()));
+                i
+            }
+        };
+        self.input = self.history[idx].clone();
+        self.input_cursor = self.input.len();
+        true
+    }
+
+    /// ↓ while browsing history: step forward, restoring the draft at the end.
+    pub fn history_next(&mut self) -> bool {
+        let Some((i, draft)) = self.hist_pos.clone() else { return false };
+        if i + 1 >= self.history.len() {
+            self.input = draft;
+            self.hist_pos = None;
+        } else {
+            self.hist_pos = Some((i + 1, draft));
+            self.input = self.history[i + 1].clone();
+        }
+        self.input_cursor = self.input.len();
+        true
+    }
+
+    /// Any edit ends history browsing (the recalled text becomes the draft).
+    pub fn end_history_browse(&mut self) {
+        self.hist_pos = None;
+    }
+
+    /// Print the built-in commands + shortcuts into the transcript (`/help`).
+    pub fn show_help_text(&mut self) {
+        self.flush_stream();
+        let key = Style::default().fg(Color::White);
+        let dim = Style::default().fg(Color::DarkGray);
+        self.blocks.push(Block::Plain(Line::default()));
+        self.blocks.push(Block::Plain(Line::from(Span::styled("Commands", key.add_modifier(Modifier::BOLD)))));
+        for (name, desc) in BUILTIN_COMMANDS {
+            self.blocks.push(Block::Plain(Line::from(vec![
+                Span::styled(format!("  /{name:<12}"), key),
+                Span::styled(desc.to_string(), dim),
+            ])));
+        }
+        let skills = self.slash_commands.len();
+        if skills > 0 {
+            self.blocks.push(Block::Plain(Line::from(Span::styled(
+                format!("  …plus {skills} agent skills — type / to browse them"),
+                dim,
+            ))));
+        }
+        self.blocks.push(Block::Plain(Line::default()));
+        self.blocks.push(Block::Plain(Line::from(Span::styled("Shortcuts", key.add_modifier(Modifier::BOLD)))));
+        for l in self.help_lines() {
+            self.blocks.push(Block::Plain(l));
+        }
+        self.follow = true;
+        self.pinned = false;
+    }
+
+    /// `/status`: where this chat runs and what it has used.
+    pub fn show_status_text(&mut self) {
+        self.flush_stream();
+        let key = Style::default().fg(Color::White);
+        let dim = Style::default().fg(Color::DarkGray);
+        let ws = self.workspace_name.clone().unwrap_or_else(|| "(none)".into());
+        let title = if self.title.is_empty() { "(untitled)".into() } else { self.title.clone() };
+        let rows = vec![
+            ("connection", format!("{} {}", if self.connected { "● connected" } else { "○ offline" }, self.base)),
+            ("workspace", ws),
+            ("chat", format!("{title}  ({})", self.thread_id)),
+            ("model", crate::api::model_name(self.current_model).to_string()),
+            ("usage", format!("{:.3} credits · {} this chat", self.thread_credits, fmt_tokens(self.thread_tokens))),
+        ];
+        self.blocks.push(Block::Plain(Line::default()));
+        for (k, v) in rows {
+            self.blocks.push(Block::Plain(Line::from(vec![
+                Span::styled(format!("  {k:<12}"), key),
+                Span::styled(v, dim),
+            ])));
+        }
+        self.follow = true;
+        self.pinned = false;
+    }
+
+    #[allow(dead_code)]
     fn draw_status(&self, f: &mut Frame, area: Rect) {
         let dot = if self.connected { "●" } else { "○" };
         let chat = if self.title.is_empty() {
@@ -1745,7 +2173,6 @@ impl App {
         if messages.is_empty() {
             return;
         }
-        self.rule("history");
         for m in messages {
             if m.text.trim().is_empty() {
                 continue;
@@ -1763,7 +2190,6 @@ impl App {
                 other => self.sys(&format!("· {other}: {}", m.text)),
             }
         }
-        self.rule("live");
         self.follow = true;
     }
 
@@ -1773,7 +2199,6 @@ impl App {
         if events.is_empty() {
             return;
         }
-        self.rule("history");
         for e in &events {
             let etype = e.get("type").and_then(|t| t.as_str()).unwrap_or("");
             let p = e.get("payload").cloned().unwrap_or(Value::Null);
@@ -1805,24 +2230,24 @@ impl App {
                     let name = pstr("toolName");
                     let args = crate::pulse::tool_detail(&name, p.get("arguments").unwrap_or(&Value::Null));
                     self.flush_stream();
-                    self.blocks.push(Block::Tool { name, detail: args, status: ToolStatus::Done, agent: agent.clone() });
+                    // Same wrapper/local pairing as the live path: one call, one line.
+                    let dup = self.blocks.iter().rev().take(3).any(|b| matches!(b,
+                        Block::Tool { agent: a, detail: d, .. } if a == &agent && (d == &args || args.trim().is_empty())));
+                    if !dup {
+                        self.blocks.push(Block::Tool { name, detail: args, status: ToolStatus::Done, agent: agent.clone() });
+                    }
                 }
                 "tool.output" => {
-                    let dur = p.get("durationMs").and_then(|d| d.as_i64())
-                        .map(|d| format!("  ·{d}ms")).unwrap_or_default();
                     let body = match p.get("result") {
                         Some(v) => concise_result_value(v),
                         None => "(ok)".to_string(),
                     };
                     let body = if body.is_empty() { "(ok)".to_string() } else { body };
-                    self.push(Line::from(Span::styled(
-                        format!("  ⎿ {body}{dur}"), Style::default().fg(Color::DarkGray))));
+                    self.push_tool_result(body, false);
                 }
                 "tool.failed" => {
                     self.finish_last_tool(&agent, false);
-                    self.push(Line::from(Span::styled(
-                        format!("  ⎿ ✗ {}", pstr("error")),
-                        Style::default().fg(Color::Red))));
+                    self.push_tool_result(pstr("error"), true);
                 }
                 t if t.starts_with("task.") => {
                     let title = pstr("title");
@@ -1899,7 +2324,6 @@ impl App {
                 _ => {}
             }
         }
-        self.rule("live");
         self.follow = true;
     }
 
@@ -2019,6 +2443,7 @@ impl App {
                     }
                 }
                 Block::Rule(t) => out.push_str(&format!("{t}\n")),
+                Block::ToolResult { text, .. } => out.push_str(&format!("  ⎿ {text}\n")),
                 Block::Todos { agent: _, items } => {
                     for t in items {
                         let mark = match t.status.as_str() {
@@ -2041,7 +2466,13 @@ impl App {
     // ---- slash-command autocomplete -----------------------------------
 
     pub fn set_slash_commands(&mut self, cmds: Vec<crate::api::SlashCmd>) {
-        self.slash_commands = cmds;
+        // Built-ins first; a server command can't shadow one.
+        let mut all: Vec<crate::api::SlashCmd> = BUILTIN_COMMANDS
+            .iter()
+            .map(|(n, d)| crate::api::SlashCmd { name: n.to_string(), description: d.to_string(), argument_hint: String::new() })
+            .collect();
+        all.extend(cmds.into_iter().filter(|c| builtin_command(&c.name).is_none()));
+        self.slash_commands = all;
     }
 
     /// The command-name prefix being typed (input is "/name…" with no space yet).
@@ -2110,19 +2541,18 @@ impl App {
             let c = &self.slash_commands[i];
             let hint = if c.argument_hint.is_empty() { String::new() } else { format!(" {}", c.argument_hint) };
             ListItem::new(Line::from(vec![
-                Span::styled(format!("/{}", c.name), Style::default().fg(Color::Cyan)),
-                Span::styled(hint, Style::default().fg(Color::DarkGray)),
-                Span::styled(format!("  {}", truncate(&c.description, 60)), Style::default().fg(Color::Gray)),
+                Span::styled(format!("/{:<22}", format!("{}{hint}", c.name)), Style::default().fg(Color::Cyan)),
+                Span::styled(format!("  {}", truncate(&c.description, 70)), Style::default().fg(Color::DarkGray)),
             ]))
         }).collect();
         let mut state = ListState::default();
         state.select(Some(sel.min(shown.saturating_sub(1))));
         let list = List::new(items)
             .block(TuiBlock::default().borders(Borders::ALL)
-                .title(format!(" /commands ({}) — Tab complete · Esc cancel ", matches.len()))
-                .border_style(Style::default().fg(Color::Cyan)))
-            .highlight_style(Style::default().fg(Color::Black).bg(Color::Cyan))
-            .highlight_symbol("➤ ");
+                .border_type(ratatui::widgets::BorderType::Rounded)
+                .border_style(Style::default().fg(Color::DarkGray)))
+            .highlight_style(Style::default().fg(Color::White).bg(Color::Rgb(40, 44, 52)).add_modifier(Modifier::BOLD))
+            .highlight_symbol("› ");
         f.render_widget(ratatui::widgets::Clear, area);
         let mut s = state;
         f.render_stateful_widget(list, area, &mut s);
@@ -2262,6 +2692,17 @@ impl App {
         self.last_elapsed = None;
     }
 
+    /// Attach a tool's result under its call. The wrapper tool and the local
+    /// execution it drives both report the same output; show it once.
+    fn push_tool_result(&mut self, text: String, failed: bool) {
+        let dup = self.blocks.iter().rev().take(3).any(|b| matches!(b,
+            Block::ToolResult { text: t, .. } if t.trim() == text.trim()));
+        if !dup {
+            self.blocks.push(Block::ToolResult { text, failed });
+        }
+        self.follow = true;
+    }
+
     /// Push a dim labelled separator (run boundaries, history/live markers).
     pub fn rule(&mut self, label: &str) {
         self.flush_stream();
@@ -2272,10 +2713,39 @@ impl App {
     }
 }
 
+/// Reader-facing tool name: `workspace_execute_shell_command` → "Shell",
+/// `browser_navigate` → "Browser navigate", anything else in sentence case.
+fn tool_label(name: &str) -> String {
+    let known = match name {
+        "execute_command" | "workspace_execute_shell_command" => Some("Shell"),
+        "execute_code" | "workspace_execute_code" => Some("Run code"),
+        "read_file" | "workspace_read_file" => Some("Read"),
+        "write_file" | "workspace_write_file" => Some("Write"),
+        "edit_file" | "workspace_edit_file" => Some("Edit"),
+        "web_search" => Some("Web search"),
+        "web_fetch" | "fetch_url" => Some("Fetch"),
+        _ => None,
+    };
+    if let Some(k) = known {
+        return k.to_string();
+    }
+    let base = name.strip_prefix("workspace_").unwrap_or(name).replace('_', " ");
+    let mut c = base.chars();
+    match c.next() {
+        Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+        None => name.to_string(),
+    }
+}
+
+/// The orchestrator is "the assistant" — it needs no name tag; sub-agents do.
+fn is_main_agent(agent: &str) -> bool {
+    agent.is_empty() || agent == "agent" || agent.contains("Supervisor") || agent == "orchestrator"
+}
+
 fn agent_header(agent: &str) -> Line<'static> {
     Line::from(Span::styled(
         format!("◆ {agent}"),
-        Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM),
     ))
 }
 
@@ -2463,12 +2933,11 @@ fn concise_result_value(v: &Value) -> String {
             val.as_array()
                 .map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(" "))
                 .unwrap_or_default()
-                .replace('\n', " ")
         };
         if let Some(errs) = obj.get("errors") {
             let e = join_strs(errs);
             if !e.trim().is_empty() {
-                return format!("✗ {}", truncate(e.trim(), 200));
+                return format!("✗ {}", truncate(e.trim(), 2000));
             }
         }
         // Output-bearing results (outputs/stdout_tail/message/note) → show that.
@@ -2476,12 +2945,12 @@ fn concise_result_value(v: &Value) -> String {
             if let Some(val) = obj.get(key) {
                 let o = match val {
                     Value::Array(_) => join_strs(val),
-                    Value::String(s) => s.replace('\n', " "),
+                    Value::String(s) => s.clone(),
                     _ => String::new(),
                 };
                 let o = o.trim();
                 if !o.is_empty() {
-                    return truncate(o, 200);
+                    return truncate(o, 4000);
                 }
             }
         }
@@ -2496,7 +2965,10 @@ fn concise_result_value(v: &Value) -> String {
             return "(ok)".to_string();
         }
     }
-    compact_json(Some(v), 200)
+    if let Value::String(s) = v {
+        return truncate(s.trim(), 4000);
+    }
+    compact_json(Some(v), 300)
 }
 
 /// Beautify a raw tool-result string (live path). Parses JSON when possible,
@@ -2504,7 +2976,7 @@ fn concise_result_value(v: &Value) -> String {
 fn concise_tool_result(detail: &str) -> String {
     match serde_json::from_str::<Value>(detail) {
         Ok(v) => concise_result_value(&v),
-        Err(_) => truncate(detail, 220),
+        Err(_) => truncate(detail, 4000),
     }
 }
 

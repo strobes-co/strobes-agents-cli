@@ -89,13 +89,91 @@ fn notify_done_bytes(secs: u64, disabled: bool, min: u64) -> Option<Vec<u8>> {
 }
 
 #[derive(Parser)]
-#[command(name = "strobes", version, about = "Ratatui client for Strobes Agents AI")]
+#[command(
+    name = "strobes",
+    version,
+    about = "Strobes Agents AI in your terminal",
+    long_about = "Strobes Agents AI in your terminal.\n\n\
+        Run `strobes` to start chatting, or `strobes \"scan example.com\"` to start with a prompt.\n\
+        Inside the chat, type / for commands and ? for keyboard shortcuts.",
+    after_help = "Examples:\n  \
+        strobes                         start a new chat\n  \
+        strobes \"find exposed admin panels on example.com\"\n  \
+        strobes -c                      continue the last chat\n  \
+        strobes -r                      pick a chat to resume\n  \
+        strobes -p \"summarize findings\" print the answer and exit (scriptable)\n  \
+        cat report.txt | strobes -p \"triage this\"",
+    args_conflicts_with_subcommands = true
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Option<Cmd>,
     /// Tenant to use for this run (defaults to the configured default tenant).
     #[arg(long, visible_alias = "profile", global = true)]
     tenant: Option<String>,
+    /// Start the chat with this prompt (quotes optional).
+    #[arg(value_name = "PROMPT", trailing_var_arg = true)]
+    prompt: Vec<String>,
+    /// Continue the most recent chat.
+    #[arg(short = 'c', long = "continue")]
+    cont: bool,
+    /// Resume a chat: pick from a list, or pass a thread id.
+    #[arg(short = 'r', long, value_name = "THREAD", num_args = 0..=1, default_missing_value = "")]
+    resume: Option<String>,
+    /// Print mode: send the prompt, print the reply, and exit. Reads stdin too.
+    #[arg(short = 'p', long)]
+    print: bool,
+    /// Use this workspace for the chat.
+    #[arg(short = 'w', long, value_name = "ID")]
+    workspace: Option<String>,
+    /// Model id for the chat (see /model inside the chat).
+    #[arg(short = 'm', long, value_name = "ID")]
+    model: Option<i64>,
+}
+
+/// `strobes --tenant x status` must run the `status` subcommand, but clap
+/// gives the trailing PROMPT positional priority once an option precedes the
+/// subcommand. If the first bare word is a subcommand name, move it (and what
+/// follows) to the front; the leading options are global, so they still apply.
+fn subcommand_first(args: Vec<String>) -> Vec<String> {
+    use clap::CommandFactory;
+    let cmd = Cli::command();
+    let is_sub = |w: &str| cmd.get_subcommands().any(|c| c.get_name() == w || c.get_all_aliases().any(|a| a == w));
+    let mut i = 1;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if a == "--" {
+            return args;
+        }
+        if a == "--tenant" || a == "--profile" {
+            i += 2;
+            continue;
+        }
+        if a.starts_with('-') {
+            i += 1;
+            continue;
+        }
+        if i > 1 && is_sub(a) {
+            let mut out = vec![args[0].clone()];
+            out.extend_from_slice(&args[i..]);
+            out.extend_from_slice(&args[1..i]);
+            return out;
+        }
+        return args;
+    }
+    args
+}
+
+/// How the interactive chat picks its thread at launch.
+enum Launch {
+    /// A fresh chat in the bound workspace (the default, like `claude`).
+    Fresh,
+    /// Reopen the most recent chat (`-c`).
+    Continue,
+    /// Show the workspace → thread pickers (`-r`, `strobes chat`).
+    Pick,
+    /// A specific thread (`-r <id>`, `--thread`).
+    Thread(String),
 }
 
 #[derive(Subcommand)]
@@ -849,13 +927,55 @@ fn restore_default_sigpipe() {}
 #[tokio::main]
 async fn main() -> Result<()> {
     restore_default_sigpipe();
-    let cli = Cli::parse();
+    let cli = Cli::parse_from(subcommand_first(std::env::args().collect()));
     let mut cfg = Config::load();
     // Select the tenant for this run without mutating the stored default.
     let tenant = cli.tenant.clone().unwrap_or_else(|| cfg.current_profile.clone());
     let profile = cfg.profile_for(&tenant);
 
-    match cli.cmd.unwrap_or(Cmd::Chat { thread: None, workspace: None, model: None, reasoning: None, new: false }) {
+    // Bare `strobes [PROMPT] [-c|-r|-p]` — the Claude Code-style entry point.
+    if cli.cmd.is_none() {
+        let mut prompt = cli.prompt.join(" ").trim().to_string();
+        if cli.print {
+            // Piped stdin is part of the prompt (`cat log | strobes -p "triage"`).
+            use std::io::{IsTerminal, Read};
+            if !std::io::stdin().is_terminal() {
+                let mut buf = String::new();
+                let _ = std::io::stdin().read_to_string(&mut buf);
+                if !buf.trim().is_empty() {
+                    prompt = if prompt.is_empty() { buf } else { format!("{prompt}\n\n{buf}") };
+                }
+            }
+            if prompt.trim().is_empty() {
+                return Err(anyhow!("-p needs a prompt: strobes -p \"your question\""));
+            }
+            let ws = cli.workspace.clone().or_else(|| profile.workspace_id.clone());
+            return cmd_send(&profile, prompt, ws, None, None, cli.model, None, "text", true, None, None, None, None).await;
+        }
+        let launch = match (&cli.resume, cli.cont) {
+            (Some(t), _) if !t.is_empty() => Launch::Thread(t.clone()),
+            (Some(_), _) => Launch::Pick,
+            (None, true) => Launch::Continue,
+            (None, false) => Launch::Fresh,
+        };
+        let initial = if prompt.is_empty() { None } else { Some(prompt) };
+        {
+            use std::io::IsTerminal;
+            if !std::io::stdout().is_terminal() || !std::io::stdin().is_terminal() {
+                return Err(anyhow!(
+                    "the chat needs an interactive terminal — for scripts use: strobes -p \"your prompt\""
+                ));
+            }
+        }
+        let mut terminal = ratatui::init();
+        enable_mouse();
+        let r = chat_flow(&mut terminal, &mut cfg, &tenant, profile, launch, cli.workspace.clone(), cli.model, None, initial).await;
+        disable_mouse();
+        ratatui::restore();
+        return r;
+    }
+
+    match cli.cmd.unwrap() {
         Cmd::Login { base_url, org_id, master_key, deployment, analyzer_registry_url, no_verify } => {
             cmd_login(&mut cfg, &tenant, base_url, org_id, master_key, deployment, analyzer_registry_url, no_verify).await
         }
@@ -902,7 +1022,14 @@ async fn main() -> Result<()> {
             // parsing and collides with SGR mouse reports — leaking raw scroll
             // sequences (e.g. `[<64;..M`) into the input. Newlines use Ctrl+J.
             enable_mouse();
-            let r = chat_flow(&mut terminal, &mut cfg, &tenant, profile, thread, workspace, new, model, reasoning).await;
+            // `strobes chat` keeps the workspace → thread pickers; `--new`
+            // jumps straight into a fresh chat, `--thread` into that one.
+            let launch = match (thread, new) {
+                (_, true) => Launch::Fresh,
+                (Some(t), false) => Launch::Thread(t),
+                (None, false) => Launch::Pick,
+            };
+            let r = chat_flow(&mut terminal, &mut cfg, &tenant, profile, launch, workspace, model, reasoning, None).await;
             disable_mouse();
             ratatui::restore();
             r
@@ -954,24 +1081,33 @@ async fn chat_flow(
     cfg: &mut Config,
     tenant: &str,
     mut profile: config::Profile,
-    thread: Option<String>,
+    launch: Launch,
     workspace: Option<String>,
-    new: bool,
     model: Option<i64>,
     reasoning: Option<String>,
+    prompt: Option<String>,
 ) -> Result<()> {
+    // An empty chat left over from the last launch is reused instead of
+    // piling up blank threads — but only if it belongs to the same workspace.
+    let reusable = match &workspace {
+        Some(w) if profile.workspace_id.as_deref() != Some(w.as_str()) => None,
+        _ => profile.thread_id.clone(),
+    };
     if let Some(w) = &workspace {
         profile.workspace_id = Some(w.clone());
     }
-    // Only an explicit --thread skips the pickers; a plain run always offers
-    // workspace → thread selection (the stored thread_id is not auto-resumed).
-    let explicit = if new { None } else { thread };
-    // `initial_msg` is auto-sent on connect (used to seed a new workspace's
-    // setup chat with the user's prompt).
-    let mut initial_msg: Option<String> = None;
-    let thread_id = match explicit {
-        Some(t) => t,
-        None => {
+    require_complete(&profile)?;
+    // `initial_msg` is auto-sent on connect (the launch prompt, or a new
+    // workspace's setup prompt).
+    let mut initial_msg: Option<String> = prompt;
+    let thread_id = match launch {
+        Launch::Thread(t) => t,
+        Launch::Continue => match profile.thread_id.clone() {
+            Some(t) => t,
+            None => fresh_thread(terminal, &profile, None).await?,
+        },
+        Launch::Fresh => fresh_thread(terminal, &profile, reusable.as_deref()).await?,
+        Launch::Pick => {
             // Esc on the thread picker steps back to the workspace picker; Esc on
             // the workspace picker (or ^C anywhere) quits cleanly.
             let ws_flag = workspace.is_some();
@@ -1018,6 +1154,28 @@ async fn chat_flow(
         let _ = cfg.save();
     }
     run_chat(terminal, tenant, profile, thread_id, model, reasoning, initial_msg).await
+}
+
+/// A new chat thread in the profile's workspace, created behind the loader.
+/// `reuse` is the last thread this profile opened: if nobody ever sent a
+/// message in it, open that instead of creating yet another empty thread.
+async fn fresh_thread(
+    terminal: &mut ratatui::DefaultTerminal,
+    profile: &config::Profile,
+    reuse: Option<&str>,
+) -> Result<String> {
+    let client = api::ApiClient::new(profile.clone())?;
+    picker::with_loader(terminal, "Starting chat", async {
+        if let Some(t) = reuse {
+            if let Ok(h) = client.get_thread_history(t, 1).await {
+                if h.messages.is_empty() && h.active_run.is_none() {
+                    return Ok(t.to_string());
+                }
+            }
+        }
+        client.create_thread("CLI session", profile.workspace_id.as_deref(), None).await
+    })
+    .await
 }
 
 /// Show a workspace picker over the available workspaces and return the chosen
@@ -7485,6 +7643,32 @@ fn require_complete(p: &config::Profile) -> Result<()> {
     Ok(())
 }
 
+/// Run a client-side slash command (see `app::BUILTIN_COMMANDS`).
+fn run_builtin(cmd: &str, app: &mut App, handle: &mut pulse::PulseHandle, defer: &mut Option<Defer>, quit: &mut bool) {
+    let _ = handle;
+    match cmd {
+        "help" => app.show_help_text(),
+        "new" => *defer = Some(Defer::SwitchThread("__new__".into())),
+        "resume" => *defer = Some(Defer::Threads),
+        "workspace" => *defer = Some(Defer::Workspaces),
+        "model" => *defer = Some(Defer::Models),
+        "findings" => *defer = Some(Defer::Findings),
+        "approvals" => *defer = Some(Defer::Approvals),
+        "files" => *defer = Some(Defer::Files),
+        "copy" => match copy_to_clipboard(&app.transcript_plaintext()) {
+            Ok(_) => app.notice("copied transcript to clipboard"),
+            Err(e) => app.on_app_event(pulse::AppEvent::Error(format!("copy failed: {e}"))),
+        },
+        "thinking" => {
+            app.show_thinking = !app.show_thinking;
+            app.notice(if app.show_thinking { "showing the agent's reasoning" } else { "hiding the agent's reasoning" });
+        }
+        "status" => app.show_status_text(),
+        "exit" => *quit = true,
+        _ => {}
+    }
+}
+
 /// What a keypress deferred to after the select block (these need `.await`
 /// and/or to reassign `rx`, which can't happen while select borrows it).
 enum Defer {
@@ -7792,18 +7976,9 @@ pub async fn run_chat(
                             // ----- overlay navigation -----
                             match k.code {
                                 KeyCode::Esc => {
-                                    // Back-stack: detail → list, chat → threads →
-                                    // workspaces → exit. Findings/approvals just
-                                    // close back to chat.
-                                    if app.overlay_detail_open() {
-                                        app.overlay_esc();
-                                    } else if app.overlay_kind() == Some(app::OverlayKind::Threads) {
-                                        defer = Some(Defer::Workspaces);
-                                    } else if app.overlay_kind() == Some(app::OverlayKind::Workspaces) {
-                                        quit = true;
-                                    } else {
-                                        app.overlay_esc();
-                                    }
+                                    // Esc always steps back toward the chat
+                                    // (detail → list → chat); it never quits.
+                                    app.overlay_esc();
                                 }
                                 KeyCode::Up => app.overlay_move(true),
                                 KeyCode::Down => app.overlay_move(false),
@@ -7870,30 +8045,74 @@ pub async fn run_chat(
                                 _ => {}
                             }
                         } else if app.slash_open()
-                            && matches!(k.code, KeyCode::Up | KeyCode::Down | KeyCode::Tab | KeyCode::Enter)
+                            && matches!(k.code, KeyCode::Up | KeyCode::Down | KeyCode::Tab | KeyCode::Enter | KeyCode::Esc)
                             && !ctrl
                         {
                             // ----- slash-command autocomplete popup -----
                             match k.code {
                                 KeyCode::Up => app.slash_move(true),
                                 KeyCode::Down => app.slash_move(false),
-                                KeyCode::Tab | KeyCode::Enter => app.slash_complete(),
+                                KeyCode::Esc => app.input_clear(),
+                                KeyCode::Tab => app.slash_complete(),
+                                KeyCode::Enter => {
+                                    // Enter runs a built-in right away (like
+                                    // picking from a menu); skills complete
+                                    // so their arguments can be typed.
+                                    app.slash_complete();
+                                    let name = app.input.trim().trim_start_matches('/').to_string();
+                                    if let Some(cmd) = app::builtin_command(&name) {
+                                        app.input_clear();
+                                        run_builtin(cmd, &mut app, &mut handle, &mut defer, &mut quit);
+                                    }
+                                }
                                 _ => {}
                             }
+                        } else if app.show_help && matches!(k.code, KeyCode::Esc | KeyCode::Char('?')) {
+                            app.show_help = false;
                         } else {
                             // ----- normal chat -----
+                            // Any other key dismisses the shortcuts panel and
+                            // still does its normal job.
+                            app.show_help = false;
                             match k.code {
                                 // Esc: if scrolled up, snap back to the live
                                 // bottom first; otherwise step back into
                                 // navigation (threads → workspaces). ^C quits.
+                                // Esc: interrupt a running turn; else snap back
+                                // to the bottom if scrolled; else (twice) clear
+                                // the prompt.
                                 KeyCode::Esc => {
-                                    if app.is_pinned() {
+                                    if app.running {
+                                        handle.cancel();
+                                        app.status = "interrupting…".into();
+                                    } else if app.is_pinned() {
                                         app.jump_to_bottom();
-                                    } else {
-                                        defer = Some(Defer::Threads);
+                                    } else if !app.input.is_empty() {
+                                        if app.take_armed(app::Armed::ClearInput) {
+                                            app.input_clear();
+                                        } else {
+                                            app.arm(app::Armed::ClearInput);
+                                        }
                                     }
                                 }
-                                KeyCode::Char('c') if ctrl => { if app.running { handle.cancel(); } else { quit = true; } }
+                                // Ctrl-C: interrupt, else clear the prompt,
+                                // else press twice to quit. Ctrl-D quits on an
+                                // empty prompt.
+                                KeyCode::Char('c') if ctrl => {
+                                    if app.running {
+                                        handle.cancel();
+                                        app.status = "interrupting…".into();
+                                    } else if !app.input.is_empty() {
+                                        app.input_clear();
+                                        app.disarm();
+                                    } else if app.take_armed(app::Armed::Quit) {
+                                        quit = true;
+                                    } else {
+                                        app.arm(app::Armed::Quit);
+                                    }
+                                }
+                                KeyCode::Char('d') if ctrl && app.input.is_empty() => quit = true,
+                                KeyCode::Char('?') if app.input.is_empty() => app.show_help = true,
                                 KeyCode::Char('t') if ctrl => app.show_thinking = !app.show_thinking,
                                 KeyCode::Char('r') if ctrl => app.markdown = !app.markdown,
                                 KeyCode::Char('s') if ctrl => {
@@ -7923,7 +8142,15 @@ pub async fn run_chat(
                                 }
                                 KeyCode::Enter => {
                                     let text = app.input.trim().to_string();
-                                    if !text.is_empty() {
+                                    let builtin = text
+                                        .strip_prefix('/')
+                                        .filter(|t| !t.contains(' '))
+                                        .and_then(app::builtin_command);
+                                    if let Some(cmd) = builtin {
+                                        app.input_clear();
+                                        run_builtin(cmd, &mut app, &mut handle, &mut defer, &mut quit);
+                                    } else if !text.is_empty() {
+                                        app.remember_prompt(&text);
                                         // Dragged local file path(s) + a bound
                                         // workspace → upload instead of sending.
                                         match parse_dragged_paths(&text) {
@@ -7962,10 +8189,20 @@ pub async fn run_chat(
                                 // Up/Down move the cursor within a multiline
                                 // message; at the top/bottom edge they scroll the
                                 // transcript instead.
-                                KeyCode::Up => { if !app.input_up() { app.scroll_line(true); } }
-                                KeyCode::Down => { if !app.input_down() { app.scroll_line(false); } }
-                                KeyCode::Char(c) if !ctrl => app.input_insert_char(c),
+                                // ↑/↓: move within a multiline prompt; on an
+                                // empty (or recalled) prompt, walk sent prompts;
+                                // otherwise scroll the transcript.
+                                KeyCode::Up => {
+                                    if !app.input_up() && !app.history_prev() { app.scroll_line(true); }
+                                }
+                                KeyCode::Down => {
+                                    if !app.input_down() && !app.history_next() { app.scroll_line(false); }
+                                }
+                                KeyCode::Char(c) if !ctrl => { app.end_history_browse(); app.input_insert_char(c) }
                                 _ => {}
+                            }
+                            if !matches!(k.code, KeyCode::Esc | KeyCode::Char('c')) {
+                                app.disarm();
                             }
                         }
                     }
@@ -8366,6 +8603,14 @@ pub async fn run_chat(
                             app_tx = nclone;
                             app.reset_for_thread(new_thread.clone());
                             load_thread_data(&client, &new_thread, profile.workspace_id.as_deref(), &mut app).await;
+                            // Remember it so `strobes -c` reopens this chat.
+                            {
+                                let mut c = Config::load();
+                                let p = c.profile_mut(tenant);
+                                p.thread_id = Some(new_thread.clone());
+                                p.workspace_id = profile.workspace_id.clone();
+                                let _ = c.save();
+                            }
                         }
                         Err(e) => app.on_app_event(pulse::AppEvent::Error(format!("switch failed: {e}"))),
                     }

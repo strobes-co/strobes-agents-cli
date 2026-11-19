@@ -294,6 +294,13 @@ async fn run_session(
             },
             msg = read.next() => match msg {
                 Some(Ok(Message::Text(txt))) => {
+                    // STROBES_DEBUG_WS=<file> appends every raw frame (debugging aid).
+                    if let Ok(path) = std::env::var("STROBES_DEBUG_WS") {
+                        use std::io::Write;
+                        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                            let _ = writeln!(f, "{txt}");
+                        }
+                    }
                     if let Ok(v) = serde_json::from_str::<Value>(&txt) {
                         handle_frame(v, app_tx, out_tx, workspace_id, thread_id);
                     }
@@ -776,7 +783,10 @@ fn handle_frame(v: Value, app_tx: &mpsc::UnboundedSender<AppEvent>, out_tx: &mps
                             | Some("remove_todo") | Some("clear_todos")
                     );
                     let result = b.get("result").unwrap_or(&Value::Null);
-                    let detail = if is_todo_tool { result.to_string() } else { compact(result, 600) };
+                    // Keep the full structure (newlines included) so the
+                    // transcript can show the first lines of the output.
+                    let full = result.to_string();
+                    let detail = if is_todo_tool || full.len() <= 20_000 { full } else { compact(result, 4000) };
                     Some(StreamItem {
                         kind: "tool_output".into(), agent, text: None, tool_name: name,
                         detail: Some(detail),
