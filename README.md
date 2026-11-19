@@ -348,44 +348,52 @@ jobs:
 
 ---
 
-## Interactive Chat (`strobes chat`)
-
-Opens a full terminal UI that streams a remote agent run and executes
-its tools (shell, code, browser) on your local machine.
+## Chat
 
 ```bash
-strobes status                  # check connectivity
-strobes workspaces              # list remote workspaces
-strobes threads                 # list your threads
-strobes chat                    # interactive chat (thread picker)
-strobes chat --thread <UUID> --model 18    # resume a thread (Sonnet 4.6)
-strobes bind --download         # pick + download a workspace locally
-strobes pull --workspace <UUID> # download workspace files to a folder
-strobes export -w <UUID>        # export thread transcripts (Markdown + index.md)
-strobes export -w <UUID> --format json --dir out/   # raw event JSON
-strobes update                  # self-update to the latest release
-strobes --version               # print the version
+strobes                                  # start chatting (logs you in on first run)
+strobes "find exposed admin panels on example.com"   # start with a prompt
+strobes -c                               # continue the last chat
+strobes -r                               # pick a chat to resume (or -r <thread-id>)
+strobes -p "summarize open findings"     # print the answer and exit — scriptable
+cat scan.log | strobes -p "triage this"  # stdin is appended to the prompt
+strobes -w <workspace-id> -m 18          # pick workspace / model for this run
 ```
 
-### In-chat keys
+The agent streams in your terminal and runs its tools (shell, code, browser)
+on your machine. Type `/` for commands and `?` for shortcuts.
+
+### Commands
+
+| Command | Does |
+|---------|------|
+| `/help` | Commands and shortcuts |
+| `/new` (`/clear`) | Start a new chat |
+| `/resume` | Switch to another chat |
+| `/workspace` | Switch or bind a workspace |
+| `/model` | Choose the AI model |
+| `/findings` · `/approvals` · `/files` | Browse the workspace |
+| `/copy` · `/status` · `/thinking` · `/exit` | Copy transcript · where you are · show reasoning · quit |
+| `!<command>` | Run a shell command locally in the agent's sandbox |
+
+Agent skills (e.g. `/api-pentest`) appear in the same `/` menu after the built-ins.
+
+### Keys
 
 | Key | Action |
 |-----|--------|
-| `Enter` | Send message |
-| `/` | Slash-command autocomplete (Tab/Enter to complete) |
-| `^W` | Workspaces browser → Enter binds, then pick a thread |
-| `^O` | Threads browser (Enter switches) |
-| `^F` / `^A` | Findings / approvals for the bound workspace |
-| `^L` | List synced local workspace files |
-| `^E` | Open the local workspace folder in Finder / Explorer |
-| `^Y` | Copy the full transcript to the clipboard |
-| `^T` / `^R` | Toggle thinking / markdown |
-| `^C` | Cancel the running turn (or quit when idle) |
-| `Esc` | Back (chat → threads → workspaces) · PgUp/PgDn / ↑↓ scroll |
+| `Enter` · `Ctrl-J` | Send · newline (Shift/Alt+Enter on kitty-protocol terminals) |
+| `Esc` | Interrupt the agent · press twice to clear the prompt |
+| `Ctrl-C` | Interrupt · clear the prompt · press twice to quit (`Ctrl-D` quits too) |
+| `↑` / `↓` | Previous prompts (history is kept across sessions) |
+| `PgUp` / `PgDn`, mouse wheel | Scroll the chat |
+| `Ctrl-O` | Expand tool output |
+| `Ctrl-P` · `Ctrl-W` · `Ctrl-F` · `Ctrl-A` | Model · workspaces · findings · approvals |
+| `Ctrl-T` · `Ctrl-R` · `Ctrl-Y` · `Ctrl-S` | Thinking · raw markdown · copy transcript · select mode |
 
-Mouse isn't captured, so terminal native **click-drag selection + copy** still
-works in the transcript. A spinner appears while a turn is running. The CLI
-checks for newer releases on chat start and suggests the update one-liner.
+Other commands: `strobes status`, `strobes workspaces`, `strobes threads`,
+`strobes bind --download`, `strobes pull`, `strobes export -w <id>`,
+`strobes update`. `strobes chat` still opens the workspace → thread pickers.
 
 **Browser setup:** `browser_*` tools need Google Chrome / Chromium — detected
 automatically. Point at a non-standard install with `STROBES_AI_CHROME=/path/to/chrome`,
@@ -399,9 +407,8 @@ shared Chrome process per workspace.
 
 ### Credits & tokens
 
-The status bar shows **AI credits + token usage**: the current run's usage
-while streaming (`◈ 0.036 cr · 1.8k tok`), and the session total (`◈ Σ …`)
-once idle.
+The line above the prompt shows elapsed time and tokens while the agent works;
+the footer shows this chat's total credits. `/status` has the full breakdown.
 
 ---
 
