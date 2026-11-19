@@ -390,6 +390,10 @@ on your machine. Type `/` for commands and `?` for shortcuts.
 | `/findings` · `/approvals` · `/files` | Browse the workspace |
 | `/copy` · `/status` · `/thinking` · `/exit` | Copy transcript · where you are · show reasoning · quit |
 | `/login` · `/logout` | Sign in through the browser (switch org/workspace) · sign out |
+| `/jobs` | Local commands: running/background status, log tail, `x` to stop |
+| `/browser` | The agent's local browser — `open <url>` to sign in, `show`/`hide`, `attach 9222`, `close` |
+| `/permissions` | Toggle: confirm approval-gated actions yourself, or approve automatically |
+| `/api [METHOD] <path> [json]` | Call the Strobes API from the chat |
 | `!<command>` | Run a shell command locally in the agent's sandbox |
 | `@<file>` | Mention a file from the current folder (inserts its path) |
 
@@ -408,6 +412,7 @@ Agent skills (e.g. `/api-pentest`) appear in the same `/` menu after the built-i
 | `Ctrl-O` | Expand tool output |
 | `Ctrl-P` · `Ctrl-W` · `Ctrl-F` · `Ctrl-A` | Model · workspaces · findings · approvals |
 | `Ctrl-R` | Search prompt history |
+| `Ctrl-B` | Move the running local command to the background (the agent carries on) |
 | `Ctrl-T` · `Ctrl-Y` · `Ctrl-S` | Thinking · copy transcript · select mode (`/markdown` toggles raw markdown) |
 
 ### Local commands, background jobs and the browser
