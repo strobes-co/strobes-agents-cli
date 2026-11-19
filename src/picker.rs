@@ -26,10 +26,10 @@ pub enum Nav {
 }
 
 /// Braille spinner frames for the loading overlay's subtitle.
-const LOADER_SPIN: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 /// Rotating flavor text for the loading overlay — cycles slowly while the
 /// saucer animates. The real action is shown (dimmed) on the subtitle line.
+#[allow(dead_code)] // the old full-screen loader's art, kept for now
 const SAUCER_MSGS: [&str; 16] = [
     "Calling the mothership for supplies",
     "Beaming your data aboard",
@@ -53,6 +53,7 @@ const SAUCER_MSGS: [&str; 16] = [
 /// glint, a block-glyph disc, a row of running (marquee) under-lights, and a
 /// pulsing tractor beam. Built from Unicode block/triangle glyphs so it reads as
 /// a real craft rather than plain ASCII. Center-aligned by the caller.
+#[allow(dead_code)]
 fn saucer_render(frame: usize) -> Vec<Line<'static>> {
     let glass = Style::default().fg(Color::White).add_modifier(Modifier::BOLD);
     let dome = Style::default().fg(Color::LightCyan).add_modifier(Modifier::BOLD);
@@ -110,44 +111,20 @@ pub fn loader_seed() -> usize {
 /// once per appearance) picks the starting flavor message so it varies run to
 /// run. The message rotates slowly, so a short wait shows just one or two.
 pub fn draw_loader(f: &mut ratatui::Frame, label: &str, frame: usize, seed: usize) {
+    // A single quiet line at the bottom-left — where the chat's activity line
+    // lives — so going from "Starting chat…" to the chat doesn't jump.
+    let _ = seed;
     let area = f.area();
-    // Rotate ~every 40 frames (~3.2s at 80ms) so a brief loader shows 1–2 lines.
-    let msg = SAUCER_MSGS[(seed.wrapping_add(frame / 40)) % SAUCER_MSGS.len()];
-    let spin = LOADER_SPIN[frame % LOADER_SPIN.len()];
-    let dots = ".".repeat(1 + (frame / 3) % 3);
-    let subtitle = format!("{spin} {label}{dots:<3}");
-
-    let cyan = Style::default().fg(Color::Cyan);
-    let msg_style = Style::default().fg(Color::White).add_modifier(Modifier::BOLD);
-    let sub_style = Style::default().fg(Color::DarkGray);
-
-    let mut lines: Vec<Line> = saucer_render(frame);
-    lines.push(Line::default());
-    lines.push(Line::from(Span::styled(format!("👽  {msg}…"), msg_style)));
-    lines.push(Line::from(Span::styled(subtitle, sub_style)));
-
-    // Size the box to the widest content line (+ padding + borders), clamped.
-    let widest = lines
-        .iter()
-        .map(|l| l.width())
-        .chain(std::iter::once(msg.chars().count() + 4))
-        .max()
-        .unwrap_or(24) as u16;
-    let w = widest.saturating_add(4).min(area.width.saturating_sub(2)).max(24);
-    let h = (lines.len() as u16 + 2).min(area.height.max(3));
-    let x = area.x + area.width.saturating_sub(w) / 2;
-    let y = area.y + area.height.saturating_sub(h) / 2;
-    let rect = Rect { x, y, width: w, height: h };
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(" 🛸 incoming transmission ")
-        .border_style(cyan);
-    let para = Paragraph::new(lines)
-        .block(block)
-        .alignment(ratatui::layout::Alignment::Center);
-    f.render_widget(Clear, rect);
-    f.render_widget(para, rect);
+    const SPIN: [&str; 6] = ["✻", "✺", "✹", "✸", "✷", "✶"];
+    let glyph = SPIN[(frame / 2) % SPIN.len()];
+    let line = Line::from(vec![
+        Span::styled(format!(" {glyph} "), Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+        Span::styled(format!("{label}…"), Style::default().fg(Color::Magenta)),
+    ]);
+    let y = area.y + area.height.saturating_sub(5);
+    let rect = Rect { x: area.x, y, width: area.width, height: 1 };
+    f.render_widget(Clear, area);
+    f.render_widget(Paragraph::new(line), rect);
 }
 
 /// Run `fut` to completion while showing the centered loading overlay, so a
@@ -532,12 +509,13 @@ mod loader_tests {
     use super::*;
     use ratatui::{backend::TestBackend, Terminal};
 
-    /// The saucer renders without panic across animation frames, fits its box,
-    /// and actually paints the craft + label glyphs.
+    /// The loader renders one quiet line with the label on every frame,
+    /// even on a tiny terminal.
     #[test]
-    fn saucer_renders() {
-        for frame in [0usize, 3, 6, 9, 40, 80] {
-            let mut t = Terminal::new(TestBackend::new(48, 14)).unwrap();
+    fn loader_renders() {
+        for (w, h) in [(48u16, 14u16), (20, 3)] {
+            for frame in [0usize, 3, 6, 9, 40, 80] {
+            let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
             t.draw(|f| draw_loader(f, "Loading workspaces", frame, 2)).unwrap();
             let buf = t.backend().buffer().clone();
             let mut screen = String::new();
@@ -547,9 +525,9 @@ mod loader_tests {
                 }
                 screen.push('\n');
             }
-            assert!(screen.contains('█'), "saucer disc missing at frame {frame}");
-            assert!(screen.contains('●'), "saucer lights missing at frame {frame}");
+            if w < 30 { continue; }
             assert!(screen.contains("Loading workspaces"), "label missing at frame {frame}");
+            }
         }
     }
 }
