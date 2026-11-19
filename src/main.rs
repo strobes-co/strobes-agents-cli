@@ -8637,6 +8637,8 @@ pub async fn run_chat(
 
     let mut events = EventStream::new();
     let mut viewport_h: u16 = 20;
+    // When the last interrupt was (re)sent — see the RunFinished handling.
+    let mut last_cancel: Option<std::time::Instant> = None;
     // Drives the working-spinner animation while a turn is running.
     let mut ticker = tokio::time::interval(std::time::Duration::from_millis(120));
 
@@ -9081,13 +9083,19 @@ pub async fn run_chat(
                             pulse::AppEvent::ApprovalRequest { .. } => notify_needs_you("approval needed"),
                             _ => {}
                         }
-                        // An interrupt pressed before the server had started the
-                        // run was dropped by it — send it again now that it exists.
-                        if matches!(ev, pulse::AppEvent::RunStarted) && app.cancel_requested {
+                        // An interrupt pressed before a worker picked the run up
+                        // is dropped server-side ("created" ≠ "started"). Keep
+                        // re-sending it — at most once a second — on the run's
+                        // events until it actually finishes.
+                        if app.cancel_requested && !finished
+                            && last_cancel.map(|t| t.elapsed() >= std::time::Duration::from_secs(1)).unwrap_or(true)
+                        {
                             handle.cancel();
+                            last_cancel = Some(std::time::Instant::now());
                         }
                         if finished {
                             app.cancel_requested = false;
+                            last_cancel = None;
                         }
                         app.on_app_event(ev);
                         // Notify the (possibly away) user that the reply is ready.

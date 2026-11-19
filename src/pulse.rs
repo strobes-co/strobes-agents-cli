@@ -819,8 +819,13 @@ fn handle_frame(v: Value, app_tx: &mpsc::UnboundedSender<AppEvent>, out_tx: &mps
     }
 
     // Run lifecycle → finished.
+    // A run cancelled before a worker started it only ever sends
+    // run.canceled (no run.completed), so that ends the turn too.
+    let canceled = matches!(etype, "run.canceled" | "run.cancelled")
+        || (etype == "system" && matches!(sub.as_deref(), Some("run.canceled") | Some("run.cancelled")));
     let terminal = etype == "run.completed"
         || etype == "run.failed"
+        || canceled
         || (etype == "system"
             && matches!(sub.as_deref(), Some("run.completed") | Some("run.failed")));
 
@@ -912,7 +917,9 @@ fn handle_frame(v: Value, app_tx: &mpsc::UnboundedSender<AppEvent>, out_tx: &mps
                 let _ = app_tx.send(AppEvent::Credits { credits, tokens, final_run: true });
             }
         }
-        let label = if etype.ends_with("failed") || sval(&b, "type").as_deref() == Some("run.failed") {
+        let label = if canceled {
+            "cancelled".into()
+        } else if etype.ends_with("failed") || sval(&b, "type").as_deref() == Some("run.failed") {
             format!("failed: {}", sval(&b, "error").unwrap_or_default())
         } else {
             "completed".into()
