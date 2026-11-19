@@ -180,6 +180,12 @@ fn is_todo_tool(name: &str) -> bool {
     )
 }
 
+/// Tools whose call line is redundant with what the UI already shows (the
+/// human-input prompt renders as its own question + answer).
+fn is_silent_tool(name: &str) -> bool {
+    matches!(name, "request_human_input" | "workspace_request_human_input" | "ask_user")
+}
+
 struct Stream {
     thinking: bool,
     agent: String,
@@ -192,6 +198,8 @@ struct Pending {
     fields: Vec<Field>,
     idx: usize,
     answers: Map<String, Value>,
+    /// Highlighted option for a choice field.
+    sel: usize,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -799,17 +807,20 @@ impl App {
             AppEvent::Interrupt { id, title, message, fields } => {
                 self.running = false;
                 self.status = "input needed ⏸".into();
-                self.push(Line::from(Span::styled(
-                    format!("⏸ {title}"),
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-                )));
+                self.flush_stream();
+                self.push(Line::default());
+                self.push(Line::from(vec![
+                    Span::styled("? ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                    Span::styled(title, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                ]));
                 if !message.is_empty() {
-                    self.push(Line::from(Span::styled(
-                        format!("   {message}"),
-                        Style::default().fg(Color::Cyan),
-                    )));
+                    for l in message.lines() {
+                        self.push(Line::from(Span::styled(format!("  {l}"), Style::default().fg(Color::Gray))));
+                    }
                 }
-                self.pending = Some(Pending { id, fields, idx: 0, answers: Map::new() });
+                let mut p = Pending { id, fields, idx: 0, answers: Map::new(), sel: 0 };
+                p.sel = default_choice(&p);
+                self.pending = Some(p);
                 self.follow = true;
             }
             AppEvent::Stream(item) => self.on_stream(item),
@@ -835,11 +846,94 @@ impl App {
         })
     }
 
+    /// Choices for the field being answered (select options, or Yes/No for a
+    /// checkbox); empty for free-text fields.
+    pub fn pending_choices(&self) -> Vec<String> {
+        let Some(p) = &self.pending else { return Vec::new() };
+        let Some(f) = p.fields.get(p.idx) else { return Vec::new() };
+        field_choices(f).into_iter().map(|(l, _)| l).collect()
+    }
+
+    pub fn pending_move(&mut self, up: bool) {
+        let n = self.pending_choices().len();
+        if let Some(p) = &mut self.pending {
+            if n > 0 {
+                p.sel = if up { (p.sel + n - 1) % n } else { (p.sel + 1) % n };
+            }
+        }
+    }
+
+    /// Answer the current choice field with option `idx` (or the highlighted
+    /// one). Returns the full response once every field is answered.
+    pub fn submit_choice(&mut self, idx: Option<usize>) -> Option<(String, Value)> {
+        let (label, value) = {
+            let p = self.pending.as_ref()?;
+            let f = p.fields.get(p.idx)?;
+            let ch = field_choices(f);
+            let i = idx.unwrap_or(p.sel);
+            ch.get(i)?.clone()
+        };
+        self.record_answer(&label, value)
+    }
+
+    /// Stop answering: the run is cancelled by the caller.
+    pub fn decline_interrupt(&mut self) {
+        if self.pending.take().is_some() {
+            self.push(Line::from(Span::styled("  ⎿  Declined", Style::default().fg(Color::DarkGray))));
+        }
+    }
+
+    fn record_answer(&mut self, shown: &str, value: Value) -> Option<(String, Value)> {
+        let (key, label) = {
+            let p = self.pending.as_ref()?;
+            let f = p.fields.get(p.idx)?;
+            (f.key.clone(), f.label.clone())
+        };
+        self.push(Line::from(vec![
+            Span::styled(format!("  ⎿  {label}: "), Style::default().fg(Color::DarkGray)),
+            Span::styled(shown.to_string(), Style::default().fg(Color::White)),
+        ]));
+        let p = self.pending.as_mut()?;
+        p.answers.insert(key, value);
+        p.idx += 1;
+        if p.idx >= p.fields.len() {
+            let done = self.pending.take().unwrap();
+            self.running = true;
+            self.status = "resuming…".into();
+            self.run_started.get_or_insert_with(std::time::Instant::now);
+            Some((done.id, Value::Object(done.answers)))
+        } else {
+            let mut np = self.pending.take().unwrap();
+            np.sel = default_choice(&np);
+            self.pending = Some(np);
+            None
+        }
+    }
+
     /// Feed the typed value as the answer to the current interrupt field.
     /// Returns `Some((interrupt_id, response_data))` once all fields are filled.
     pub fn submit_interrupt_value(&mut self, text: &str) -> Option<(String, Value)> {
+        // Choice fields: a typed number or option text picks that option.
+        let choices = self.pending_choices();
+        if !choices.is_empty() {
+            let t = text.trim().to_lowercase();
+            let idx = t.parse::<usize>().ok().filter(|n| *n >= 1 && *n <= choices.len()).map(|n| n - 1)
+                .or_else(|| choices.iter().position(|c| c.to_lowercase().starts_with(&t) && !t.is_empty()));
+            return self.submit_choice(idx);
+        }
+        // Empty answer takes the field's default, if it has one.
+        let default_text = self.pending.as_ref()
+            .and_then(|p| p.fields.get(p.idx))
+            .and_then(|f| f.default.clone())
+            .map(|d| d.as_str().map(String::from).unwrap_or_else(|| d.to_string()));
+        let owned;
+        let text = if text.trim().is_empty() {
+            match default_text { Some(d) => { owned = d; owned.as_str() } None => text }
+        } else {
+            text
+        };
         // Read the current field (short immutable borrow), compute the value.
-        let (key, label, value) = {
+        let (_key, _label, value) = {
             let p = self.pending.as_ref()?;
             let field = p.fields.get(p.idx)?;
             let value: Value = match field.ftype.as_str() {
@@ -856,25 +950,9 @@ impl App {
             };
             (field.key.clone(), field.label.clone(), value)
         };
-
-        // Echo the answer (mutable borrow — no `pending` borrow held here).
-        self.push(Line::from(Span::styled(
-            format!("   {label} = {text}"),
-            Style::default().fg(Color::Magenta),
-        )));
-
-        // Record it and advance.
-        let p = self.pending.as_mut()?;
-        p.answers.insert(key, value);
-        p.idx += 1;
-        if p.idx >= p.fields.len() {
-            let done = self.pending.take().unwrap();
-            self.running = true;
-            self.status = "resuming…".into();
-            Some((done.id, Value::Object(done.answers)))
-        } else {
-            None
-        }
+        let is_secret = self.pending.as_ref().and_then(|p| p.fields.get(p.idx)).map(|f| f.ftype == "password").unwrap_or(false);
+        let shown = if is_secret { "••••••".to_string() } else { text.to_string() };
+        self.record_answer(&shown, value)
     }
 
     fn on_stream(&mut self, item: StreamItem) {
@@ -897,7 +975,7 @@ impl App {
                 // RESULT (tool_output) instead of a generic call line here —
                 // the args alone (e.g. `todo(action='complete', id=3)`)
                 // don't carry enough to render the full list anyway.
-                if is_todo_tool(&name) {
+                if is_todo_tool(&name) || is_silent_tool(&name) {
                     return;
                 }
                 // One line per call. The server sends an arg-less "early"
@@ -944,6 +1022,9 @@ impl App {
             }
             "tool_output" => {
                 let name = item.tool_name.clone().unwrap_or_default();
+                if is_silent_tool(&name) {
+                    return;
+                }
                 let agent = item.agent.clone().unwrap_or_else(|| "agent".into());
                 // Todo tools never got a Block::Tool pushed at tool_start
                 // above — nothing to settle. Try to render a fresh checklist
@@ -1344,7 +1425,11 @@ impl App {
         let help = if self.show_help { self.help_lines() } else { Vec::new() };
         let footer_h = (help.len() as u16).max(1);
         let cap = f.area().height.saturating_sub(3 + footer_h).max(3);
-        let input_h = (self.input_visual_rows(tw) + 2).clamp(3, cap);
+        let rows = match self.pending_choices().len() {
+            0 => self.input_visual_rows(tw),
+            n => n as u16,
+        };
+        let input_h = (rows + 2).clamp(3, cap);
         let activity_h = if self.activity_line().is_some() { 1 } else { 0 };
         let chunks = Layout::vertical([
             Constraint::Min(1),
@@ -1768,6 +1853,26 @@ impl App {
     }
 
     fn draw_input(&self, f: &mut Frame, area: Rect) {
+        let choices = self.pending_choices();
+        if !choices.is_empty() {
+            let sel = self.pending.as_ref().map(|p| p.sel).unwrap_or(0);
+            let lines: Vec<Line<'static>> = choices.iter().enumerate().map(|(i, c)| {
+                let on = i == sel;
+                let style = if on { Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD) } else { Style::default().fg(Color::Gray) };
+                Line::from(vec![
+                    Span::styled(if on { "❯ " } else { "  " }, style),
+                    Span::styled(format!("{}. {c}", i + 1), style),
+                ])
+            }).collect();
+            let block = TuiBlock::default()
+                .borders(Borders::ALL)
+                .border_type(ratatui::widgets::BorderType::Rounded)
+                .title(format!(" {} ", self.pending_label().unwrap_or_default()))
+                .border_style(Style::default().fg(Color::Cyan))
+                .padding(Padding::horizontal(1));
+            f.render_widget(Paragraph::new(lines).block(block).wrap(Wrap { trim: false }), area);
+            return;
+        }
         let (title, color) = if let Some(label) = self.pending_label() {
             (format!(" {label} "), Color::Cyan)
         } else if self.input.starts_with('/') {
@@ -1884,8 +1989,14 @@ impl App {
         } else if self.overlay.is_some() {
             let search = if self.overlay_searchable() { "type to filter · " } else { "" };
             format!("  {search}↑↓ select · enter open · esc back")
+        } else if self.pending.is_some() && !self.pending_choices().is_empty() {
+            "  ↑↓ or 1-9 to choose · enter to confirm · esc to decline".to_string()
         } else if self.pending.is_some() {
-            "  type your answer · enter to submit".to_string()
+            let def = self.pending.as_ref().and_then(|p| p.fields.get(p.idx)).and_then(|f| f.default.clone());
+            match def {
+                Some(d) => format!("  type your answer · enter to submit (empty = {}) · esc to decline", d.as_str().map(String::from).unwrap_or_else(|| d.to_string())),
+                None => "  type your answer · enter to submit · esc to decline".to_string(),
+            }
         } else if self.select_mode {
             "  select mode — drag to select, ⌘C copies · ctrl+s to exit".to_string()
         } else if self.slash_open() {
@@ -2247,6 +2358,9 @@ impl App {
                     // the args the same way the live path does (code/command,
                     // not a raw JSON dump).
                     let name = pstr("toolName");
+                    if is_silent_tool(&name) {
+                        continue;
+                    }
                     let args = crate::pulse::tool_detail(&name, p.get("arguments").unwrap_or(&Value::Null));
                     self.flush_stream();
                     // Same wrapper/local pairing as the live path: one call, one line.
@@ -2259,6 +2373,7 @@ impl App {
                         self.blocks.push(Block::Tool { name, detail: args, status: ToolStatus::Done, agent: agent.clone(), call_id: cid, local_id: None });
                     }
                 }
+                "tool.output" if is_silent_tool(&pstr("toolName")) => {}
                 "tool.output" => {
                     let body = match p.get("result") {
                         Some(v) => concise_result_value(v),
@@ -2895,6 +3010,24 @@ impl App {
     }
 }
 
+/// (label, value) choices a field offers: its options, or Yes/No for a checkbox.
+fn field_choices(f: &Field) -> Vec<(String, Value)> {
+    if !f.options.is_empty() {
+        return f.options.clone();
+    }
+    if matches!(f.ftype.as_str(), "checkbox" | "boolean" | "bool" | "confirm") {
+        return vec![("Yes".into(), Value::Bool(true)), ("No".into(), Value::Bool(false))];
+    }
+    Vec::new()
+}
+
+/// The option to highlight first: the field's default, else the first.
+fn default_choice(p: &Pending) -> usize {
+    let Some(f) = p.fields.get(p.idx) else { return 0 };
+    let Some(d) = &f.default else { return 0 };
+    field_choices(f).iter().position(|(_, v)| v == d).unwrap_or(0)
+}
+
 /// Reader-facing tool name: `workspace_execute_shell_command` → "Shell",
 /// `browser_navigate` → "Browser navigate", anything else in sentence case.
 pub fn tool_label(name: &str) -> String {
@@ -3352,6 +3485,45 @@ mod input_editor_tests {
         a.on_stream(tok("friend."));
         a.on_stream(tok("Hello there, friend."));
         assert_eq!(a.stream.as_ref().map(|s| s.buf.as_str()), Some("Hello there, friend."));
+    }
+
+    fn choice_interrupt(a: &mut App) {
+        let depth = Field {
+            key: "depth".into(), label: "Depth".into(), ftype: "select".into(),
+            options: vec![("Quick".into(), Value::from("quick")), ("Deep".into(), Value::from("deep"))],
+            default: Some(Value::from("deep")),
+        };
+        let subs = Field { key: "subs".into(), label: "Subdomains".into(), ftype: "checkbox".into(), options: vec![], default: None };
+        let note = Field { key: "note".into(), label: "Note".into(), ftype: "text".into(), options: vec![], default: Some(Value::from("none")) };
+        a.on_app_event(AppEvent::Interrupt { id: "i1".into(), title: "Configure".into(), message: "".into(), fields: vec![depth, subs, note] });
+    }
+
+    #[test]
+    fn choice_prompt_answers_by_key_default_and_text() {
+        let mut a = app();
+        choice_interrupt(&mut a);
+        // Highlight starts on the default.
+        assert_eq!(a.pending_choices(), vec!["Quick", "Deep"]);
+        assert_eq!(a.pending.as_ref().unwrap().sel, 1);
+        assert!(a.submit_choice(Some(0)).is_none()); // "1" → Quick
+        assert_eq!(a.pending_choices(), vec!["Yes", "No"]); // checkbox
+        a.pending_move(false);
+        assert!(a.submit_choice(None).is_none()); // No
+        // Free text, empty → default.
+        let (id, data) = a.submit_interrupt_value("").unwrap();
+        assert_eq!(id, "i1");
+        assert_eq!(data, serde_json::json!({"depth": "quick", "subs": false, "note": "none"}));
+        assert!(a.pending.is_none());
+    }
+
+    #[test]
+    fn choice_prompt_accepts_typed_number_and_decline() {
+        let mut a = app();
+        choice_interrupt(&mut a);
+        assert!(a.submit_interrupt_value("2").is_none());
+        assert_eq!(a.pending.as_ref().unwrap().answers.get("depth"), Some(&Value::from("deep")));
+        a.decline_interrupt();
+        assert!(a.pending.is_none());
     }
 
     #[test]

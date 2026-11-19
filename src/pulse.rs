@@ -43,6 +43,9 @@ pub struct Field {
     pub key: String,
     pub label: String,
     pub ftype: String, // text | password | number | select | textarea | checkbox | ...
+    /// (label, value) choices for select/radio fields.
+    pub options: Vec<(String, Value)>,
+    pub default: Option<Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -697,11 +700,25 @@ fn handle_frame(v: Value, app_tx: &mpsc::UnboundedSender<AppEvent>, out_tx: &mps
                         let key = sval(f, "key").unwrap_or_else(|| "value".into());
                         let label = sval(f, "label").unwrap_or_else(|| key.clone());
                         let ftype = sval(f, "type").unwrap_or_else(|| "text".into());
-                        fields.push(Field { key, label, ftype });
+                        // Options may be [{label, value}] or bare strings.
+                        let options = f.get("options").and_then(|o| o.as_array()).map(|arr| {
+                            arr.iter().map(|o| match o {
+                                Value::String(s) => (s.clone(), Value::String(s.clone())),
+                                Value::Object(m) => {
+                                    let value = m.get("value").cloned().unwrap_or(Value::Null);
+                                    let label = m.get("label").and_then(|l| l.as_str()).map(String::from)
+                                        .unwrap_or_else(|| value.as_str().map(String::from).unwrap_or_else(|| value.to_string()));
+                                    (label, value)
+                                }
+                                other => (other.to_string(), other.clone()),
+                            }).collect()
+                        }).unwrap_or_default();
+                        let default = f.get("default").cloned().filter(|d| !d.is_null());
+                        fields.push(Field { key, label, ftype, options, default });
                     }
                 }
                 if fields.is_empty() {
-                    fields.push(Field { key: "value".into(), label: "response".into(), ftype: "text".into() });
+                    fields.push(Field { key: "value".into(), label: "response".into(), ftype: "text".into(), options: Vec::new(), default: None });
                 }
                 let _ = app_tx.send(AppEvent::Interrupt { id, title, message, fields });
             }

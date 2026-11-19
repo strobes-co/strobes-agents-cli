@@ -8062,9 +8062,29 @@ pub async fn run_chat(
                                 KeyCode::Char('j') if !ctrl => app.overlay_move(false),
                                 _ => {}
                             }
+                        } else if app.awaiting_input() && !app.pending_choices().is_empty() {
+                            // ----- choice prompt -----
+                            match k.code {
+                                KeyCode::Up | KeyCode::Char('k') => app.pending_move(true),
+                                KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => app.pending_move(false),
+                                KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
+                                    if let Some((id, data)) = app.submit_choice(Some(c as usize - '1' as usize)) {
+                                        handle.respond_interrupt(&id, data);
+                                    }
+                                }
+                                KeyCode::Enter => {
+                                    if let Some((id, data)) = app.submit_choice(None) {
+                                        handle.respond_interrupt(&id, data);
+                                    }
+                                }
+                                KeyCode::Esc => { app.decline_interrupt(); handle.cancel(); }
+                                KeyCode::Char('c') if ctrl => { app.decline_interrupt(); handle.cancel(); }
+                                _ => {}
+                            }
                         } else if app.awaiting_input() {
                             match k.code {
-                                KeyCode::Esc => quit = true,
+                                // Esc declines (stops the run) — never quits the app.
+                                KeyCode::Esc => { app.input_clear(); app.decline_interrupt(); handle.cancel(); }
                                 KeyCode::Char(c) if !ctrl => app.input_insert_char(c),
                                 // Word delete — see the matching arms in normal chat.
                                 KeyCode::Backspace if k.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
