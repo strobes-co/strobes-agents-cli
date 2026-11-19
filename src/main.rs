@@ -967,6 +967,20 @@ async fn main() -> Result<()> {
                 ));
             }
         }
+        // First run: walk through login instead of erroring out, then
+        // continue straight into the chat.
+        let mut profile = profile;
+        if !profile.is_complete() {
+            println!("Welcome to Strobes Agents! Let's connect to your organization.");
+            println!("Get a MasterKey from Strobes → Organization → API access.\n");
+            cmd_login(&mut cfg, &tenant, None, None, None, None, None, false).await?;
+            cfg = Config::load();
+            profile = cfg.profile_for(&tenant);
+            if !profile.is_complete() {
+                return Err(anyhow!("login incomplete — run `strobes login` to try again"));
+            }
+            println!();
+        }
         let mut terminal = ratatui::init();
         enable_mouse();
         let r = chat_flow(&mut terminal, &mut cfg, &tenant, profile, launch, cli.workspace.clone(), cli.model, None, initial).await;
@@ -7638,7 +7652,7 @@ async fn cmd_threads(p: &config::Profile) -> Result<()> {
 
 fn require_complete(p: &config::Profile) -> Result<()> {
     if !p.is_complete() {
-        return Err(anyhow!("profile incomplete — run `strobes login` first"));
+        return Err(anyhow!("not logged in — run `strobes` (or `strobes login`) to connect your organization"));
     }
     Ok(())
 }
@@ -7682,6 +7696,8 @@ enum Defer {
     SwitchThread(String),
     BindWorkspace(String),
     Models,
+    /// `!cmd` — run a shell command locally, outside the agent.
+    Bash(String),
 }
 
 /// Result of a `Defer::{Workspaces,Threads,Findings,Approvals}` list fetch,
@@ -7689,6 +7705,8 @@ enum Defer {
 /// for why these run in the background instead of inline `.await`s).
 enum DeferResult {
     OpenOverlay(app::OverlayKind, String, Vec<app::OverlayItem>),
+    /// A `!cmd` finished: (output, success).
+    Bash(String, bool),
     Notice(String),
     Error(String),
 }
@@ -8149,6 +8167,10 @@ pub async fn run_chat(
                                     if let Some(cmd) = builtin {
                                         app.input_clear();
                                         run_builtin(cmd, &mut app, &mut handle, &mut defer, &mut quit);
+                                    } else if let Some(cmd) = text.strip_prefix('!').map(str::trim).filter(|c| !c.is_empty()) {
+                                        app.remember_prompt(&text);
+                                        app.input_clear();
+                                        defer = Some(Defer::Bash(cmd.to_string()));
                                     } else if !text.is_empty() {
                                         app.remember_prompt(&text);
                                         // Dragged local file path(s) + a bound
@@ -8260,6 +8282,7 @@ pub async fn run_chat(
                 match maybe_defer {
                     Some(DeferResult::OpenOverlay(kind, title, items)) => app.open_overlay(kind, title, items),
                     Some(DeferResult::Notice(s)) => app.notice(&s),
+                    Some(DeferResult::Bash(out, ok)) => app.bash_done(out, ok),
                     Some(DeferResult::Error(e)) => app.on_app_event(pulse::AppEvent::Error(e)),
                     None => {}
                 }
@@ -8326,7 +8349,7 @@ pub async fn run_chat(
                     };
                     let result = match client.list_threads(profile.workspace_id.as_deref()).await {
                         Ok(ts) => {
-                            let title = if in_ws { "Threads (this workspace)" } else { "Threads" };
+                            let title = if in_ws { "Resume a chat in this workspace" } else { "Resume a chat" };
                             DeferResult::OpenOverlay(app::OverlayKind::Threads, title.into(), thread_items(ts, &thread_id, in_ws))
                         }
                         Err(e) => DeferResult::Error(e.to_string()),
@@ -8419,6 +8442,25 @@ pub async fn run_chat(
                     })
                     .collect();
                 app.open_overlay(app::OverlayKind::Models, "Select AI model  (^P toggle)".into(), items);
+            }
+            Some(Defer::Bash(cmd)) => {
+                app.bash_started(&cmd);
+                let dtx = defer_tx.clone();
+                let mut input = serde_json::json!({ "command": cmd, "_thread_id": app.thread_id.clone() });
+                if let Some(ws) = &profile.workspace_id {
+                    input["_workspace_id"] = serde_json::json!(ws);
+                }
+                tokio::spawn(async move {
+                    let r = local::run_tool("execute_command", &input).await;
+                    let ok = r.error.is_none() && matches!(r.exit_code, Some(0) | None);
+                    let mut out = r.output;
+                    if let Some(e) = r.error {
+                        out = if out.trim().is_empty() { e } else { format!("{out}\n{e}") };
+                    } else if let Some(code) = r.exit_code.filter(|c| *c != 0) {
+                        out.push_str(&format!("\n(exit {code})"));
+                    }
+                    dtx.send(DeferResult::Bash(out, ok)).ok();
+                });
             }
             Some(Defer::OpenFiles) => {
                 let dir = local::sandbox_dir();
@@ -8933,6 +8975,38 @@ fn approval_items(aps: Vec<api::Approval>) -> Vec<app::OverlayItem> {
         .collect()
 }
 
+/// Seconds since the Unix epoch for an ISO-8601 timestamp (UTC assumed,
+/// fractional seconds and offset ignored) — enough for "3h ago".
+fn iso_epoch(s: &str) -> Option<i64> {
+    let b = s.as_bytes();
+    if b.len() < 19 {
+        return None;
+    }
+    let n = |r: std::ops::Range<usize>| s.get(r)?.parse::<i64>().ok();
+    let (y, m, d) = (n(0..4)?, n(5..7)?, n(8..10)?);
+    let (hh, mm, ss) = (n(11..13)?, n(14..16)?, n(17..19)?);
+    // Days from civil (Howard Hinnant).
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + doe - 719468;
+    Some(days * 86400 + hh * 3600 + mm * 60 + ss)
+}
+
+/// Compact relative age: "just now", "5m ago", "3h ago", "2d ago".
+fn ago(secs: i64) -> String {
+    match secs.max(0) {
+        s if s < 60 => "just now".into(),
+        s if s < 3600 => format!("{}m ago", s / 60),
+        s if s < 86400 => format!("{}h ago", s / 3600),
+        s if s < 86400 * 30 => format!("{}d ago", s / 86400),
+        s => format!("{}mo ago", s / (86400 * 30)),
+    }
+}
+
 fn thread_items(ts: Vec<api::Thread>, current: &str, in_workspace: bool) -> Vec<app::OverlayItem> {
     let new_label = if in_workspace {
         "➕  New chat (in this workspace)".to_string()
@@ -8944,10 +9018,29 @@ fn thread_items(ts: Vec<api::Thread>, current: &str, in_workspace: bool) -> Vec<
         detail: vec!["Press Enter to start a new chat thread.".into()],
         action: Some("__new__".into()),
     }];
-    items.extend(ts.into_iter().map(|t| {
-        let here = if t.id == current { " ●" } else { "" };
-        let title = if t.title.is_empty() { "(untitled)".into() } else { t.title.clone() };
-        let label = format!("{title}{here}  · {}  {}", t.status, trunc(&t.last_message, 50));
+    // Default titles say nothing; the last message is the better name. Chats
+    // nobody ever wrote in are hidden (except the one you're in).
+    let generic = |t: &str| t.is_empty() || t == "CLI session" || t == "Chat with Strobes AI" || t == "New chat";
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    items.extend(ts.into_iter().filter(|t| t.id == current || !(generic(&t.title) && t.last_message.trim().is_empty())).map(|t| {
+        let here = if t.id == current { "  (current)" } else { "" };
+        let title = if generic(&t.title) && !t.last_message.trim().is_empty() {
+            trunc(t.last_message.trim(), 70)
+        } else if t.title.is_empty() {
+            "(empty chat)".into()
+        } else {
+            trunc(&t.title, 70)
+        };
+        let state = match t.status.as_str() {
+            "running" => "  ⟳ running",
+            "failed" => "  ✗ failed",
+            _ => "",
+        };
+        let age = t.created_at.as_deref().and_then(iso_epoch).map(|e| format!("  · {}", ago(now - e))).unwrap_or_default();
+        let label = format!("{title}{state}{age}{here}");
         let detail = vec![title, format!("status: {}", t.status), format!("id: {}", t.id),
             String::new(), "Press Enter to switch to this thread.".into()];
         app::OverlayItem { label, detail, action: Some(t.id) }
@@ -9373,6 +9466,23 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio_tungstenite::accept_async;
     use tokio_tungstenite::tungstenite::Message;
+
+    #[test]
+    fn iso_epoch_and_ago() {
+        assert_eq!(iso_epoch("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(iso_epoch("2000-03-01T12:30:15.123+00:00"), Some(951_913_815));
+        assert_eq!(iso_epoch("bad"), None);
+        assert_eq!(ago(30), "just now");
+        assert_eq!(ago(7200), "2h ago");
+    }
+
+    #[test]
+    fn subcommand_after_global_flag_is_not_a_prompt() {
+        let a = |v: &[&str]| subcommand_first(v.iter().map(|s| s.to_string()).collect());
+        assert_eq!(a(&["strobes", "--tenant", "x", "status"]), vec!["strobes", "status", "--tenant", "x"]);
+        assert_eq!(a(&["strobes", "scan", "status", "page"]), vec!["strobes", "scan", "status", "page"]);
+        assert_eq!(a(&["strobes", "status"]), vec!["strobes", "status"]);
+    }
 
     #[test]
     fn fmt_bytes_scales_units() {

@@ -1454,24 +1454,16 @@ impl App {
                 width: area.width,
                 height: h,
             };
-            let esc_hint = match o.kind {
-                OverlayKind::Threads => "Esc → workspaces",
-                OverlayKind::Workspaces => "Esc quit",
-                OverlayKind::Models => "Esc close · ^P toggle",
-                _ => "Esc close",
-            };
-            // Show the live search filter (the pickers are type-to-search).
-            let search = if o.filter.is_empty() {
-                if self.overlay_searchable() { " · type to search".to_string() } else { String::new() }
-            } else {
-                format!(" · search: {}", o.filter)
-            };
+            // Keys live in the footer; the title just names the list and
+            // echoes the live filter.
+            let search = if o.filter.is_empty() { String::new() } else { format!(" · “{}”", o.filter) };
             let list = List::new(items)
                 .block(
                     TuiBlock::default()
                         .borders(Borders::ALL)
-                        .title(format!(" {} ({count}) — Enter select · {esc_hint} · ^C quit{search} ", o.title))
-                        .border_style(Style::default().fg(Color::Cyan)),
+                        .border_type(ratatui::widgets::BorderType::Rounded)
+                        .title(format!(" {} ({count}){search} ", o.title))
+                        .border_style(Style::default().fg(Color::DarkGray)),
                 )
                 .highlight_style(Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD))
                 .highlight_symbol("➤ ");
@@ -1773,6 +1765,8 @@ impl App {
             (format!(" {label} "), Color::Cyan)
         } else if self.input.starts_with('/') {
             (String::new(), Color::Cyan)
+        } else if self.input.starts_with('!') {
+            (" bash ".to_string(), Color::Magenta)
         } else {
             (String::new(), Color::DarkGray)
         };
@@ -1874,6 +1868,8 @@ impl App {
             "  select mode — drag to select, ⌘C copies · ctrl+s to exit".to_string()
         } else if self.slash_open() {
             "  ↑↓ select · tab/enter complete · esc cancel".to_string()
+        } else if self.input.starts_with('!') {
+            "  ! bash mode — runs locally in the agent's sandbox, not sent to the agent".to_string()
         } else if self.input.contains('\n') {
             "  enter to send · ctrl+j newline".to_string()
         } else if !self.input.is_empty() {
@@ -1903,8 +1899,9 @@ impl App {
 
     /// The `?` shortcuts panel (replaces the footer until the next key).
     fn help_lines(&self) -> Vec<Line<'static>> {
-        let rows: [(&str, &str, &str, &str); 6] = [
+        let rows: [(&str, &str, &str, &str); 7] = [
             ("/", "commands", "ctrl+p", "model"),
+            ("!", "run a shell command locally", "ctrl+l", "local files"),
             ("esc", "interrupt the agent", "ctrl+w", "workspaces"),
             ("ctrl+c", "clear input · twice to quit", "ctrl+f", "findings"),
             ("ctrl+j", "newline (shift+enter on kitty)", "ctrl+o", "expand tool output"),
@@ -2692,6 +2689,27 @@ impl App {
         self.last_elapsed = None;
     }
 
+    /// `!cmd` bash mode: show the command as a running call.
+    pub fn bash_started(&mut self, cmd: &str) {
+        self.flush_stream();
+        self.blocks.push(Block::Tool {
+            name: "__bash__".into(),
+            detail: cmd.to_string(),
+            status: ToolStatus::Running,
+            agent: "__user__".into(),
+        });
+        self.follow = true;
+        self.pinned = false;
+    }
+
+    /// `!cmd` finished: settle the call and show its output.
+    pub fn bash_done(&mut self, output: String, ok: bool) {
+        self.finish_last_tool("__user__", ok);
+        let text = if output.trim().is_empty() { "(no output)".to_string() } else { output };
+        self.blocks.push(Block::ToolResult { text, failed: !ok });
+        self.follow = true;
+    }
+
     /// Attach a tool's result under its call. The wrapper tool and the local
     /// execution it drives both report the same output; show it once.
     fn push_tool_result(&mut self, text: String, failed: bool) {
@@ -2717,6 +2735,7 @@ impl App {
 /// `browser_navigate` → "Browser navigate", anything else in sentence case.
 fn tool_label(name: &str) -> String {
     let known = match name {
+        "__bash__" => Some("Bash"),
         "execute_command" | "workspace_execute_shell_command" => Some("Shell"),
         "execute_code" | "workspace_execute_code" => Some("Run code"),
         "read_file" | "workspace_read_file" => Some("Read"),
