@@ -1505,7 +1505,7 @@ impl App {
         // Input box grows with the wrapped message (borders + content), capped
         // so the transcript, hint and status rows always remain on screen.
         let tw = Self::input_text_width(f.area().width);
-        let help = if self.show_help { self.help_lines() } else { Vec::new() };
+        let help = if self.show_help { self.help_lines_for(f.area().width) } else { Vec::new() };
         let footer_h = (help.len() as u16).max(1);
         let cap = f.area().height.saturating_sub(3 + footer_h).max(3);
         let rows = match self.pending_choices().len() {
@@ -2007,7 +2007,11 @@ impl App {
             let tip = if self.running {
                 "Type to queue a follow-up · esc to interrupt"
             } else {
-                "Ask anything — e.g. \"find exposed admin panels on example.com\""
+                if area.width >= 76 {
+                    "Ask anything — e.g. \"find exposed admin panels on example.com\""
+                } else {
+                    "Ask anything…"
+                }
             };
             vec![Line::from(vec![
                 Span::raw("> "),
@@ -2126,7 +2130,15 @@ impl App {
         if let Some(p) = self.context_pct.filter(|p| *p >= 60.0) {
             right.insert(0, format!("context {:.0}% used — /new for a fresh chat", p));
         }
-        let right = format!("{} ", right.join(" · "));
+        // Narrow terminals keep the most useful item only.
+        if area.width < 80 && right.len() > 1 {
+            right.truncate(1);
+        }
+        let mut right = format!("{} ", right.join(" · "));
+        let max_r = (area.width / 2) as usize;
+        if right.chars().count() > max_r {
+            right = format!("{} ", truncate(right.trim_end(), max_r.saturating_sub(2)));
+        }
         let rw = (right.chars().count() as u16).min(area.width / 2);
         let parts = Layout::horizontal([Constraint::Min(1), Constraint::Length(rw)]).split(area);
         let lstyle = if self.armed_now().is_some() { Style::default().fg(Color::Yellow) } else { dim };
@@ -2139,6 +2151,11 @@ impl App {
 
     /// The `?` shortcuts panel (replaces the footer until the next key).
     fn help_lines(&self) -> Vec<Line<'static>> {
+        self.help_lines_for(u16::MAX)
+    }
+
+    /// The shortcuts table: two columns when it fits, else one.
+    fn help_lines_for(&self, width: u16) -> Vec<Line<'static>> {
         let rows: [(&str, &str, &str, &str); 8] = [
             ("/", "commands", "ctrl+p", "model"),
             ("!", "run a shell command locally", "ctrl+l", "local files"),
@@ -2151,6 +2168,13 @@ impl App {
         ];
         let key = Style::default().fg(Color::White);
         let dim = Style::default().fg(Color::DarkGray);
+        if width < 80 {
+            return rows
+                .iter()
+                .flat_map(|(k1, d1, k2, d2)| [(*k1, *d1), (*k2, *d2)])
+                .map(|(k, d)| Line::from(vec![Span::styled(format!("  {k:<10}"), key), Span::styled(d.to_string(), dim)]))
+                .collect();
+        }
         rows.iter()
             .map(|(k1, d1, k2, d2)| {
                 Line::from(vec![
