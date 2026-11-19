@@ -74,6 +74,8 @@ pub enum AppEvent {
     LocalLine { call_id: String, line: String },
     /// A backgrounded local command finished.
     JobDone { job: u32, exit: Option<i32>, command: String },
+    /// The agent wants to do something that needs approval (ask mode).
+    ApprovalRequest { id: String, agent: String, module: String, preview: String },
     Error(String),
 }
 
@@ -138,6 +140,16 @@ impl PulseHandle {
 
     pub fn cancel(&self) {
         let _ = self.out.send(json!({ "type": "run.cancel" }).to_string());
+    }
+
+    /// Answer an approval request ("approved" / "rejected").
+    pub fn respond_approval(&self, approval_id: &str, approved: bool) {
+        let frame = json!({
+            "type": "approval.response",
+            "approval_id": approval_id,
+            "decision": if approved { "approved" } else { "rejected" },
+        });
+        let _ = self.out.send(frame.to_string());
     }
 
     /// Answer a `request_human_input` interrupt.
@@ -567,6 +579,10 @@ fn compact(v: &Value, limit: usize) -> String {
     }
 }
 
+/// `/permissions ask`: approval requests go to the user instead of being
+/// approved automatically.
+pub static ASK_APPROVALS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Forward job events (live lines, background completion) to the UI.
 pub fn job_sink(app_tx: mpsc::UnboundedSender<AppEvent>) -> crate::jobs::Sink {
     std::sync::Arc::new(move |e| {
@@ -696,9 +712,18 @@ fn handle_frame(v: Value, app_tx: &mpsc::UnboundedSender<AppEvent>, out_tx: &mps
         return;
     }
 
-    // Blocking approval — auto-approve in the TUI (configurable later).
+    // Blocking approval: ask the user (/permissions ask), else auto-approve.
     if etype == "approval" && status.as_deref() == Some("requested") {
         let approval_id = sval(&b, "approvalId").or_else(|| sval(&b, "approval_id")).unwrap_or_default();
+        if ASK_APPROVALS.load(Ordering::Relaxed) {
+            let _ = app_tx.send(AppEvent::ApprovalRequest {
+                id: approval_id,
+                agent: agent.unwrap_or_default(),
+                module: sval(&b, "module").unwrap_or_default(),
+                preview: sval(&b, "preview").or_else(|| sval(&b, "description")).unwrap_or_default(),
+            });
+            return;
+        }
         let _ = out_tx.send(
             json!({ "type": "approval.response", "approval_id": approval_id, "decision": "approved" })
                 .to_string(),

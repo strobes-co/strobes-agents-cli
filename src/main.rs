@@ -7538,6 +7538,7 @@ fn describe(ev: &pulse::AppEvent) -> String {
         Context(p) => format!("context {p:.1}%"),
         LocalLine { call_id, line } => format!("local[{}] {line}", &call_id[..8.min(call_id.len())]),
         JobDone { job, exit, command } => format!("job #{job} done exit={exit:?} {command}"),
+        ApprovalRequest { id, module, .. } => format!("approval requested {id} ({module})"),
         Error(e) => format!("error: {e}"),
         LocalToolDone { name, ms, exit, err } => {
             format!("local tool {name} done {ms}ms exit={exit:?} err={err:?}")
@@ -8228,6 +8229,23 @@ fn require_complete(p: &config::Profile) -> Result<()> {
     Ok(())
 }
 
+/// Send a finished prompt's answer: an approval decision, or an interrupt reply.
+fn answer_pending(handle: &pulse::PulseHandle, id: &str, data: serde_json::Value, app: &mut App) {
+    if let Some(approval) = id.strip_prefix("approval:") {
+        let d = data.get("decision").and_then(|v| v.as_str()).unwrap_or("rejected");
+        if d == "always" {
+            pulse::ASK_APPROVALS.store(false, std::sync::atomic::Ordering::Relaxed);
+            app.notice("approving automatically for the rest of this session (/permissions to change)");
+        }
+        handle.respond_approval(approval, d != "rejected");
+        if d == "rejected" {
+            app.notice("declined — the agent was told no");
+        }
+    } else {
+        handle.respond_interrupt(id, data);
+    }
+}
+
 /// Run a client-side slash command (see `app::BUILTIN_COMMANDS`).
 fn run_builtin(cmd: &str, app: &mut App, handle: &mut pulse::PulseHandle, defer: &mut Option<Defer>, quit: &mut bool) {
     let _ = handle;
@@ -8242,6 +8260,18 @@ fn run_builtin(cmd: &str, app: &mut App, handle: &mut pulse::PulseHandle, defer:
         "approvals" => *defer = Some(Defer::Approvals),
         "files" => *defer = Some(Defer::Files),
         "jobs" => *defer = Some(Defer::Jobs),
+        "permissions" => {
+            let ask = !pulse::ASK_APPROVALS.load(std::sync::atomic::Ordering::Relaxed);
+            pulse::ASK_APPROVALS.store(ask, std::sync::atomic::Ordering::Relaxed);
+            let mut c = Config::load();
+            c.approvals = if ask { "ask".into() } else { String::new() };
+            let _ = c.save();
+            app.notice(if ask {
+                "permissions: ask — you'll confirm each action that needs approval (saved)"
+            } else {
+                "permissions: automatic — approval-gated actions are approved for you (saved)"
+            });
+        }
         "browser" => *defer = Some(Defer::Browser(String::new())),
         "copy" => match copy_to_clipboard(&app.transcript_plaintext()) {
             Ok(_) => app.notice("copied transcript to clipboard"),
@@ -8476,6 +8506,7 @@ pub async fn run_chat(
     let mut profile = profile;
     let client = api::ApiClient::new(profile.clone())?;
     let mut app = App::new(thread_id.clone(), profile.base_url.clone(), tenant.to_string(), profile.org_id.clone());
+    pulse::ASK_APPROVALS.store(Config::load().approvals == "ask", std::sync::atomic::Ordering::Relaxed);
     app.has_workspace = profile.workspace_id.is_some();
     if let Some(m) = model {
         app.set_model(Some(m));
@@ -8715,12 +8746,12 @@ pub async fn run_chat(
                                 KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => app.pending_move(false),
                                 KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
                                     if let Some((id, data)) = app.submit_choice(Some(c as usize - '1' as usize)) {
-                                        handle.respond_interrupt(&id, data);
+                                        answer_pending(&handle, &id, data, &mut app);
                                     }
                                 }
                                 KeyCode::Enter => {
                                     if let Some((id, data)) = app.submit_choice(None) {
-                                        handle.respond_interrupt(&id, data);
+                                        answer_pending(&handle, &id, data, &mut app);
                                     }
                                 }
                                 KeyCode::Esc => { app.decline_interrupt(); handle.cancel(); }
@@ -8746,7 +8777,7 @@ pub async fn run_chat(
                                     let raw = app.input.clone();
                                     app.input_clear();
                                     if let Some((id, data)) = app.submit_interrupt_value(raw.trim()) {
-                                        handle.respond_interrupt(&id, data);
+                                        answer_pending(&handle, &id, data, &mut app);
                                     }
                                 }
                                 _ => {}

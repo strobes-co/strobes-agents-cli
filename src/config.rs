@@ -204,6 +204,10 @@ pub struct Config {
     /// Per-workspace open counts (workspace_id -> usage), for "recent" ranking.
     #[serde(default)]
     pub workspace_usage: BTreeMap<String, WorkspaceUsage>,
+    /// "ask" → confirm each action the agent needs approval for; anything
+    /// else (default) approves automatically.
+    #[serde(default)]
+    pub approvals: String,
 }
 
 fn default_profile_name() -> String {

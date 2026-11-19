@@ -411,6 +411,7 @@ pub const BUILTIN_COMMANDS: &[(&str, &str)] = &[
     ("approvals", "Review pending approvals"),
     ("files", "Browse the workspace's local files"),
     ("jobs", "Background commands: status, output, stop (alias /bg)"),
+    ("permissions", "Ask before approval-gated actions, or approve automatically"),
     ("browser", "Agent's browser: open <url> to sign in · show · hide · attach <port> · close"),
     ("copy", "Copy the transcript to the clipboard"),
     ("thinking", "Show or hide the agent's reasoning"),
@@ -925,6 +926,39 @@ impl App {
                     }
                     self.live_gen += 1;
                 }
+            }
+            AppEvent::ApprovalRequest { id, agent, module, preview } => {
+                self.flush_stream();
+                self.running = false;
+                self.status = "approval needed".into();
+                // The preview names the action ("Create finding: 'X'"); the
+                // module ("findings") is just a tag.
+                let mut lines = preview.lines().filter(|l| !l.trim().is_empty());
+                let head = lines.next().map(str::to_string).unwrap_or_else(|| "an action".into());
+                let who = if agent.is_empty() || is_main_agent(&agent) { String::new() } else { format!(" · {agent}") };
+                let tag = if module.is_empty() { String::new() } else { format!("  {}{who}", module.replace('_', " ")) };
+                self.push(Line::default());
+                self.push(Line::from(vec![
+                    Span::styled("? ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                    Span::styled(format!("Approve: {head}"), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                    Span::styled(tag, Style::default().fg(Color::DarkGray)),
+                ]));
+                for l in lines.take(8) {
+                    self.push(Line::from(Span::styled(format!("  {l}"), Style::default().fg(Color::Gray))));
+                }
+                let field = Field {
+                    key: "decision".into(),
+                    label: "Allow it?".into(),
+                    ftype: "select".into(),
+                    options: vec![
+                        ("Yes".into(), Value::from("approved")),
+                        ("Yes, and don't ask again this session".into(), Value::from("always")),
+                        ("No".into(), Value::from("rejected")),
+                    ],
+                    default: None,
+                };
+                self.pending = Some(Pending { id: format!("approval:{id}"), fields: vec![field], idx: 0, answers: Map::new(), sel: 0 });
+                self.follow = true;
             }
             AppEvent::JobDone { job, exit, command } => {
                 let how = match exit {
@@ -4518,6 +4552,20 @@ mod input_editor_tests {
         assert_eq!(tool_summary("search_tools", &tools).unwrap(), "loaded 1 tool: oob_send_smtp");
         assert!(tool_summary("execute_command", &tools).is_none());
         assert_eq!(tool_label("load_skill"), "Skill");
+    }
+
+    #[test]
+    fn approval_request_becomes_a_choice() {
+        let mut a = app();
+        a.on_app_event(AppEvent::ApprovalRequest {
+            id: "ap1".into(), agent: "Strobes AI Supervisor".into(),
+            module: "create_finding".into(), preview: "SQLi on /login".into(),
+        });
+        assert_eq!(a.pending_choices(), vec!["Yes", "Yes, and don't ask again this session", "No"]);
+        let (id, data) = a.submit_choice(Some(2)).unwrap();
+        assert_eq!(id, "approval:ap1");
+        assert_eq!(data, serde_json::json!({"decision": "rejected"}));
+        assert!(a.transcript_plaintext().contains("Approve: SQLi on /login"));
     }
 
     #[test]
