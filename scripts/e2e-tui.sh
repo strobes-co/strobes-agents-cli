@@ -111,7 +111,7 @@ tmux list-panes -t $S -F '#{pane_current_command}' 2>/dev/null | grep -q strobes
 
 echo "▸ resume"
 start 100 32 -c
-check "-c reopens the last chat" "e2e-pong-7731" 15
+check "-c reopens the last chat" "e2e-sub-5150" 15
 keys C-c C-c
 start 100 32 -r
 check "-r opens the resume list" "Resume a chat" 15

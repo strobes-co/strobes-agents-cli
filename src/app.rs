@@ -765,16 +765,26 @@ impl App {
             self.push_interrupted();
             return;
         }
-        if let Some(Block::Assistant { agent: prev_agent, md: prev_md }) = self.blocks.last_mut() {
-            // A segment the server sent twice (whole, or just its last chunk).
-            if *prev_agent == agent && is_replay(prev_md, &md) {
-                return;
-            }
-            if *prev_agent == agent {
-                prev_md.push_str("\n\n");
-                prev_md.push_str(&md);
-                self.follow = true;
-                return;
+        // The reply this continues: the last block, or the last one before a
+        // run of thinking blocks (hidden by default) — servers interleave
+        // thinking between fragments of one reply.
+        let prev = self
+            .blocks
+            .iter()
+            .rposition(|b| !matches!(b, Block::Thinking(_)))
+            .filter(|_| !self.show_thinking || matches!(self.blocks.last(), Some(Block::Assistant { .. })));
+        if let Some(i) = prev {
+            if let Block::Assistant { agent: prev_agent, md: prev_md } = &mut self.blocks[i] {
+                // A segment the server sent twice (whole, or just its last chunk).
+                if *prev_agent == agent && is_replay(prev_md, &md) {
+                    return;
+                }
+                if *prev_agent == agent {
+                    prev_md.push_str(segment_joint(prev_md, &md));
+                    prev_md.push_str(&md);
+                    self.follow = true;
+                    return;
+                }
             }
         }
         self.blocks.push(Block::Assistant { agent, md });
@@ -3909,6 +3919,30 @@ fn humanize_job_note(text: &str) -> String {
     out
 }
 
+/// How to join two consecutive reply segments from one agent. Servers can
+/// persist one sentence as several segments (e.g. while a sub-agent runs),
+/// so a segment that clearly continues the previous one joins inline;
+/// otherwise they are separate paragraphs.
+fn segment_joint(prev: &str, next: &str) -> &'static str {
+    let Some(first) = next.chars().next() else { return "" };
+    let last = prev.chars().last().unwrap_or(' ');
+    if first.is_whitespace() || last.is_whitespace() {
+        return "";
+    }
+    if matches!(first, ';' | ',' | '.' | ':' | '!' | '?' | ')' | '-' | '\'' | '’') {
+        return "";
+    }
+    if first.is_lowercase() {
+        // "…the result in" + "one line" → a space; "Sub" + "agent" stays apart too.
+        return " ";
+    }
+    if !matches!(last, '.' | '!' | '?' | ':' | ')' | '`' | '*') && last.is_alphanumeric() && first.is_alphanumeric() {
+        // Mid-sentence cut before a capitalised word ("…on the" + "Linux host").
+        return " ";
+    }
+    "\n\n"
+}
+
 /// Is `chunk` a server re-send of text already shown? Older servers race two
 /// flushes of the same buffer, re-sending the whole segment or just its last
 /// chunk, so the same words land twice in a row. Short chunks are never
@@ -4591,6 +4625,19 @@ mod input_editor_tests {
         assert_eq!(id, "approval:ap1");
         assert_eq!(data, serde_json::json!({"decision": "rejected"}));
         assert!(a.transcript_plaintext().contains("Approve: SQLi on /login"));
+    }
+
+    #[test]
+    fn fragmented_segments_rejoin_into_one_sentence() {
+        let mut a = app();
+        for part in ["Sub", "-agent dispatched and running", "; I will report", " the result in", "one line once it completes."] {
+            a.push_assistant("Strobes AI Supervisor".into(), part.into());
+        }
+        // Hidden thinking between fragments doesn't split them either.
+        a.blocks.push(Block::Thinking("IT:0 sent".into()));
+        a.push_assistant("Strobes AI Supervisor".into(), "Done. All checks passed.".into());
+        let t = a.transcript_plaintext();
+        assert!(t.contains("Sub-agent dispatched and running; I will report the result in one line once it completes.\n\nDone."), "{t}");
     }
 
     #[test]
