@@ -1450,7 +1450,10 @@ impl App {
             }
         }
         out.iter_mut().for_each(win_safe_line);
-        out
+        // Wrap here (not in the Paragraph) so continuation lines hang under
+        // their text — "⏺ long reply…" continues under the reply, not at col 0.
+        let w = width as usize;
+        out.into_iter().flat_map(|l| wrap_hanging(l, w)).collect()
     }
 
     fn render_md(&self, md: &str, out: &mut Vec<Line<'static>>) {
@@ -1472,8 +1475,8 @@ impl App {
         self.render_md(md, out);
         let mut lead = bullet;
         for l in out[start..].iter_mut() {
-            if lead && l.spans.iter().all(|s| s.content.trim().is_empty()) {
-                continue; // keep the bullet for the first visible line
+            if l.spans.iter().all(|s| s.content.trim().is_empty()) {
+                continue; // blank stays blank (keeps paragraph spacing single)
             }
             let pre = if lead {
                 Span::styled("⏺ ", Style::default().fg(Color::White))
@@ -1530,7 +1533,10 @@ impl App {
             let body_area = chunks[0];
             // One task ("Exploring & Planning") is just noise; the panel earns
             // its space once the agent has a real plan.
-            if self.tasks.len() >= 2 && body_area.width > 80 {
+            // …and only while there's work in flight: a finished plan gives the
+            // width back to the transcript.
+            let open = self.running || self.tasks.iter().any(|t| matches!(t.status, TaskStatus::Running | TaskStatus::Created));
+            if self.tasks.len() >= 2 && open && body_area.width > 80 {
                 let panel_w = (body_area.width / 4).clamp(22, 36);
                 let hchunks = Layout::horizontal([
                     Constraint::Min(1),
@@ -3306,6 +3312,86 @@ fn default_choice(p: &Pending) -> usize {
     field_choices(f).iter().position(|(_, v)| v == d).unwrap_or(0)
 }
 
+/// Columns a wrapped line's continuation should be indented by: its leading
+/// whitespace plus a leading marker ("⏺ ", "⎿  ", "> ", "• ", "1. ", …).
+fn hang_indent(text: &str) -> usize {
+    let ws = text.chars().take_while(|c| *c == ' ').count();
+    let rest = &text[ws..];
+    for m in ["⏺ ", "⎿  ", "> ", "• ", "- ", "* ", "◆ ", "? ", "✻ "] {
+        if rest.starts_with(m) {
+            return ws + m.chars().count();
+        }
+    }
+    let digits = rest.chars().take_while(|c| c.is_ascii_digit()).count();
+    if digits > 0 && rest[digits..].starts_with(". ") {
+        return ws + digits + 2;
+    }
+    ws
+}
+
+/// Word-wrap a styled line to `width`, indenting continuation rows by
+/// `hang_indent`. Box-drawn content (code boxes, tables) is left as is.
+fn wrap_hanging(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
+    let sw = |t: &str| Span::raw(t.to_string()).width();
+    if width < 8 || line.width() <= width {
+        return vec![line];
+    }
+    let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+    if text.contains(['│', '┌', '└', '╭', '╰']) {
+        return vec![line];
+    }
+    let indent = hang_indent(&text).min(width / 2);
+    let mut rows: Vec<Line<'static>> = Vec::new();
+    let mut cur: Vec<Span<'static>> = Vec::new();
+    let mut cur_w = 0usize;
+    let push_tok = |cur: &mut Vec<Span<'static>>, tok: &str, style: Style| {
+        match cur.last_mut() {
+            Some(last) if last.style == style => {
+                let mut c = last.content.to_string();
+                c.push_str(tok);
+                last.content = c.into();
+            }
+            _ => cur.push(Span::styled(tok.to_string(), style)),
+        }
+    };
+    for span in &line.spans {
+        let style = span.style;
+        for tok in span.content.split_inclusive(' ') {
+            let tw = sw(tok);
+            let fits = cur_w + sw(tok.trim_end()) <= width;
+            if !fits && cur_w > indent {
+                rows.push(Line::from(std::mem::take(&mut cur)));
+                cur.push(Span::raw(" ".repeat(indent)));
+                cur_w = indent;
+                let t = tok.trim_start();
+                if t.is_empty() {
+                    continue;
+                }
+                // A single word longer than the row: hard-split it.
+                let mut rest = t.to_string();
+                while cur_w + sw(rest.as_str()) > width && rest.chars().count() > 1 {
+                    let room = width.saturating_sub(cur_w).max(1);
+                    let head: String = rest.chars().take(room).collect();
+                    rest = rest.chars().skip(room).collect();
+                    push_tok(&mut cur, &head, style);
+                    rows.push(Line::from(std::mem::take(&mut cur)));
+                    cur.push(Span::raw(" ".repeat(indent)));
+                    cur_w = indent;
+                }
+                cur_w += sw(rest.as_str());
+                push_tok(&mut cur, &rest, style);
+            } else {
+                cur_w += tw;
+                push_tok(&mut cur, tok, style);
+            }
+        }
+    }
+    if !cur.is_empty() {
+        rows.push(Line::from(cur));
+    }
+    rows
+}
+
 /// Reader-facing tool name: `workspace_execute_shell_command` → "Shell",
 /// `browser_navigate` → "Browser navigate", anything else in sentence case.
 pub fn tool_label(name: &str) -> String {
@@ -3882,6 +3968,22 @@ mod input_editor_tests {
         assert_eq!(text.matches("Interrupted").count(), 1, "{text}");
         assert!(!text.contains("Run cancelled"));
         assert!(!is_cancel_receipt("The run cancelled flag is set"));
+    }
+
+    #[test]
+    fn long_lines_hang_under_their_marker() {
+        let text = "⏺ one two three four five six seven eight nine ten";
+        let rows = wrap_hanging(Line::from(text.to_string()), 20);
+        let rows: Vec<String> = rows.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect()).collect();
+        assert!(rows.len() > 1);
+        for r in &rows[1..] {
+            assert!(r.starts_with("  ") && !r.starts_with("   "), "{r:?}");
+            assert!(r.chars().count() <= 20, "{r:?}");
+        }
+        assert_eq!(hang_indent("  ⎿  out"), 5);
+        assert_eq!(hang_indent("  12. item"), 6);
+        // Code boxes are left for the renderer.
+        assert_eq!(wrap_hanging(Line::from("│ ".to_string() + &"x".repeat(50)), 20).len(), 1);
     }
 
     #[test]
