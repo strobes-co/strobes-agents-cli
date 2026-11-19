@@ -421,6 +421,15 @@ Agent skills (e.g. `/api-pentest`) appear in the same `/` menu after the built-i
   the agent continues in that session. `show`/`hide` switch visible/headless,
   `attach 9222` drives your own Chrome, `close` stops it.
 
+### Many targets at once
+
+```bash
+strobes batch -f targets.txt -j 4 "Assess {target} for exposed admin panels" --out results/
+```
+
+Runs one agent per target, N at a time, with live progress; writes
+`results/<target>.md` and a `results/index.md` summary (exit 1 if any failed).
+
 ### Strobes API
 
 ```bash

@@ -265,6 +265,32 @@ enum Cmd {
     },
     /// Forget this tenant's credentials.
     Logout,
+    /// Run one prompt over many targets, several agents at a time.
+    ///
+    ///   strobes batch -f targets.txt -j 4 "Assess {target} for exposed admin panels"
+    ///   echo -e "a.com\nb.com" | strobes batch "Recon {target}" --out recon/
+    Batch {
+        /// Prompt template; {target} is replaced by each target.
+        prompt: String,
+        /// File with one target per line (default: stdin). # comments skipped.
+        #[arg(short = 'f', long)]
+        file: Option<String>,
+        /// How many agents run at once.
+        #[arg(short = 'j', long, default_value_t = 3)]
+        jobs: usize,
+        /// Directory for <target>.md results and index.md.
+        #[arg(long, default_value = "strobes-batch")]
+        out: String,
+        /// Workspace for every run (default: the bound one).
+        #[arg(short = 'w', long)]
+        workspace: Option<String>,
+        /// Model id for every run.
+        #[arg(short = 'm', long)]
+        model: Option<i64>,
+        /// Give up on a target after this many seconds.
+        #[arg(long, default_value_t = 1800)]
+        timeout: u64,
+    },
     /// Call the Strobes API with your credentials (like `gh api`).
     ///
     /// Paths are relative to your organization unless they start with /v1/:
@@ -1101,6 +1127,9 @@ async fn main() -> Result<()> {
         }
         Cmd::Logout => cmd_logout(&mut cfg, &tenant),
         Cmd::Api { path, method, data, query, raw } => cmd_api(&profile, &path, &method, data, query, raw).await,
+        Cmd::Batch { prompt, file, jobs, out, workspace, model, timeout } => {
+            cmd_batch(&profile, &tenant, prompt, file, jobs, out, workspace, model, timeout).await
+        }
         Cmd::Update { force } => cmd_update(force).await,
         Cmd::Tenants => cmd_tenants(&cfg),
         Cmd::Credits { workspace, thread } => cmd_credits(&profile, workspace, thread).await,
@@ -7749,6 +7778,140 @@ async fn browser_login(cfg: &mut Config, tenant: &str, url: Option<String>, web_
     Ok(())
 }
 
+/// File-safe name for a target ("https://a.com/x" → "a.com_x").
+fn target_slug(t: &str) -> String {
+    let t = t.trim().trim_start_matches("https://").trim_start_matches("http://");
+    let s: String = t.chars().map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' { c } else { '_' }).collect();
+    let s = s.trim_matches('_').to_string();
+    if s.is_empty() { "target".into() } else { s.chars().take(80).collect() }
+}
+
+/// `strobes batch`: fan a prompt out over targets with bounded concurrency.
+/// Each target is its own `strobes -p` run (own thread), so a failure or a
+/// hang never affects the others.
+#[allow(clippy::too_many_arguments)]
+async fn cmd_batch(
+    p: &config::Profile,
+    tenant: &str,
+    prompt: String,
+    file: Option<String>,
+    jobs: usize,
+    out: String,
+    workspace: Option<String>,
+    model: Option<i64>,
+    timeout_secs: u64,
+) -> Result<()> {
+    require_complete(p)?;
+    let text = match &file {
+        Some(f) => std::fs::read_to_string(f).with_context(|| format!("reading {f}"))?,
+        None => {
+            use std::io::IsTerminal;
+            if std::io::stdin().is_terminal() {
+                return Err(anyhow!("give targets with -f targets.txt or on stdin"));
+            }
+            let mut s = String::new();
+            std::io::Read::read_to_string(&mut std::io::stdin(), &mut s)?;
+            s
+        }
+    };
+    let targets: Vec<String> = text
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(String::from)
+        .collect();
+    if targets.is_empty() {
+        return Err(anyhow!("no targets"));
+    }
+    if !prompt.contains("{target}") {
+        eprintln!("note: the prompt has no {{target}} — every run gets the same prompt plus the target appended");
+    }
+    let dir = std::path::PathBuf::from(&out);
+    std::fs::create_dir_all(&dir)?;
+    let exe = std::env::current_exe()?;
+    let jobs = jobs.clamp(1, 32);
+    let total = targets.len();
+    let ws = workspace.or_else(|| p.workspace_id.clone());
+    eprintln!("running {total} target(s), {jobs} at a time → {}/", dir.display());
+
+    let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(jobs));
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let started = std::time::Instant::now();
+    let mut handles = Vec::new();
+    for t in targets.clone() {
+        let sem = sem.clone();
+        let done = done.clone();
+        let exe = exe.clone();
+        let dir = dir.clone();
+        let tenant = tenant.to_string();
+        let ws = ws.clone();
+        let full = if prompt.contains("{target}") { prompt.replace("{target}", &t) } else { format!("{prompt}\n\nTarget: {t}") };
+        handles.push(tokio::spawn(async move {
+            let _permit = sem.acquire_owned().await.ok();
+            let t0 = std::time::Instant::now();
+            let mut cmd = tokio::process::Command::new(&exe);
+            cmd.arg("--tenant").arg(&tenant).arg("-p").arg(&full);
+            if let Some(w) = &ws {
+                cmd.arg("-w").arg(w);
+            }
+            if let Some(m) = model {
+                cmd.arg("-m").arg(m.to_string());
+            }
+            cmd.stdin(std::process::Stdio::null()).kill_on_drop(true);
+            let res = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), cmd.output()).await;
+            let (ok, body, why) = match res {
+                Ok(Ok(o)) => {
+                    let body = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                    let err = String::from_utf8_lossy(&o.stderr).trim().to_string();
+                    let ok = o.status.success() && !body.is_empty();
+                    let why = if ok { String::new() } else { err.lines().last().unwrap_or("failed").to_string() };
+                    (ok, body, why)
+                }
+                Ok(Err(e)) => (false, String::new(), e.to_string()),
+                Err(_) => (false, String::new(), format!("timed out after {timeout_secs}s")),
+            };
+            let slug = target_slug(&t);
+            let file = dir.join(format!("{slug}.md"));
+            let _ = std::fs::write(&file, format!("# {t}\n\n> {}\n\n{}\n", full.replace('\n', " "), if ok { body.clone() } else { format!("**failed:** {why}") }));
+            let n = done.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            let secs = t0.elapsed().as_secs();
+            if ok {
+                eprintln!("[{n}/{total}] \x1b[32m✔\x1b[0m {t}  ({secs}s)");
+            } else {
+                eprintln!("[{n}/{total}] \x1b[31m✘\x1b[0m {t}  ({secs}s) — {why}");
+            }
+            (t, slug, ok, body, why)
+        }));
+    }
+    let mut rows = Vec::new();
+    for h in handles {
+        if let Ok(r) = h.await {
+            rows.push(r);
+        }
+    }
+    let failed = rows.iter().filter(|r| !r.2).count();
+    let mut index = format!("# strobes batch\n\nPrompt: `{}`\n\n| target | result | summary |\n|---|---|---|\n", prompt.replace('|', "\\|"));
+    for (t, slug, ok, body, why) in &rows {
+        let first = if *ok { body.lines().find(|l| !l.trim().is_empty()).unwrap_or("").to_string() } else { why.clone() };
+        index.push_str(&format!(
+            "| [{t}]({slug}.md) | {} | {} |\n",
+            if *ok { "✔" } else { "✘" },
+            trunc(&first.replace('|', "\\|"), 120)
+        ));
+    }
+    std::fs::write(dir.join("index.md"), index)?;
+    eprintln!(
+        "done in {}s: {} ok, {failed} failed → {}",
+        started.elapsed().as_secs(),
+        total - failed,
+        dir.join("index.md").display()
+    );
+    if failed > 0 {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
 /// `strobes api`: one authenticated request, pretty JSON out, non-zero exit
 /// on HTTP errors.
 async fn cmd_api(p: &config::Profile, path: &str, method: &str, data: Option<String>, query: Vec<String>, raw: bool) -> Result<()> {
@@ -10154,6 +10317,13 @@ mod tests {
         assert_eq!(iso_epoch("bad"), None);
         assert_eq!(ago(30), "just now");
         assert_eq!(ago(7200), "2h ago");
+    }
+
+    #[test]
+    fn batch_target_slugs_are_file_safe() {
+        assert_eq!(target_slug("https://a.example.com/login?x=1"), "a.example.com_login_x_1");
+        assert_eq!(target_slug("10.0.0.1"), "10.0.0.1");
+        assert_eq!(target_slug("///"), "target");
     }
 
     #[test]
