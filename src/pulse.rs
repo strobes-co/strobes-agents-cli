@@ -251,7 +251,8 @@ pub async fn connect(
                         }
                         Err(e) => {
                             let _ = app_tx.send(AppEvent::Disconnected(format!("reconnect failed: {e}")));
-                            delay = (delay * 2).min(20);
+                            // Capped low: a restarted server should be picked up quickly.
+                            delay = (delay * 2).min(5);
                         }
                     }
                 }
