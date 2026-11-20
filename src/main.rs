@@ -6,12 +6,18 @@
 //! its tools locally (the user's machine is the sandbox).
 
 mod analyzer_registry;
+mod hooks;
+mod jobs;
 mod api;
 mod app;
 mod browser;
 mod cache;
+mod commands;
 mod config;
 mod local;
+mod mcp;
+mod mcp_serve;
+mod project;
 mod pack;
 mod markdown;
 mod picker;
@@ -73,6 +79,24 @@ fn notify_response_done(secs: u64) {
     }
 }
 
+/// The agent is blocked on the user (a question or an approval): notify
+/// right away — this is exactly when someone who stepped away needs a ping.
+fn notify_needs_you(what: &str) {
+    let disabled = std::env::var("STROBES_AI_NOTIFY")
+        .map(|v| v.eq_ignore_ascii_case("off") || v == "0")
+        .unwrap_or(false);
+    if disabled {
+        return;
+    }
+    use std::io::Write;
+    let what: String = what.chars().filter(|c| !c.is_control()).take(80).collect();
+    let mut out = std::io::stdout();
+    let _ = out.write_all(
+        format!("\x07\x1b]9;Strobes Agents — {what}\x07\x1b]777;notify;Strobes Agents;{what}\x07").as_bytes(),
+    );
+    let _ = out.flush();
+}
+
 /// The escape bytes for a done-notification, or None when suppressed (disabled,
 /// or the run was shorter than `min` seconds). BEL = universal attention;
 /// OSC 9 = desktop notification (iTerm2/WezTerm/Windows Terminal); OSC 777 =
@@ -89,13 +113,136 @@ fn notify_done_bytes(secs: u64, disabled: bool, min: u64) -> Option<Vec<u8>> {
 }
 
 #[derive(Parser)]
-#[command(name = "strobes", version, about = "Ratatui client for Strobes Agents AI")]
+#[command(
+    name = "strobes",
+    version,
+    about = "Strobes Agents AI in your terminal",
+    long_about = "Strobes Agents AI in your terminal.\n\n\
+        Run `strobes` to start chatting, or `strobes \"scan example.com\"` to start with a prompt.\n\
+        Inside the chat, type / for commands and ? for keyboard shortcuts.",
+    after_help = "Examples:\n  \
+        strobes                         start a new chat\n  \
+        strobes \"find exposed admin panels on example.com\"\n  \
+        strobes -c                      continue the last chat\n  \
+        strobes -r                      pick a chat to resume\n  \
+        strobes -p \"summarize findings\" print the answer and exit (scriptable)\n  \
+        cat report.txt | strobes -p \"triage this\"",
+    args_conflicts_with_subcommands = true
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Option<Cmd>,
     /// Tenant to use for this run (defaults to the configured default tenant).
     #[arg(long, visible_alias = "profile", global = true)]
     tenant: Option<String>,
+    /// Start the chat with this prompt (quotes optional).
+    #[arg(value_name = "PROMPT")]
+    prompt: Vec<String>,
+    /// Continue the most recent chat.
+    #[arg(short = 'c', long = "continue")]
+    cont: bool,
+    /// Resume a chat: pick from a list, or pass a thread id.
+    #[arg(short = 'r', long, value_name = "THREAD", num_args = 0..=1, default_missing_value = "")]
+    resume: Option<String>,
+    /// Print mode: send the prompt, print the reply, and exit. Reads stdin too.
+    #[arg(short = 'p', long)]
+    print: bool,
+    /// Use this workspace for the chat.
+    #[arg(short = 'w', long, value_name = "ID")]
+    workspace: Option<String>,
+    /// Model id for the chat (see /model inside the chat).
+    #[arg(short = 'm', long, value_name = "ID")]
+    model: Option<i64>,
+}
+
+/// `strobes --tenant x status` must run the `status` subcommand, but clap
+/// gives the trailing PROMPT positional priority once an option precedes the
+/// subcommand. If the first bare word is a subcommand name, move it (and what
+/// follows) to the front; the leading options are global, so they still apply.
+fn subcommand_first(args: Vec<String>) -> Vec<String> {
+    use clap::CommandFactory;
+    let cmd = Cli::command();
+    let is_sub = |w: &str| cmd.get_subcommands().any(|c| c.get_name() == w || c.get_all_aliases().any(|a| a == w));
+    let mut i = 1;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if a == "--" {
+            return args;
+        }
+        if a == "--tenant" || a == "--profile" {
+            i += 2;
+            continue;
+        }
+        if a.starts_with('-') {
+            // Any other flag: the words after it are a prompt, not a command.
+            return args;
+        }
+        if i > 1 && is_sub(a) {
+            let mut out = vec![args[0].clone()];
+            out.extend_from_slice(&args[i..]);
+            out.extend_from_slice(&args[1..i]);
+            return out;
+        }
+        return args;
+    }
+    args
+}
+
+/// A tool output squeezed to one capped line, for `strobes send` logs/JSON.
+fn one_line(s: &str, limit: usize) -> String {
+    let t = s.replace("\\n", " ").replace('\n', " ");
+    if t.chars().count() > limit {
+        format!("{}…", t.chars().take(limit).collect::<String>())
+    } else {
+        t
+    }
+}
+
+/// Should `-p` read stdin into the prompt? With no prompt given, any
+/// non-terminal stdin is the input. With a prompt, only a pipe that already
+/// has data (`cat log | strobes -p "triage"`) — never a redirected file a
+/// shell loop is reading from, nor an idle pipe that would block forever.
+fn piped_stdin_ready(no_prompt: bool) -> bool {
+    use std::io::IsTerminal;
+    if std::io::stdin().is_terminal() {
+        return false;
+    }
+    if no_prompt {
+        return true;
+    }
+    #[cfg(unix)]
+    unsafe {
+        let mut st: libc::stat = std::mem::zeroed();
+        if libc::fstat(0, &mut st) != 0 || (st.st_mode & libc::S_IFMT) != libc::S_IFIFO {
+            return false;
+        }
+        let mut pfd = libc::pollfd { fd: 0, events: libc::POLLIN, revents: 0 };
+        libc::poll(&mut pfd, 1, 200) > 0 && (pfd.revents & libc::POLLIN) != 0
+    }
+    #[cfg(not(unix))]
+    false
+}
+
+/// How the interactive chat picks its thread at launch.
+enum Launch {
+    /// A fresh chat in the bound workspace (the default, like `claude`).
+    Fresh,
+    /// Reopen the most recent chat (`-c`).
+    Continue,
+    /// Show the workspace → thread pickers (`strobes chat`).
+    Pick,
+    /// Open the last chat with the resume list on top (`-r`).
+    ResumeList,
+    /// A specific thread (`-r <id>`, `--thread`).
+    Thread(String),
+}
+
+#[derive(Subcommand)]
+enum McpAction {
+    /// Serve Strobes over MCP on stdin/stdout.
+    Serve,
+    /// Show configured MCP servers and their tools.
+    List,
 }
 
 #[derive(Subcommand)]
@@ -116,9 +263,18 @@ enum Cmd {
         #[arg(long)]
         new: bool,
     },
-    /// Configure credentials interactively (or pass flags to skip prompts).
+    /// Sign in through the browser (or `--key` to paste a MasterKey).
     Login {
-        /// Deployment base URL, e.g. https://app.strobes.co
+        /// Paste a MasterKey instead of signing in through the browser.
+        #[arg(long)]
+        key: bool,
+        /// Strobes URL to sign in to (default: your last one, else https://app.strobes.co).
+        #[arg(long, value_name = "URL")]
+        url: Option<String>,
+        /// Web app URL, when it isn't the API host (e.g. http://localhost:3000).
+        #[arg(long, value_name = "URL")]
+        web_url: Option<String>,
+        /// Deployment base URL, e.g. https://app.strobes.co (with --key).
         #[arg(long)]
         base_url: Option<String>,
         /// Organization UUID.
@@ -138,6 +294,81 @@ enum Cmd {
         #[arg(long)]
         no_verify: bool,
     },
+    /// Forget this tenant's credentials.
+    Logout,
+    /// Run one prompt over many targets, several agents at a time.
+    ///
+    ///   strobes batch -f targets.txt -j 4 "Assess {target} for exposed admin panels"
+    ///   echo -e "a.com\nb.com" | strobes batch "Recon {target}" --out recon/
+    Batch {
+        /// Prompt template; {target} is replaced by each target.
+        prompt: String,
+        /// File with one target per line (default: stdin). # comments skipped.
+        #[arg(short = 'f', long)]
+        file: Option<String>,
+        /// How many agents run at once.
+        #[arg(short = 'j', long, default_value_t = 3)]
+        jobs: usize,
+        /// Directory for <target>.md results and index.md.
+        #[arg(long, default_value = "strobes-batch")]
+        out: String,
+        /// Workspace for every run (default: the bound one).
+        #[arg(short = 'w', long)]
+        workspace: Option<String>,
+        /// Model id for every run.
+        #[arg(short = 'm', long)]
+        model: Option<i64>,
+        /// Give up on a target after this many seconds.
+        #[arg(long, default_value_t = 1800)]
+        timeout: u64,
+    },
+    /// Call the Strobes API with your credentials (like `gh api`).
+    ///
+    /// Paths are relative to your organization unless they start with /v1/:
+    ///   strobes api /cli/workspaces/
+    ///   strobes api -X POST /cli/threads/create/ -d '{"title":"x"}'
+    ///   strobes api /v1/organizations/{org}/master_key/
+    Api {
+        /// API path (org-relative, /v1/…, or a full URL; {org} is filled in).
+        path: String,
+        /// HTTP method.
+        #[arg(short = 'X', long, default_value = "GET")]
+        method: String,
+        /// JSON body, @file, or @- for stdin.
+        #[arg(short = 'd', long)]
+        data: Option<String>,
+        /// Query parameter key=value (repeatable).
+        #[arg(short = 'q', long = "query", value_name = "KEY=VALUE")]
+        query: Vec<String>,
+        /// Print the body as-is (no pretty-printing).
+        #[arg(long)]
+        raw: bool,
+    },
+    /// MCP: `strobes mcp serve` runs Strobes as an MCP server (stdio) for
+    /// Claude Code, Cursor, …; `strobes mcp list` shows the MCP servers the
+    /// agent can use from here.
+    ///
+    ///   claude mcp add strobes -- strobes mcp serve
+    Mcp {
+        #[command(subcommand)]
+        action: McpAction,
+    },
+    /// Skills: list · show <slug> · push <dir> · enable|disable <slug>.
+    Skills { args: Vec<String> },
+    /// Workspace memory: [search <q> · add <text> · rm <id>].
+    Memory { args: Vec<String> },
+    /// Recurring runs: [list · add <frequency> <HH:MM> <prompt> · pause|resume|run|rm <id>].
+    Schedule { args: Vec<String> },
+    /// Agent runs: [all · cancel <id>].
+    Runs { args: Vec<String> },
+    /// Workspace reports: [list · new <csv|threat|cve> · get <name>].
+    Report { args: Vec<String> },
+    /// List the specialist agents (use one with `--agent <id>` on send).
+    Agents,
+    /// Files a chat produced: <thread> [list · get|open <path> [--pdf]].
+    Artifacts { thread: String, args: Vec<String> },
+    /// Request/response behind evidence ids: <thread> <ev-…>…
+    Evidence { thread: String, refs: Vec<String> },
     /// Update the CLI to the latest release (downloads + replaces the binary).
     Update {
         /// Reinstall even if already on the latest version.
@@ -849,16 +1080,126 @@ fn restore_default_sigpipe() {}
 #[tokio::main]
 async fn main() -> Result<()> {
     restore_default_sigpipe();
-    let cli = Cli::parse();
+    let cli = Cli::parse_from(subcommand_first(std::env::args().collect()));
     let mut cfg = Config::load();
     // Select the tenant for this run without mutating the stored default.
     let tenant = cli.tenant.clone().unwrap_or_else(|| cfg.current_profile.clone());
     let profile = cfg.profile_for(&tenant);
 
-    match cli.cmd.unwrap_or(Cmd::Chat { thread: None, workspace: None, model: None, reasoning: None, new: false }) {
-        Cmd::Login { base_url, org_id, master_key, deployment, analyzer_registry_url, no_verify } => {
-            cmd_login(&mut cfg, &tenant, base_url, org_id, master_key, deployment, analyzer_registry_url, no_verify).await
+    // Bare `strobes [PROMPT] [-c|-r|-p]` — the Claude Code-style entry point.
+    if cli.cmd.is_none() {
+        let mut prompt = cli.prompt.join(" ").trim().to_string();
+        if cli.print {
+            // Piped stdin is part of the prompt (`cat log | strobes -p "triage"`).
+            use std::io::Read;
+            if piped_stdin_ready(prompt.is_empty()) {
+                let mut buf = String::new();
+                let _ = std::io::stdin().read_to_string(&mut buf);
+                if !buf.trim().is_empty() {
+                    prompt = if prompt.is_empty() { buf } else { format!("{prompt}\n\n{buf}") };
+                }
+            }
+            if prompt.trim().is_empty() {
+                return Err(anyhow!("-p needs a prompt: strobes -p \"your question\""));
+            }
+            let ws = cli.workspace.clone().or_else(|| profile.workspace_id.clone());
+            return cmd_send(&profile, prompt, ws, None, None, cli.model, None, "text", true, None, None, None, None, true).await;
         }
+        let launch = match (&cli.resume, cli.cont) {
+            (Some(t), _) if !t.is_empty() => Launch::Thread(t.clone()),
+            (Some(_), _) => Launch::ResumeList,
+            (None, true) => Launch::Continue,
+            (None, false) => Launch::Fresh,
+        };
+        let initial = if prompt.is_empty() { None } else { Some(prompt) };
+        {
+            use std::io::IsTerminal;
+            if !std::io::stdout().is_terminal() || !std::io::stdin().is_terminal() {
+                return Err(anyhow!(
+                    "the chat needs an interactive terminal — for scripts use: strobes -p \"your prompt\""
+                ));
+            }
+        }
+        // First run: walk through login instead of erroring out, then
+        // continue straight into the chat.
+        let mut profile = profile;
+        if !profile.is_complete() {
+            println!("Welcome to Strobes Agents! Let's sign you in.\n");
+            browser_login(&mut cfg, &tenant, None, None).await?;
+            cfg = Config::load();
+            profile = cfg.profile_for(&tenant);
+            if !profile.is_complete() {
+                return Err(anyhow!("login incomplete — run `strobes login` to try again"));
+            }
+            println!();
+        }
+        let mut terminal = ratatui::init();
+        enable_mouse();
+        let mut r = chat_flow(&mut terminal, &mut cfg, &tenant, profile, launch, cli.workspace.clone(), cli.model, None, initial).await;
+        // `/login` / `/logout` leave the TUI to run in the plain terminal.
+        loop {
+            let after = AFTER_CHAT.lock().unwrap().take();
+            match after {
+                Some(AfterChat::Login) => {
+                    disable_mouse();
+                    ratatui::restore();
+                    match browser_login(&mut cfg, &tenant, None, None).await {
+                        Ok(()) => {
+                            cfg = Config::load();
+                            let profile = cfg.profile_for(&tenant);
+                            terminal = ratatui::init();
+                            enable_mouse();
+                            r = chat_flow(&mut terminal, &mut cfg, &tenant, profile, Launch::Fresh, None, cli.model, None, None).await;
+                        }
+                        Err(e) => {
+                            eprintln!("  {e}");
+                            return Ok(());
+                        }
+                    }
+                }
+                Some(AfterChat::Logout) => {
+                    disable_mouse();
+                    ratatui::restore();
+                    let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::SetTitle(""));
+                    return cmd_logout(&mut cfg, &tenant);
+                }
+                None => break,
+            }
+        }
+        disable_mouse();
+        ratatui::restore();
+        let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::SetTitle(""));
+        return r;
+    }
+
+    match cli.cmd.unwrap() {
+        Cmd::Login { key, url, web_url, base_url, org_id, master_key, deployment, analyzer_registry_url, no_verify } => {
+            // Any key-style flag (or --key) keeps the paste-a-MasterKey flow.
+            if key || base_url.is_some() || org_id.is_some() || master_key.is_some() {
+                cmd_login(&mut cfg, &tenant, base_url, org_id, master_key, deployment, analyzer_registry_url, no_verify).await
+            } else {
+                browser_login(&mut cfg, &tenant, url, web_url).await
+            }
+        }
+        Cmd::Logout => cmd_logout(&mut cfg, &tenant),
+        Cmd::Api { path, method, data, query, raw } => cmd_api(&profile, &path, &method, data, query, raw).await,
+        Cmd::Batch { prompt, file, jobs, out, workspace, model, timeout } => {
+            cmd_batch(&profile, &tenant, prompt, file, jobs, out, workspace, model, timeout).await
+        }
+        Cmd::Mcp { action: McpAction::Serve } => mcp_serve::serve(profile.clone(), tenant.clone()).await,
+        Cmd::Mcp { action: McpAction::List } => {
+            mcp::start_all();
+            mcp::wait_ready(std::time::Duration::from_secs(20)).await;
+            run_command_cli(&profile, "mcp", &[], None).await
+        }
+        Cmd::Skills { args } => run_command_cli(&profile, "skills", &args, None).await,
+        Cmd::Memory { args } => run_command_cli(&profile, "memory", &args, None).await,
+        Cmd::Schedule { args } => run_command_cli(&profile, "schedule", &args, None).await,
+        Cmd::Runs { args } => run_command_cli(&profile, "runs", &args, None).await,
+        Cmd::Report { args } => run_command_cli(&profile, "report", &args, None).await,
+        Cmd::Agents => run_command_cli(&profile, "agent", &[], None).await,
+        Cmd::Artifacts { thread, args } => run_command_cli(&profile, "artifacts", &args, Some(thread)).await,
+        Cmd::Evidence { thread, refs } => run_command_cli(&profile, "evidence", &refs, Some(thread)).await,
         Cmd::Update { force } => cmd_update(force).await,
         Cmd::Tenants => cmd_tenants(&cfg),
         Cmd::Credits { workspace, thread } => cmd_credits(&profile, workspace, thread).await,
@@ -902,15 +1243,23 @@ async fn main() -> Result<()> {
             // parsing and collides with SGR mouse reports — leaking raw scroll
             // sequences (e.g. `[<64;..M`) into the input. Newlines use Ctrl+J.
             enable_mouse();
-            let r = chat_flow(&mut terminal, &mut cfg, &tenant, profile, thread, workspace, new, model, reasoning).await;
+            // `strobes chat` keeps the workspace → thread pickers; `--new`
+            // jumps straight into a fresh chat, `--thread` into that one.
+            let launch = match (thread, new) {
+                (_, true) => Launch::Fresh,
+                (Some(t), false) => Launch::Thread(t),
+                (None, false) => Launch::Pick,
+            };
+            let r = chat_flow(&mut terminal, &mut cfg, &tenant, profile, launch, workspace, model, reasoning, None).await;
             disable_mouse();
             ratatui::restore();
+            let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::SetTitle(""));
             r
         }
         Cmd::Probe { thread, send, secs, model, reasoning } => cmd_probe(&profile, &thread, send, secs, model, reasoning).await,
         Cmd::Workflow { sub } => cmd_workflow(profile, sub, &tenant).await,
         Cmd::Send { message, workspace, new_workspace, title, model, reasoning, output, non_interactive, timeout, fail_on_findings, sandbox_id, agent } => {
-            cmd_send(&profile, message, workspace, new_workspace, title, model, reasoning, &output, non_interactive, timeout, fail_on_findings, sandbox_id, agent).await
+            cmd_send(&profile, message, workspace, new_workspace, title, model, reasoning, &output, non_interactive, timeout, fail_on_findings, sandbox_id, agent, false).await
         }
         Cmd::Ci { sub } => match sub {
             CiCmd::Sast { dir, output, output_file, prompt, workspace, model, reasoning, timeout, fail_on, exclude, max_mb } => {
@@ -954,24 +1303,39 @@ async fn chat_flow(
     cfg: &mut Config,
     tenant: &str,
     mut profile: config::Profile,
-    thread: Option<String>,
+    launch: Launch,
     workspace: Option<String>,
-    new: bool,
     model: Option<i64>,
     reasoning: Option<String>,
+    prompt: Option<String>,
 ) -> Result<()> {
+    // An empty chat left over from the last launch is reused instead of
+    // piling up blank threads — but only if it belongs to the same workspace.
+    let reusable = match &workspace {
+        Some(w) if profile.workspace_id.as_deref() != Some(w.as_str()) => None,
+        _ => profile.thread_id.clone(),
+    };
     if let Some(w) = &workspace {
         profile.workspace_id = Some(w.clone());
     }
-    // Only an explicit --thread skips the pickers; a plain run always offers
-    // workspace → thread selection (the stored thread_id is not auto-resumed).
-    let explicit = if new { None } else { thread };
-    // `initial_msg` is auto-sent on connect (used to seed a new workspace's
-    // setup chat with the user's prompt).
-    let mut initial_msg: Option<String> = None;
-    let thread_id = match explicit {
-        Some(t) => t,
-        None => {
+    require_complete(&profile)?;
+    // `initial_msg` is auto-sent on connect (the launch prompt, or a new
+    // workspace's setup prompt).
+    let mut initial_msg: Option<String> = prompt;
+    let open_resume = matches!(launch, Launch::ResumeList);
+    let thread_id = match launch {
+        Launch::Thread(t) => t,
+        // The last chat only if it belongs to the workspace asked for.
+        Launch::Continue => match reusable.clone() {
+            Some(t) => t,
+            None => fresh_thread(terminal, &profile, None).await?,
+        },
+        Launch::Fresh => fresh_thread(terminal, &profile, reusable.as_deref()).await?,
+        Launch::ResumeList => match reusable.clone() {
+            Some(t) => t,
+            None => fresh_thread(terminal, &profile, None).await?,
+        },
+        Launch::Pick => {
             // Esc on the thread picker steps back to the workspace picker; Esc on
             // the workspace picker (or ^C anywhere) quits cleanly.
             let ws_flag = workspace.is_some();
@@ -1017,7 +1381,29 @@ async fn chat_flow(
         }
         let _ = cfg.save();
     }
-    run_chat(terminal, tenant, profile, thread_id, model, reasoning, initial_msg).await
+    run_chat(terminal, tenant, profile, thread_id, model, reasoning, initial_msg, open_resume).await
+}
+
+/// A new chat thread in the profile's workspace, created behind the loader.
+/// `reuse` is the last thread this profile opened: if nobody ever sent a
+/// message in it, open that instead of creating yet another empty thread.
+async fn fresh_thread(
+    terminal: &mut ratatui::DefaultTerminal,
+    profile: &config::Profile,
+    reuse: Option<&str>,
+) -> Result<String> {
+    let client = api::ApiClient::new(profile.clone())?;
+    picker::with_loader(terminal, "Starting chat", async {
+        if let Some(t) = reuse {
+            if let Ok(h) = client.get_thread_history(t, 1).await {
+                if h.messages.is_empty() && h.active_run.is_none() {
+                    return Ok(t.to_string());
+                }
+            }
+        }
+        client.create_thread("CLI session", profile.workspace_id.as_deref(), None).await
+    })
+    .await
 }
 
 /// Show a workspace picker over the available workspaces and return the chosen
@@ -1515,6 +1901,7 @@ async fn upload_entries_task(
     let total_bytes: u64 = sizes.iter().sum();
     let mut done_bytes: u64 = 0;
     let (mut ok, mut failed) = (0usize, 0usize);
+    let mut uploaded: Vec<String> = Vec::new();
     for (i, (path, prefix)) in entries.iter().enumerate() {
         let shown = path
             .file_name()
@@ -1535,7 +1922,10 @@ async fn upload_entries_task(
         ))));
         let local = path.to_string_lossy().to_string();
         match upload_one(&client, &ws, &local, prefix, &sync_roots).await {
-            Ok(_) => ok += 1,
+            Ok(dest) => {
+                ok += 1;
+                uploaded.push(dest);
+            }
             Err(e) => {
                 failed += 1;
                 let _ = tx.send(pulse::AppEvent::Error(format!(
@@ -1550,7 +1940,7 @@ async fn upload_entries_task(
     }
     let _ = tx.send(pulse::AppEvent::Progress(None));
     let where_to = match sync_roots.first() {
-        Some(r) => format!(" (synced to {})", r.display()),
+        Some(r) => format!(" (synced to {})", commands::short_path(r)),
         None => String::new(),
     };
     if ok > 0 {
@@ -1559,11 +1949,40 @@ async fn upload_entries_task(
             "✔ uploaded {ok}/{total} file(s) · {} to the workspace{where_to}{fail_note}",
             fmt_bytes(total_bytes)
         )));
+        // Reference what was uploaded in the prompt, the way the web app's
+        // attach does, so the next message points the agent at it.
+        let refs = upload_refs(&uploaded);
+        if !refs.is_empty() {
+            let _ = tx.send(pulse::AppEvent::InsertInput(refs));
+        }
     } else {
         let _ = tx.send(pulse::AppEvent::Notice(format!(
             "✗ no files uploaded ({failed} failed)"
         )));
     }
+}
+
+/// `[workspace file: …]` references for uploaded paths: one per file, or one
+/// per top-level folder when a whole tree was dropped.
+fn upload_refs(paths: &[String]) -> String {
+    const MAX_FILES: usize = 5;
+    let mut items: Vec<String> = if paths.len() <= MAX_FILES {
+        paths.to_vec()
+    } else {
+        let mut tops: Vec<String> = Vec::new();
+        for p in paths {
+            let top = match p.split_once('/') {
+                Some((dir, _)) => format!("{dir}/"),
+                None => p.clone(),
+            };
+            if !tops.contains(&top) {
+                tops.push(top);
+            }
+        }
+        tops
+    };
+    items.truncate(10);
+    items.iter().map(|p| format!("[workspace file: {p}]")).collect::<Vec<_>>().join(" ")
 }
 
 /// Human-readable byte count (B / KB / MB / GB, 1024-based).
@@ -1809,26 +2228,21 @@ fn spawn_workspace_sync(
     std::env::set_var("STROBES_AI_SANDBOX", &dir);
     std::env::set_var("STROBES_AI_WORKSPACE_ID", &ws_id);
 
+    // Already mirrored: nothing worth saying (/files shows them).
     if workspace_is_synced(&dir) {
-        let _ = tx.send(pulse::AppEvent::Notice(format!(
-            "workspace files at {} (cached)", dir.display()
-        )));
         return;
     }
 
     tokio::spawn(async move {
-        let _ = tx.send(pulse::AppEvent::Notice("syncing workspace files locally…".into()));
-        match sync_workspace_sandbox(&profile, &ws_id).await {
-            Ok(WorkspaceSyncOutcome::Synced(n)) => {
-                let _ = tx.send(pulse::AppEvent::Notice(format!(
-                    "✔ synced {n} workspace files → {}", dir.display()
-                )));
+        // Progress on the activity line, not the transcript.
+        let _ = tx.send(pulse::AppEvent::Progress(Some("Syncing workspace files…".into())));
+        let r = sync_workspace_sandbox(&profile, &ws_id).await;
+        let _ = tx.send(pulse::AppEvent::Progress(None));
+        match r {
+            Ok(WorkspaceSyncOutcome::Synced(n)) if n > 0 => {
+                let _ = tx.send(pulse::AppEvent::Notice(format!("synced {n} workspace files (/files to browse)")));
             }
-            Ok(WorkspaceSyncOutcome::Empty) => {
-                let _ = tx.send(pulse::AppEvent::Notice(
-                    "workspace has no files yet — nothing to sync".into(),
-                ));
-            }
+            Ok(_) => {}
             Err(e) => { let _ = tx.send(pulse::AppEvent::Error(format!("workspace sync failed: {e}"))); }
         }
     });
@@ -1901,8 +2315,12 @@ async fn cmd_send(
     fail_on_findings: Option<String>,
     sandbox_id: Option<String>,
     agent: Option<String>,
+    print_mode: bool,
 ) -> Result<()> {
     require_complete(p)?;
+    // One-shot runs wait (briefly) for MCP servers so their tools are offered.
+    mcp::start_all();
+    mcp::wait_ready(std::time::Duration::from_secs(15)).await;
 
     // If a sandbox_id was supplied, create the directory and point the
     // STROBES_AI_SANDBOX env var at it.  sandbox_dir_for() checks this var
@@ -1942,14 +2360,15 @@ async fn cmd_send(
     // directory that had nothing to do with the bound workspace's files.
     if sandbox_id.is_none() {
         if let Some(ws) = &workspace_id {
-            eprintln!("syncing workspace files locally…");
+            if !print_mode { eprintln!("syncing workspace files locally…"); }
             match sync_workspace_sandbox(p, ws).await {
-                Ok(WorkspaceSyncOutcome::Synced(n)) => {
+                Ok(WorkspaceSyncOutcome::Synced(n)) if !print_mode => {
                     eprintln!("sandbox: {} ({n} file(s))", workspace_sandbox_path(ws).display());
                 }
-                Ok(WorkspaceSyncOutcome::Empty) => {
+                Ok(WorkspaceSyncOutcome::Empty) if !print_mode => {
                     eprintln!("sandbox: {} (workspace has no files yet)", workspace_sandbox_path(ws).display());
                 }
+                Ok(_) => {}
                 Err(e) => eprintln!("warning: workspace sync failed ({e}) — local tools will use an empty sandbox"),
             }
         }
@@ -1961,7 +2380,9 @@ async fn cmd_send(
     });
 
     let thread_id = client.create_thread(&thread_title, workspace_id.as_deref(), agent.as_deref()).await?;
-    eprintln!("thread: {thread_id}");
+    if !print_mode {
+        eprintln!("thread: {thread_id}");
+    }
 
     let (tx, mut rx) = mpsc::unbounded_channel::<pulse::AppEvent>();
     let handle = pulse::connect(p, &thread_id, tx, model, reasoning.clone()).await?;
@@ -1977,6 +2398,10 @@ async fn cmd_send(
         .map(|s| tokio::time::Instant::now() + std::time::Duration::from_secs(s));
 
     let mut needs_newline = false;
+    // Text of the current reply segment, to drop a server replay of the
+    // whole segment as one extra token (it would print the answer twice).
+    let mut segment = String::new();
+    let mut last_tool_line: Option<(String, String)> = None;
     let run_result: Result<()> = loop {
         let ev_opt = if let Some(dl) = deadline {
             tokio::select! {
@@ -2008,6 +2433,10 @@ async fn cmd_send(
                 pulse::AppEvent::Stream(item) => match item.kind.as_str() {
                     "token" => {
                         if let Some(text) = &item.text {
+                            if text.trim().len() >= 8 && (text.trim() == segment.trim() || app::is_replay(&segment, text)) {
+                                continue;
+                            }
+                            segment.push_str(text);
                             if json_mode {
                                 json_text.push_str(text);
                             } else {
@@ -2019,7 +2448,7 @@ async fn cmd_send(
                     }
                     "thinking" => {
                         if let Some(text) = &item.text {
-                            if !json_mode {
+                            if !json_mode && !print_mode {
                                 if needs_newline { println!(); needs_newline = false; }
                                 println!("💭 {text}");
                             }
@@ -2032,10 +2461,21 @@ async fn cmd_send(
                             json_tools.push(serde_json::json!({
                                 "name": name, "status": "running", "detail": detail
                             }));
+                        } else if print_mode {
+                            // Progress goes to stderr so stdout stays just the answer.
+                            // One line per call: skip the arg-less early start and
+                            // the local mirror of the wrapper call.
+                            let d = detail.lines().next().unwrap_or("").trim().to_string();
+                            let key = (app::tool_label(&name), d.clone());
+                            if !item.local && !d.is_empty() && last_tool_line.as_ref() != Some(&key) {
+                                eprintln!("\x1b[2m⏺ {}({})\x1b[0m", key.0, trunc(&d, 100));
+                                last_tool_line = Some(key);
+                            }
                         } else {
                             if needs_newline { println!(); needs_newline = false; }
                             if detail.is_empty() { println!("▶ {name}"); } else { println!("▶ {name}({detail})"); }
                         }
+                        segment.clear();
                     }
                     "tool_output" => {
                         let name = item.tool_name.as_deref().unwrap_or("?").to_string();
@@ -2043,11 +2483,11 @@ async fn cmd_send(
                         if json_mode {
                             if let Some(last) = json_tools.iter_mut().rev().find(|t| t["name"] == name && t["status"] == "running") {
                                 last["status"] = serde_json::Value::String("done".into());
-                                last["output"] = serde_json::Value::String(detail);
+                                last["output"] = serde_json::Value::String(one_line(&detail, 600));
                             }
-                        } else {
+                        } else if !print_mode {
                             if needs_newline { println!(); needs_newline = false; }
-                            if !detail.is_empty() { println!("◀ {name}: {detail}"); }
+                            if !detail.is_empty() { println!("◀ {name}: {}", one_line(&detail, 600)); }
                         }
                     }
                     "tool_failed" => {
@@ -2058,6 +2498,8 @@ async fn cmd_send(
                                 last["status"] = serde_json::Value::String("failed".into());
                                 last["error"] = serde_json::Value::String(err);
                             }
+                        } else if print_mode {
+                            eprintln!("\x1b[31m✗ {name}: {}\x1b[0m", trunc(&err, 200));
                         } else {
                             if needs_newline { println!(); needs_newline = false; }
                             println!("✗ {name}: {err}");
@@ -2065,12 +2507,13 @@ async fn cmd_send(
                     }
                     "note" | "system" => {
                         if let Some(text) = &item.text {
-                            if !json_mode {
+                            if !json_mode && !print_mode {
                                 if needs_newline { println!(); needs_newline = false; }
                                 println!("ℹ {text}");
                             }
                         }
                     }
+                    _ if print_mode => {}
                     _ => {
                         if let Some(text) = &item.text {
                             if json_mode {
@@ -7192,12 +7635,17 @@ fn describe(ev: &pulse::AppEvent) -> String {
     use pulse::AppEvent::*;
     match ev {
         Connected => "connected".into(),
+        InsertInput(t) => format!("insert: {t}"),
         Disconnected(w) => format!("disconnected: {w}"),
         RunStarted => "run started".into(),
         RunFinished(l) => format!("run finished: {l}"),
         Notice(n) => format!("notice: {n}"),
         Progress(p) => format!("progress: {p:?}"),
         Credits { credits, tokens, final_run } => format!("credits {credits:.4} tokens {tokens} final={final_run}"),
+        Context(p) => format!("context {p:.1}%"),
+        LocalLine { call_id, line } => format!("local[{}] {line}", &call_id[..8.min(call_id.len())]),
+        JobDone { job, exit, command } => format!("job #{job} done exit={exit:?} {command}"),
+        ApprovalRequest { id, module, .. } => format!("approval requested {id} ({module})"),
         Error(e) => format!("error: {e}"),
         LocalToolDone { name, ms, exit, err } => {
             format!("local tool {name} done {ms}ms exit={exit:?} err={err:?}")
@@ -7241,6 +7689,425 @@ fn prompt_line(label: &str, current: &str, secret: bool) -> Result<String> {
 
 /// Configure the active profile's credentials. Any field passed as a flag is
 /// used verbatim; the rest are prompted for interactively.
+/// Set by `/login` and `/logout` inside the chat: leave the TUI, then do it.
+static AFTER_CHAT: std::sync::Mutex<Option<AfterChat>> = std::sync::Mutex::new(None);
+
+#[derive(Clone, Copy, PartialEq)]
+enum AfterChat {
+    Login,
+    Logout,
+}
+
+/// API root (`…/api/v1`) for a Strobes URL the user typed.
+fn api_v1_for(url: &str) -> String {
+    let mut u = url.trim().trim_end_matches('/').to_string();
+    if !u.starts_with("http://") && !u.starts_with("https://") {
+        u = format!("https://{u}");
+    }
+    if u.ends_with("/api") { format!("{u}/v1") } else { format!("{u}/api/v1") }
+}
+
+/// Web app URL for a Strobes URL (same host unless overridden).
+fn web_for(url: &str) -> String {
+    let mut u = url.trim().trim_end_matches('/').to_string();
+    if !u.starts_with("http://") && !u.starts_with("https://") {
+        u = format!("https://{u}");
+    }
+    u.trim_end_matches("/api").to_string()
+}
+
+/// Run a chat command from the shell (`strobes skills`, `strobes runs`, …).
+async fn run_command_cli(profile: &config::Profile, name: &str, args: &[String], thread: Option<String>) -> Result<()> {
+    require_complete(profile)?;
+    let ctx = commands::Ctx { profile: profile.clone(), thread_id: thread.unwrap_or_default(), model: None };
+    match commands::run(name, &args.join(" "), &ctx).await {
+        Ok(commands::Outcome::Text(t)) => {
+            println!("{t}");
+            Ok(())
+        }
+        Ok(commands::Outcome::SwitchThread(id, note)) => {
+            println!("{note}\nthread: {id}  (strobes -r to open it)");
+            Ok(())
+        }
+        Err(e) => Err(anyhow!(e)),
+    }
+}
+
+fn open_browser(url: &str) -> bool {
+    // Headless/SSH sessions (and tests) just print the link.
+    if std::env::var("STROBES_NO_BROWSER").is_ok() {
+        return false;
+    }
+    let cmd = if cfg!(target_os = "macos") {
+        ("open", vec![url])
+    } else if cfg!(windows) {
+        ("cmd", vec!["/C", "start", "", url])
+    } else {
+        ("xdg-open", vec![url])
+    };
+    std::process::Command::new(cmd.0)
+        .args(cmd.1)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// `strobes login`: sign in through the browser — approve, pick the org and
+/// workspace in the web app, and the CLI is configured. (Server side:
+/// strobes/agents/views/cli_auth_views.py.)
+async fn browser_login(cfg: &mut Config, tenant: &str, url: Option<String>, web_url: Option<String>) -> Result<()> {
+    use std::io::{IsTerminal, Write};
+    let current = cfg.profile_for(tenant);
+    let remembered = current.login_url.clone().filter(|u| !u.is_empty());
+    let url = match url {
+        Some(u) => u,
+        None if std::io::stdin().is_terminal() => {
+            let def = remembered.clone().unwrap_or_else(|| "https://app.strobes.co".into());
+            let typed = prompt_line("Strobes URL", &def, false)?;
+            if typed.trim().is_empty() { def } else { typed }
+        }
+        None => remembered.unwrap_or_else(|| "https://app.strobes.co".into()),
+    };
+    let api = api_v1_for(&url);
+    let web = web_url
+        .or_else(|| std::env::var("STROBES_WEB_URL").ok().filter(|w| !w.is_empty()))
+        .map(|w| w.trim_end_matches('/').to_string())
+        .unwrap_or_else(|| web_for(&url));
+    let insecure = !current.verify_tls || std::env::var("STROBES_INSECURE").is_ok();
+    let http = reqwest::Client::builder()
+        .danger_accept_invalid_certs(insecure)
+        .user_agent(concat!("strobes-cli/", env!("CARGO_PKG_VERSION")))
+        .timeout(std::time::Duration::from_secs(20))
+        .build()?;
+
+    let host = std::process::Command::new("hostname").output().ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    let who = std::env::var("USER").or_else(|_| std::env::var("USERNAME")).unwrap_or_default();
+    let client_name = match (who.is_empty(), host.is_empty()) {
+        (false, false) => format!("{who}@{host}"),
+        (true, false) => host,
+        _ => "strobes CLI".into(),
+    };
+    let start: serde_json::Value = match http
+        .post(format!("{api}/cli/auth/device/"))
+        .json(&serde_json::json!({ "client_name": client_name }))
+        .send()
+        .await
+    {
+        Ok(r) if r.status().is_success() => r.json().await?,
+        Ok(r) if r.status().as_u16() == 404 => {
+            return Err(anyhow!(
+                "{url} doesn't support browser sign-in yet — use `strobes login --key` with a MasterKey"
+            ))
+        }
+        Ok(r) => return Err(anyhow!("couldn't start sign-in at {url} (HTTP {})", r.status())),
+        Err(e) => return Err(anyhow!("couldn't reach {url}: {e}")),
+    };
+    let s = |k: &str| start.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let (device_code, user_code) = (s("device_code"), s("user_code"));
+    let link = format!("{web}{}", s("verification_path"));
+    let interval = start.get("interval").and_then(|v| v.as_u64()).unwrap_or(2).max(1);
+    let expires = start.get("expires_in").and_then(|v| v.as_u64()).unwrap_or(600);
+
+    let opened = open_browser(&link);
+    println!();
+    println!("  {}", if opened { "Opened your browser to sign in." } else { "Open this link to sign in:" });
+    println!("  \x1b[4m{link}\x1b[0m");
+    println!();
+    println!("  Confirm the code matches:  \x1b[1m{user_code}\x1b[0m");
+    println!("  Then pick your organization and workspace, and click Authorize.");
+    println!();
+
+    const SPIN: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(expires);
+    let mut tick = 0usize;
+    let mut next_poll = std::time::Instant::now();
+    let creds = loop {
+        if std::time::Instant::now() >= deadline {
+            print!("\r\x1b[2K");
+            return Err(anyhow!("sign-in timed out — run `strobes login` again"));
+        }
+        print!("\r\x1b[2K  {} Waiting for you to authorize in the browser… (Ctrl-C to cancel)", SPIN[tick % SPIN.len()]);
+        let _ = std::io::stdout().flush();
+        tick += 1;
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                print!("\r\x1b[2K");
+                return Err(anyhow!("sign-in cancelled"));
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+        }
+        if std::time::Instant::now() < next_poll {
+            continue;
+        }
+        next_poll = std::time::Instant::now() + std::time::Duration::from_secs(interval);
+        let resp = http
+            .post(format!("{api}/cli/auth/device/token/"))
+            .json(&serde_json::json!({ "device_code": device_code }))
+            .send()
+            .await;
+        let Ok(resp) = resp else { continue }; // transient network error: keep waiting
+        let ok = resp.status().is_success();
+        let body: serde_json::Value = resp.json().await.unwrap_or_default();
+        if ok {
+            break body;
+        }
+        match body.get("error").and_then(|e| e.as_str()).unwrap_or("") {
+            "authorization_pending" | "" => {}
+            "access_denied" => {
+                print!("\r\x1b[2K");
+                return Err(anyhow!("sign-in was denied in the browser"));
+            }
+            "expired_token" => {
+                print!("\r\x1b[2K");
+                return Err(anyhow!("sign-in expired — run `strobes login` again"));
+            }
+            other => {
+                print!("\r\x1b[2K");
+                return Err(anyhow!("sign-in failed: {other}"));
+            }
+        }
+    };
+    print!("\r\x1b[2K");
+
+    let g = |k: &str| creds.get(k).and_then(|v| v.as_str()).map(String::from);
+    let api_base = g("api_base_url").unwrap_or_else(|| api.trim_end_matches("/v1").to_string());
+    let had_default = cfg.has_default();
+    {
+        let p = cfg.profile_mut(tenant);
+        let same_org = p.org_id == g("organization_id").unwrap_or_default();
+        p.base_url = api_base.trim_end_matches('/').to_string();
+        // The API root ends in /api, so requests go to <root>/v1/…
+        p.deployment = if p.base_url.ends_with("/api") { "direct".into() } else { String::new() };
+        p.org_id = g("organization_id").unwrap_or_default();
+        p.master_key = g("master_key").unwrap_or_default();
+        p.workspace_id = g("workspace_id");
+        if !same_org {
+            p.thread_id = None;
+        }
+        p.login_url = Some(url.clone());
+        p.email = g("email");
+    }
+    if !had_default {
+        cfg.current_profile = tenant.to_string();
+    }
+    cfg.save()?;
+
+    let who = g("email").map(|e| format!(" as {e}")).unwrap_or_default();
+    let ws = g("workspace_name").map(|w| format!(" · workspace {w}")).unwrap_or_default();
+    println!("  \x1b[32m✔\x1b[0m Signed in{who}{ws}");
+    println!("  Run \x1b[1mstrobes\x1b[0m to start chatting.");
+    Ok(())
+}
+
+/// File-safe name for a target ("https://a.com/x" → "a.com_x").
+fn target_slug(t: &str) -> String {
+    let t = t.trim().trim_start_matches("https://").trim_start_matches("http://");
+    let s: String = t.chars().map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' { c } else { '_' }).collect();
+    let s = s.trim_matches('_').to_string();
+    if s.is_empty() { "target".into() } else { s.chars().take(80).collect() }
+}
+
+/// `strobes batch`: fan a prompt out over targets with bounded concurrency.
+/// Each target is its own `strobes -p` run (own thread), so a failure or a
+/// hang never affects the others.
+#[allow(clippy::too_many_arguments)]
+async fn cmd_batch(
+    p: &config::Profile,
+    tenant: &str,
+    prompt: String,
+    file: Option<String>,
+    jobs: usize,
+    out: String,
+    workspace: Option<String>,
+    model: Option<i64>,
+    timeout_secs: u64,
+) -> Result<()> {
+    require_complete(p)?;
+    let text = match &file {
+        Some(f) => std::fs::read_to_string(f).with_context(|| format!("reading {f}"))?,
+        None => {
+            use std::io::IsTerminal;
+            if std::io::stdin().is_terminal() {
+                return Err(anyhow!("give targets with -f targets.txt or on stdin"));
+            }
+            let mut s = String::new();
+            std::io::Read::read_to_string(&mut std::io::stdin(), &mut s)?;
+            s
+        }
+    };
+    let targets: Vec<String> = text
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(String::from)
+        .collect();
+    if targets.is_empty() {
+        return Err(anyhow!("no targets"));
+    }
+    if !prompt.contains("{target}") {
+        eprintln!("note: the prompt has no {{target}} — every run gets the same prompt plus the target appended");
+    }
+    let dir = std::path::PathBuf::from(&out);
+    std::fs::create_dir_all(&dir)?;
+    let exe = std::env::current_exe()?;
+    let jobs = jobs.clamp(1, 32);
+    let total = targets.len();
+    let ws = workspace.or_else(|| p.workspace_id.clone());
+    eprintln!("running {total} target(s), {jobs} at a time → {}/", dir.display());
+
+    let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(jobs));
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let started = std::time::Instant::now();
+    let mut handles = Vec::new();
+    for t in targets.clone() {
+        let sem = sem.clone();
+        let done = done.clone();
+        let exe = exe.clone();
+        let dir = dir.clone();
+        let tenant = tenant.to_string();
+        let ws = ws.clone();
+        let full = if prompt.contains("{target}") { prompt.replace("{target}", &t) } else { format!("{prompt}\n\nTarget: {t}") };
+        handles.push(tokio::spawn(async move {
+            let _permit = sem.acquire_owned().await.ok();
+            let t0 = std::time::Instant::now();
+            let mut cmd = tokio::process::Command::new(&exe);
+            cmd.arg("--tenant").arg(&tenant).arg("-p").arg(&full);
+            if let Some(w) = &ws {
+                cmd.arg("-w").arg(w);
+            }
+            if let Some(m) = model {
+                cmd.arg("-m").arg(m.to_string());
+            }
+            cmd.stdin(std::process::Stdio::null()).kill_on_drop(true);
+            let res = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), cmd.output()).await;
+            let (ok, body, why) = match res {
+                Ok(Ok(o)) => {
+                    let body = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                    let err = String::from_utf8_lossy(&o.stderr).trim().to_string();
+                    let ok = o.status.success() && !body.is_empty();
+                    let why = if ok { String::new() } else { err.lines().last().unwrap_or("failed").to_string() };
+                    (ok, body, why)
+                }
+                Ok(Err(e)) => (false, String::new(), e.to_string()),
+                Err(_) => (false, String::new(), format!("timed out after {timeout_secs}s")),
+            };
+            let slug = target_slug(&t);
+            let file = dir.join(format!("{slug}.md"));
+            let _ = std::fs::write(&file, format!("# {t}\n\n> {}\n\n{}\n", full.replace('\n', " "), if ok { body.clone() } else { format!("**failed:** {why}") }));
+            let n = done.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            let secs = t0.elapsed().as_secs();
+            if ok {
+                eprintln!("[{n}/{total}] \x1b[32m✔\x1b[0m {t}  ({secs}s)");
+            } else {
+                eprintln!("[{n}/{total}] \x1b[31m✘\x1b[0m {t}  ({secs}s) — {why}");
+            }
+            (t, slug, ok, body, why)
+        }));
+    }
+    let mut rows = Vec::new();
+    for h in handles {
+        if let Ok(r) = h.await {
+            rows.push(r);
+        }
+    }
+    let failed = rows.iter().filter(|r| !r.2).count();
+    let mut index = format!("# strobes batch\n\nPrompt: `{}`\n\n| target | result | summary |\n|---|---|---|\n", prompt.replace('|', "\\|"));
+    for (t, slug, ok, body, why) in &rows {
+        let first = if *ok { body.lines().find(|l| !l.trim().is_empty()).unwrap_or("").to_string() } else { why.clone() };
+        index.push_str(&format!(
+            "| [{t}]({slug}.md) | {} | {} |\n",
+            if *ok { "✔" } else { "✘" },
+            trunc(&first.replace('|', "\\|"), 120)
+        ));
+    }
+    std::fs::write(dir.join("index.md"), index)?;
+    eprintln!(
+        "done in {}s: {} ok, {failed} failed → {}",
+        started.elapsed().as_secs(),
+        total - failed,
+        dir.join("index.md").display()
+    );
+    if failed > 0 {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// `strobes api`: one authenticated request, pretty JSON out, non-zero exit
+/// on HTTP errors.
+async fn cmd_api(p: &config::Profile, path: &str, method: &str, data: Option<String>, query: Vec<String>, raw: bool) -> Result<()> {
+    require_complete(p)?;
+    let client = api::ApiClient::new(p.clone())?;
+    let mut url = client.resolve_api_path(path)?;
+    if !query.is_empty() {
+        let mut u = url::Url::parse(&url)?;
+        for q in &query {
+            let (k, v) = q.split_once('=').ok_or_else(|| anyhow!("-q expects key=value, got {q}"))?;
+            u.query_pairs_mut().append_pair(k, v);
+        }
+        url = u.to_string();
+    }
+    let body = match data {
+        None => None,
+        Some(d) => {
+            let text = if d == "@-" {
+                let mut s = String::new();
+                std::io::Read::read_to_string(&mut std::io::stdin(), &mut s)?;
+                s
+            } else if let Some(f) = d.strip_prefix('@') {
+                std::fs::read_to_string(f).with_context(|| format!("reading {f}"))?
+            } else {
+                d
+            };
+            Some(serde_json::from_str(&text).map_err(|e| anyhow!("-d is not valid JSON: {e}"))?)
+        }
+    };
+    let method = if body.is_some() && method.eq_ignore_ascii_case("GET") { "POST".to_string() } else { method.to_string() };
+    let (status, text) = client.raw(&method, &url, body).await?;
+    let pretty = if raw {
+        text.clone()
+    } else {
+        serde_json::from_str::<serde_json::Value>(&text)
+            .ok()
+            .and_then(|v| serde_json::to_string_pretty(&v).ok())
+            .unwrap_or_else(|| text.clone())
+    };
+    if (200..300).contains(&status) {
+        println!("{pretty}");
+        Ok(())
+    } else {
+        eprintln!("HTTP {status} — {method} {url}");
+        // An HTML error page (proxy/debug 404) — its title says it all.
+        let lower = pretty.to_lowercase();
+        if lower.trim_start().starts_with("<!doctype html") || lower.trim_start().starts_with("<html") {
+            let title = lower.find("<title>").and_then(|a| lower[a + 7..].find("</title>").map(|b| pretty[a + 7..a + 7 + b].trim().to_string()));
+            eprintln!("{}", title.unwrap_or_else(|| "(HTML error page)".into()));
+        } else if !pretty.trim().is_empty() {
+            eprintln!("{}", if pretty.len() > 4000 { &pretty[..4000] } else { &pretty });
+        }
+        std::process::exit(1);
+    }
+}
+
+/// `strobes logout`: drop this tenant's key (and its chat/workspace binding).
+fn cmd_logout(cfg: &mut Config, tenant: &str) -> Result<()> {
+    let p = cfg.profile_mut(tenant);
+    if p.master_key.is_empty() {
+        println!("Not signed in.");
+        return Ok(());
+    }
+    p.master_key.clear();
+    p.thread_id = None;
+    p.email = None;
+    cfg.save()?;
+    println!("Signed out of '{tenant}'. Run `strobes login` to sign in again.");
+    Ok(())
+}
+
 async fn cmd_login(
     cfg: &mut Config,
     tenant: &str,
@@ -7255,7 +8122,8 @@ async fn cmd_login(
     let had_default = cfg.has_default();
     let cur = cfg.profile_mut(&pname).clone();
     let interactive = base_url.is_none() && org_id.is_none() && master_key.is_none();
-    if interactive {
+    // Only mention keeping values when there are values to keep.
+    if interactive && !cur.base_url.is_empty() {
         println!("Configuring tenant '{pname}' — press Enter to keep the current value.");
     }
 
@@ -7480,10 +8348,138 @@ async fn cmd_threads(p: &config::Profile) -> Result<()> {
 
 fn require_complete(p: &config::Profile) -> Result<()> {
     if !p.is_complete() {
-        return Err(anyhow!("profile incomplete — run `strobes login` first"));
+        return Err(anyhow!("not logged in — run `strobes` (or `strobes login`) to connect your organization"));
     }
     Ok(())
 }
+
+/// Send a finished prompt's answer: an approval decision, or an interrupt reply.
+fn answer_pending(handle: &pulse::PulseHandle, id: &str, data: serde_json::Value, app: &mut App) {
+    if let Some(approval) = id.strip_prefix("approval:") {
+        let d = data.get("decision").and_then(|v| v.as_str()).unwrap_or("rejected");
+        if d == "always" {
+            pulse::ASK_APPROVALS.store(false, std::sync::atomic::Ordering::Relaxed);
+            app.notice("approving automatically for the rest of this session (/permissions to change)");
+        }
+        handle.respond_approval(approval, d != "rejected");
+        if d == "rejected" {
+            app.notice("declined — the agent was told no");
+        }
+    } else {
+        handle.respond_interrupt(id, data);
+    }
+}
+
+/// Run a client-side slash command (see `app::BUILTIN_COMMANDS`).
+fn run_builtin(cmd: &str, app: &mut App, handle: &mut pulse::PulseHandle, defer: &mut Option<Defer>, quit: &mut bool) {
+    let _ = handle;
+    match cmd {
+        "help" => app.show_help_text(),
+        "new" if app.chat_is_empty() => app.notice("this chat is already empty — go ahead"),
+        "new" => *defer = Some(Defer::SwitchThread("__new__".into())),
+        "resume" => *defer = Some(Defer::Threads),
+        "workspace" => *defer = Some(Defer::Workspaces),
+        "model" => *defer = Some(Defer::Models),
+        "findings" => *defer = Some(Defer::Findings),
+        "approvals" => *defer = Some(Defer::Approvals),
+        "files" => *defer = Some(Defer::Files),
+        "jobs" => *defer = Some(Defer::Jobs),
+        "permissions" => {
+            let ask = !pulse::ASK_APPROVALS.load(std::sync::atomic::Ordering::Relaxed);
+            pulse::ASK_APPROVALS.store(ask, std::sync::atomic::Ordering::Relaxed);
+            let mut c = Config::load();
+            c.approvals = if ask { "ask".into() } else { String::new() };
+            let _ = c.save();
+            app.notice(if ask {
+                "permissions: ask — you'll confirm each action that needs approval (saved)"
+            } else {
+                "permissions: automatic — approval-gated actions are approved for you (saved)"
+            });
+        }
+        "browser" => *defer = Some(Defer::Browser(String::new())),
+        "api" => app.notice("usage: /api [GET|POST|PATCH|DELETE] /cli/workspaces/ [json body] — org-relative unless it starts with /v1/"),
+        "copy" => match copy_to_clipboard(&app.transcript_plaintext()) {
+            Ok(_) => app.notice("copied transcript to clipboard"),
+            Err(e) => app.on_app_event(pulse::AppEvent::Error(format!("copy failed: {e}"))),
+        },
+        "thinking" => {
+            app.show_thinking = !app.show_thinking;
+            app.notice(if app.show_thinking { "showing the agent's reasoning" } else { "hiding the agent's reasoning" });
+        }
+        "status" => app.show_status_text(),
+        "markdown" => {
+            app.markdown = !app.markdown;
+            app.notice(if app.markdown { "rendering markdown" } else { "showing raw markdown" });
+        }
+        "login" => {
+            *AFTER_CHAT.lock().unwrap() = Some(AfterChat::Login);
+            *quit = true;
+        }
+        "logout" => {
+            *AFTER_CHAT.lock().unwrap() = Some(AfterChat::Logout);
+            *quit = true;
+        }
+        "exit" => *quit = true,
+        c if commands::is_command(c) => *defer = Some(Defer::Cmd(c.to_string(), String::new())),
+        _ => {}
+    }
+}
+
+/// `/browser`: the agent's live local browser (strobes_pt) and its tabs.
+const BROWSER_STATUS_PY: &str = r#"
+import json, os, urllib.request
+from strobes_pt import browser as b
+
+def tabs(name):
+    ws = b.local_ws_url(name, launch=False)
+    if not ws:
+        return None
+    port = ws.split("//", 1)[1].split("/", 1)[0].split(":")[1]
+    lst = json.load(urllib.request.urlopen(f"http://127.0.0.1:{port}/json/list", timeout=3))
+    return [t.get("url", "") for t in lst if t.get("type") == "page"]
+
+parts = []
+for s in b.sessions():
+    t = tabs(s["name"])
+    if t is None:
+        parts.append(f'{s["name"]} (stopped)')
+    else:
+        parts.append(f'{s["name"]} (running · ' + (", ".join(t[:3]) or "no tabs") + ")")
+print("sessions: " + "; ".join(parts) if parts else "no browser yet — it starts when the agent (or /browser open) needs it")
+"#;
+
+/// `/browser open <url>`: open a tab in the agent's browser — the session it
+/// used most recently (so a sign-in lands where the agent will look), else
+/// "default" — launching it if needed.
+const BROWSER_OPEN_PY: &str = r#"
+import os, urllib.request, urllib.parse
+from strobes_pt import browser as b
+names = [s["name"] for s in b.sessions()]
+def mtime(n):
+    try:
+        return os.path.getmtime(os.path.join(b._LOCAL_DIR, n))
+    except OSError:
+        return 0
+live = [n for n in names if b.local_ws_url(n, launch=False)]
+name = max(live or names or ["default"], key=mtime)
+ws = b.local_ws_url(name)
+port = ws.split("//", 1)[1].split("/", 1)[0].split(":")[1]
+url = __URL__
+req = urllib.request.Request(f"http://127.0.0.1:{port}/json/new?" + urllib.parse.quote(url, safe=":/?&=%#"), method="PUT")
+urllib.request.urlopen(req, timeout=10).read()
+print(name)
+"#;
+
+/// `/browser close`: stop every running browser session of the agent.
+const BROWSER_CLOSE_PY: &str = r#"
+from strobes_pt import browser as b
+n = 0
+for s in b.sessions():
+    if b.local_ws_url(s["name"], launch=False):
+        b._purge_local(s["name"])
+        n += 1
+print(f"closed {n} browser session(s)" if n else "the agent's browser wasn't running")
+"#;
 
 /// What a keypress deferred to after the select block (these need `.await`
 /// and/or to reassign `rx`, which can't happen while select borrows it).
@@ -7498,6 +8494,16 @@ enum Defer {
     SwitchThread(String),
     BindWorkspace(String),
     Models,
+    /// `!cmd` — run a shell command locally, outside the agent.
+    Bash(String),
+    /// /jobs overlay.
+    Jobs,
+    /// /browser [args].
+    Browser(String),
+    /// /api [METHOD] <path> [json].
+    Api(String),
+    /// An argument-taking command from `commands` (name, args).
+    Cmd(String, String),
 }
 
 /// Result of a `Defer::{Workspaces,Threads,Findings,Approvals}` list fetch,
@@ -7505,6 +8511,10 @@ enum Defer {
 /// for why these run in the background instead of inline `.await`s).
 enum DeferResult {
     OpenOverlay(app::OverlayKind, String, Vec<app::OverlayItem>),
+    /// Chain another deferred action (e.g. bind a workspace → new chat).
+    Then(Defer),
+    /// A `!cmd` finished: (call id, output, success).
+    Bash(String, String, bool),
     Notice(String),
     Error(String),
 }
@@ -7574,6 +8584,15 @@ fn parse_dragged_paths(input: &str) -> Option<Vec<std::path::PathBuf>> {
 
 /// Load a thread's history, active-run state and title into the app, running
 /// the independent round-trips concurrently. Used when switching threads.
+/// A chat opened with /agent is titled after its specialist, which runs it:
+/// show that agent as the main one when the chat is reopened.
+fn mark_specialist_chat(threads: Option<&Vec<api::Thread>>, thread_id: &str, events: &[serde_json::Value]) {
+    let Some(title) = threads.and_then(|ts| ts.iter().find(|t| t.id == thread_id)).map(|t| t.title.as_str()) else { return };
+    if !title.is_empty() && events.iter().any(|e| e.get("agentName").and_then(|a| a.as_str()) == Some(title)) {
+        app::mark_main_agent(title);
+    }
+}
+
 async fn load_thread_data(
     client: &api::ApiClient,
     thread_id: &str,
@@ -7590,7 +8609,10 @@ async fn load_thread_data(
         app.set_thread_credits(c.credits, c.tokens);
     }
     match events_res {
-        Ok(events) if !events.is_empty() => app.seed_history_events(events),
+        Ok(events) if !events.is_empty() => {
+            mark_specialist_chat(threads_res.as_ref().ok(), thread_id, &events);
+            app.seed_history_events(events)
+        }
         _ => {
             if let Ok(hist) = client.get_thread_history(thread_id, 100).await {
                 app.seed_history(hist.messages);
@@ -7619,12 +8641,26 @@ pub async fn run_chat(
     model: Option<i64>,
     reasoning: Option<String>,
     initial_msg: Option<String>,
+    open_resume: bool,
 ) -> Result<()> {
     require_complete(&profile)?;
+    // The user's MCP servers start in the background; their tools join the
+    // next message once they're up (see /mcp).
+    mcp::start_all();
+    // The org's live model list (custom models too) for /model.
+    {
+        let p = profile.clone();
+        tokio::spawn(async move {
+            if let Ok(c) = api::ApiClient::new(p) {
+                let _ = c.load_models().await;
+            }
+        });
+    }
 
     let mut profile = profile;
     let client = api::ApiClient::new(profile.clone())?;
     let mut app = App::new(thread_id.clone(), profile.base_url.clone(), tenant.to_string(), profile.org_id.clone());
+    pulse::ASK_APPROVALS.store(Config::load().approvals == "ask", std::sync::atomic::Ordering::Relaxed);
     app.has_workspace = profile.workspace_id.is_some();
     if let Some(m) = model {
         app.set_model(Some(m));
@@ -7674,7 +8710,10 @@ pub async fn run_chat(
 
     // Apply the fetched data (in-memory, fast).
     match events_res {
-        Ok(events) if !events.is_empty() => app.seed_history_events(events),
+        Ok(events) if !events.is_empty() => {
+            mark_specialist_chat(threads_res.as_ref().ok(), &thread_id, &events);
+            app.seed_history_events(events)
+        }
         _ => {
             if let Ok(hist) = client.get_thread_history(&thread_id, 100).await {
                 app.seed_history(hist.messages);
@@ -7727,8 +8766,15 @@ pub async fn run_chat(
         }
     }
 
+    // `strobes -r`: the chat opens with the resume list on top.
+    if open_resume {
+        defer_tx.send(DeferResult::Then(Defer::Threads)).ok();
+    }
+
     let mut events = EventStream::new();
     let mut viewport_h: u16 = 20;
+    // When the last interrupt was (re)sent — see the RunFinished handling.
+    let mut last_cancel: Option<std::time::Instant> = None;
     // Drives the working-spinner animation while a turn is running.
     let mut ticker = tokio::time::interval(std::time::Duration::from_millis(120));
 
@@ -7792,18 +8838,9 @@ pub async fn run_chat(
                             // ----- overlay navigation -----
                             match k.code {
                                 KeyCode::Esc => {
-                                    // Back-stack: detail → list, chat → threads →
-                                    // workspaces → exit. Findings/approvals just
-                                    // close back to chat.
-                                    if app.overlay_detail_open() {
-                                        app.overlay_esc();
-                                    } else if app.overlay_kind() == Some(app::OverlayKind::Threads) {
-                                        defer = Some(Defer::Workspaces);
-                                    } else if app.overlay_kind() == Some(app::OverlayKind::Workspaces) {
-                                        quit = true;
-                                    } else {
-                                        app.overlay_esc();
-                                    }
+                                    // Esc always steps back toward the chat
+                                    // (detail → list → chat); it never quits.
+                                    app.overlay_esc();
                                 }
                                 KeyCode::Up => app.overlay_move(true),
                                 KeyCode::Down => app.overlay_move(false),
@@ -7813,6 +8850,10 @@ pub async fn run_chat(
                                     match app.overlay_enter() {
                                         Some((app::OverlayKind::Workspaces, id)) => defer = Some(Defer::BindWorkspace(id)),
                                         Some((app::OverlayKind::Threads, id)) => defer = Some(Defer::SwitchThread(id)),
+                                        Some((app::OverlayKind::History, text)) => {
+                                            app.close_overlay();
+                                            app.set_input(&text);
+                                        }
                                         Some((app::OverlayKind::Models, id)) => {
                                             let model_id = match id.parse::<i64>().ok() {
                                                 Some(0) => None,
@@ -7841,14 +8882,55 @@ pub async fn run_chat(
                                 // Type-to-search in the workspace/thread/model pickers.
                                 KeyCode::Backspace if app.overlay_searchable() => app.overlay_filter_pop(),
                                 KeyCode::Char(c) if !ctrl && app.overlay_searchable() => app.overlay_filter_push(c),
+                                // /jobs: x stops the selected command, r refreshes.
+                                KeyCode::Char('x') if app.overlay_kind() == Some(app::OverlayKind::Jobs) => {
+                                    if let Some(id) = app.overlay_current_action().and_then(|a| a.parse::<u32>().ok()) {
+                                        if jobs::kill(id) {
+                                            app.notice(&format!("stopping job #{id}"));
+                                        }
+                                        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                                        app.open_jobs();
+                                    }
+                                }
+                                KeyCode::Char('r') if app.overlay_kind() == Some(app::OverlayKind::Jobs) => app.open_jobs(),
                                 // vim-style j/k nav only where there's no search.
                                 KeyCode::Char('k') if !ctrl => app.overlay_move(true),
                                 KeyCode::Char('j') if !ctrl => app.overlay_move(false),
                                 _ => {}
                             }
+                        } else if app.awaiting_input() && !app.pending_choices().is_empty() {
+                            // ----- choice prompt -----
+                            match k.code {
+                                KeyCode::Up | KeyCode::Char('k') => app.pending_move(true),
+                                KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => app.pending_move(false),
+                                KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
+                                    if let Some((id, data)) = app.submit_choice(Some(c as usize - '1' as usize)) {
+                                        answer_pending(&handle, &id, data, &mut app);
+                                    }
+                                }
+                                KeyCode::Enter => {
+                                    if let Some((id, data)) = app.submit_choice(None) {
+                                        answer_pending(&handle, &id, data, &mut app);
+                                    }
+                                }
+                                // Esc on an approval answers No (the run goes on);
+                                // on an agent question it stops the run.
+                                KeyCode::Esc | KeyCode::Char('c') if k.code == KeyCode::Esc || ctrl => {
+                                    if let Some(ap) = app.pending_approval_id() {
+                                        handle.respond_approval(&ap, false);
+                                        app.decline_interrupt();
+                                        app.running = true;
+                                    } else {
+                                        app.decline_interrupt();
+                                        handle.cancel();
+                                    }
+                                }
+                                _ => {}
+                            }
                         } else if app.awaiting_input() {
                             match k.code {
-                                KeyCode::Esc => quit = true,
+                                // Esc declines (stops the run) — never quits the app.
+                                KeyCode::Esc => { app.input_clear(); app.decline_interrupt(); handle.cancel(); }
                                 KeyCode::Char(c) if !ctrl => app.input_insert_char(c),
                                 // Word delete — see the matching arms in normal chat.
                                 KeyCode::Backspace if k.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
@@ -7864,38 +8946,110 @@ pub async fn run_chat(
                                     let raw = app.input.clone();
                                     app.input_clear();
                                     if let Some((id, data)) = app.submit_interrupt_value(raw.trim()) {
-                                        handle.respond_interrupt(&id, data);
+                                        answer_pending(&handle, &id, data, &mut app);
                                     }
                                 }
                                 _ => {}
                             }
+                        } else if !app.slash_open()
+                            && matches!(k.code, KeyCode::Up | KeyCode::Down | KeyCode::Tab | KeyCode::Enter | KeyCode::Esc)
+                            && !ctrl
+                            && app.mention_open()
+                        {
+                            // ----- @ file mention menu -----
+                            match k.code {
+                                KeyCode::Up => app.mention_move(true),
+                                KeyCode::Down => app.mention_move(false),
+                                KeyCode::Tab | KeyCode::Enter => app.mention_complete(),
+                                KeyCode::Esc => app.input_insert_char(' '),
+                                _ => {}
+                            }
                         } else if app.slash_open()
-                            && matches!(k.code, KeyCode::Up | KeyCode::Down | KeyCode::Tab | KeyCode::Enter)
+                            && matches!(k.code, KeyCode::Up | KeyCode::Down | KeyCode::Tab | KeyCode::Enter | KeyCode::Esc)
                             && !ctrl
                         {
                             // ----- slash-command autocomplete popup -----
                             match k.code {
                                 KeyCode::Up => app.slash_move(true),
                                 KeyCode::Down => app.slash_move(false),
-                                KeyCode::Tab | KeyCode::Enter => app.slash_complete(),
+                                KeyCode::Esc => app.input_clear(),
+                                KeyCode::Tab => app.slash_complete(),
+                                KeyCode::Enter => {
+                                    // Enter runs a built-in right away (like
+                                    // picking from a menu); skills complete
+                                    // so their arguments can be typed.
+                                    app.slash_complete();
+                                    let name = app.input.trim().trim_start_matches('/').to_string();
+                                    if let Some(cmd) = app::builtin_command(&name) {
+                                        app.input_clear();
+                                        run_builtin(cmd, &mut app, &mut handle, &mut defer, &mut quit);
+                                    }
+                                }
                                 _ => {}
                             }
+                        } else if app.show_help && matches!(k.code, KeyCode::Esc | KeyCode::Char('?')) {
+                            app.show_help = false;
                         } else {
                             // ----- normal chat -----
+                            // Any other key dismisses the shortcuts panel and
+                            // still does its normal job.
+                            app.show_help = false;
                             match k.code {
                                 // Esc: if scrolled up, snap back to the live
                                 // bottom first; otherwise step back into
                                 // navigation (threads → workspaces). ^C quits.
+                                // Esc: interrupt a running turn; else snap back
+                                // to the bottom if scrolled; else (twice) clear
+                                // the prompt.
+                                KeyCode::Esc if !app.running && jobs::foreground_running() > 0 => {
+                                    let n = jobs::kill_foreground();
+                                    app.notice(&format!("stopped {n} running command{}", if n == 1 { "" } else { "s" }));
+                                }
                                 KeyCode::Esc => {
-                                    if app.is_pinned() {
+                                    if app.running {
+                                        handle.cancel();
+                                        app.cancel_requested = true;
+                                        jobs::kill_foreground();
+                                        app.status = "interrupting…".into();
+                                    } else if app.is_pinned() {
                                         app.jump_to_bottom();
-                                    } else {
-                                        defer = Some(Defer::Threads);
+                                    } else if !app.input.is_empty() {
+                                        if app.take_armed(app::Armed::ClearInput) {
+                                            app.input_clear();
+                                        } else {
+                                            app.arm(app::Armed::ClearInput);
+                                        }
                                     }
                                 }
-                                KeyCode::Char('c') if ctrl => { if app.running { handle.cancel(); } else { quit = true; } }
+                                // Ctrl-C: interrupt, else clear the prompt,
+                                // else press twice to quit. Ctrl-D quits on an
+                                // empty prompt.
+                                KeyCode::Char('c') if ctrl => {
+                                    if app.running {
+                                        handle.cancel();
+                                        app.cancel_requested = true;
+                                        jobs::kill_foreground();
+                                        app.status = "interrupting…".into();
+                                    } else if !app.input.is_empty() {
+                                        app.input_clear();
+                                        app.disarm();
+                                    } else if app.take_armed(app::Armed::Quit) {
+                                        quit = true;
+                                    } else {
+                                        app.arm(app::Armed::Quit);
+                                    }
+                                }
+                                KeyCode::Char('d') if ctrl && app.input.is_empty() => quit = true,
+                                // Ctrl-B: move the running local command to the background.
+                                KeyCode::Char('b') if ctrl => match jobs::detach_latest() {
+                                    Some(id) => app.notice(&format!("moved to the background as job #{id} — the agent carries on · /jobs to check on it")),
+                                    None => app.notice("no local command is running — ctrl+b backgrounds one while it runs"),
+                                },
+                                KeyCode::Char('?') if app.input.is_empty() => app.show_help = true,
                                 KeyCode::Char('t') if ctrl => app.show_thinking = !app.show_thinking,
-                                KeyCode::Char('r') if ctrl => app.markdown = !app.markdown,
+                                // Ctrl-R searches history (as in Claude Code / shells);
+                                // the raw-markdown toggle moved to /markdown.
+                                KeyCode::Char('r') if ctrl => app.open_history_search(),
                                 KeyCode::Char('s') if ctrl => {
                                     app.select_mode = !app.select_mode;
                                     if app.select_mode { disable_mouse(); } else { enable_mouse(); }
@@ -7921,9 +9075,67 @@ pub async fn run_chat(
                                 KeyCode::Enter if k.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::SHIFT) => {
                                     app.input_newline();
                                 }
+                                // `\` then Enter: newline (works on every terminal).
+                                KeyCode::Enter if app.input_backslash_newline() => {}
                                 KeyCode::Enter => {
                                     let text = app.input.trim().to_string();
-                                    if !text.is_empty() {
+                                    let builtin = text
+                                        .strip_prefix('/')
+                                        .filter(|t| !t.contains(' '))
+                                        .and_then(app::builtin_command);
+                                    // `/model <name>` switches without the picker.
+                                    let model_arg = text
+                                        .strip_prefix("/model ")
+                                        .map(str::trim)
+                                        .filter(|a| !a.is_empty())
+                                        .map(str::to_lowercase);
+                                    let browser_arg = text.strip_prefix("/browser ").map(|a| a.trim().to_string());
+                                    let api_arg = text.strip_prefix("/api ").map(|a| a.trim().to_string());
+                                    // `/name args` for the commands in `commands`.
+                                    let cmd_arg = text.strip_prefix('/').and_then(|t| {
+                                        let (n, a) = t.split_once(char::is_whitespace)?;
+                                        commands::is_command(n).then(|| (n.to_string(), a.trim().to_string()))
+                                    });
+                                    // `# note` → remember it for this workspace.
+                                    let memo = text.strip_prefix('#').filter(|m| !m.starts_with('#') && !m.trim().is_empty()).map(|m| m.trim().to_string());
+                                    if let Some(m) = memo {
+                                        app.input_clear();
+                                        defer = Some(Defer::Cmd("memory".into(), format!("add {m}")));
+                                    } else if let Some((n, a)) = cmd_arg {
+                                        if !commands::is_secret(&n) {
+                                            app.remember_prompt(&text);
+                                        }
+                                        app.input_clear();
+                                        defer = Some(Defer::Cmd(n, a));
+                                    } else if let Some(a) = api_arg {
+                                        app.remember_prompt(&text);
+                                        app.input_clear();
+                                        defer = Some(Defer::Api(a));
+                                    } else if let Some(a) = browser_arg {
+                                        app.input_clear();
+                                        defer = Some(Defer::Browser(a));
+                                    } else if let Some(q) = model_arg {
+                                        app.input_clear();
+                                        match api::find_model(&q) {
+                                            Some((id, name)) => {
+                                                let m = if id == 0 { None } else { Some(id) };
+                                                handle.set_model(m);
+                                                app.set_model(m);
+                                                app.notice(&format!("model → {name}"));
+                                            }
+                                            None => app.notice(&format!("no model matches “{q}” — /model lists them")),
+                                        }
+                                    } else if let Some(cmd) = builtin {
+                                        app.input_clear();
+                                        run_builtin(cmd, &mut app, &mut handle, &mut defer, &mut quit);
+                                    } else if let Some(cmd) = text.strip_prefix('!').map(str::trim).filter(|c| !c.is_empty()) {
+                                        app.remember_prompt(&text);
+                                        app.input_clear();
+                                        defer = Some(Defer::Bash(cmd.to_string()));
+                                    } else if !text.is_empty() {
+                                        // History keeps the full text: paste bodies
+                                        // don't outlive this prompt.
+                                        app.remember_prompt(&app.expand_pastes(&text));
                                         // Dragged local file path(s) + a bound
                                         // workspace → upload instead of sending.
                                         match parse_dragged_paths(&text) {
@@ -7932,8 +9144,10 @@ pub async fn run_chat(
                                                 app.input_clear();
                                             }
                                             _ => {
+                                                // Show the compact form, send the full text.
+                                                let full = app.expand_pastes(&text);
                                                 app.echo_user(&text);
-                                                handle.send_user_message(&text);
+                                                handle.send_user_message(&full);
                                                 app.input_clear();
                                                 app.running = true;
                                                 app.status = "sending…".into();
@@ -7962,10 +9176,20 @@ pub async fn run_chat(
                                 // Up/Down move the cursor within a multiline
                                 // message; at the top/bottom edge they scroll the
                                 // transcript instead.
-                                KeyCode::Up => { if !app.input_up() { app.scroll_line(true); } }
-                                KeyCode::Down => { if !app.input_down() { app.scroll_line(false); } }
-                                KeyCode::Char(c) if !ctrl => app.input_insert_char(c),
+                                // ↑/↓: move within a multiline prompt; on an
+                                // empty (or recalled) prompt, walk sent prompts;
+                                // otherwise scroll the transcript.
+                                KeyCode::Up => {
+                                    if !app.input_up() && !app.history_prev() { app.scroll_line(true); }
+                                }
+                                KeyCode::Down => {
+                                    if !app.input_down() && !app.history_next() { app.scroll_line(false); }
+                                }
+                                KeyCode::Char(c) if !ctrl => { app.end_history_browse(); app.input_insert_char(c) }
                                 _ => {}
+                            }
+                            if !matches!(k.code, KeyCode::Esc | KeyCode::Char('c')) {
+                                app.disarm();
                             }
                         }
                     }
@@ -7992,7 +9216,7 @@ pub async fn run_chat(
                                 app.input_insert_str(data.trim());
                                 app.notice("bind a workspace first, then drop files or folders to upload");
                             }
-                            None => app.input_insert_str(&data),
+                            None => app.input_paste(&data),
                         }
                     }
                     // A transient parse error (e.g. a stray escape byte) must NOT
@@ -8006,6 +9230,25 @@ pub async fn run_chat(
                 match maybe_app {
                     Some(ev) => {
                         let finished = matches!(ev, pulse::AppEvent::RunFinished(_));
+                        match &ev {
+                            pulse::AppEvent::Interrupt { title, .. } => notify_needs_you(&format!("question: {title}")),
+                            pulse::AppEvent::ApprovalRequest { .. } => notify_needs_you("approval needed"),
+                            _ => {}
+                        }
+                        // An interrupt pressed before a worker picked the run up
+                        // is dropped server-side ("created" ≠ "started"). Keep
+                        // re-sending it — at most once a second — on the run's
+                        // events until it actually finishes.
+                        if app.cancel_requested && !finished
+                            && last_cancel.map(|t| t.elapsed() >= std::time::Duration::from_secs(1)).unwrap_or(true)
+                        {
+                            handle.cancel();
+                            last_cancel = Some(std::time::Instant::now());
+                        }
+                        if finished {
+                            app.cancel_requested = false;
+                            last_cancel = None;
+                        }
                         app.on_app_event(ev);
                         // Notify the (possibly away) user that the reply is ready.
                         if finished {
@@ -8023,6 +9266,8 @@ pub async fn run_chat(
                 match maybe_defer {
                     Some(DeferResult::OpenOverlay(kind, title, items)) => app.open_overlay(kind, title, items),
                     Some(DeferResult::Notice(s)) => app.notice(&s),
+                    Some(DeferResult::Bash(id, out, ok)) => app.bash_done(&id, out, ok),
+                    Some(DeferResult::Then(d)) => defer = Some(d),
                     Some(DeferResult::Error(e)) => app.on_app_event(pulse::AppEvent::Error(e)),
                     None => {}
                 }
@@ -8041,6 +9286,7 @@ pub async fn run_chat(
         needs_draw |= redraw;
 
         if quit {
+            jobs::kill_all();
             break Ok(());
         }
 
@@ -8089,7 +9335,7 @@ pub async fn run_chat(
                     };
                     let result = match client.list_threads(profile.workspace_id.as_deref()).await {
                         Ok(ts) => {
-                            let title = if in_ws { "Threads (this workspace)" } else { "Threads" };
+                            let title = if in_ws { "Resume a chat in this workspace" } else { "Resume a chat" };
                             DeferResult::OpenOverlay(app::OverlayKind::Threads, title.into(), thread_items(ts, &thread_id, in_ws))
                         }
                         Err(e) => DeferResult::Error(e.to_string()),
@@ -8157,10 +9403,7 @@ pub async fn run_chat(
                 }
             }
             Some(Defer::Models) => {
-                let models: Vec<(i64, String)> = api::BUILTIN_MODELS
-                    .iter()
-                    .map(|&(id, name)| (id, name.to_string()))
-                    .collect();
+                let models: Vec<(i64, String)> = api::models();
                 let current = app.current_model();
                 let items: Vec<app::OverlayItem> = models
                     .into_iter()
@@ -8182,6 +9425,178 @@ pub async fn run_chat(
                     })
                     .collect();
                 app.open_overlay(app::OverlayKind::Models, "Select AI model  (^P toggle)".into(), items);
+            }
+            Some(Defer::Jobs) => app.open_jobs(),
+            Some(Defer::Cmd(name, args)) => {
+                let dtx = defer_tx.clone();
+                let ctx = commands::Ctx { profile: profile.clone(), thread_id: app.thread_id.clone(), model: app.current_model() };
+                app.set_busy(&format!("/{name}…"));
+                tokio::spawn(async move {
+                    let r = commands::run(&name, &args, &ctx).await;
+                    match r {
+                        Ok(commands::Outcome::Text(t)) => { dtx.send(DeferResult::Notice(t)).ok(); }
+                        Ok(commands::Outcome::SwitchThread(id, note)) => {
+                            dtx.send(DeferResult::Then(Defer::SwitchThread(id))).ok();
+                            dtx.send(DeferResult::Notice(note)).ok();
+                        }
+                        Err(e) => { dtx.send(DeferResult::Error(e)).ok(); }
+                    }
+                });
+            }
+            Some(Defer::Api(args)) => {
+                let dtx = defer_tx.clone();
+                let profile = profile.clone();
+                app.set_busy("api…");
+                tokio::spawn(async move {
+                    // [METHOD] <path> [json…]
+                    let mut parts = args.splitn(2, char::is_whitespace);
+                    let first = parts.next().unwrap_or("").to_string();
+                    let (method, rest) = if ["GET", "POST", "PUT", "PATCH", "DELETE"].contains(&first.to_uppercase().as_str()) {
+                        (first.to_uppercase(), parts.next().unwrap_or("").trim().to_string())
+                    } else {
+                        ("GET".to_string(), args.trim().to_string())
+                    };
+                    let mut it = rest.splitn(2, char::is_whitespace);
+                    let path = it.next().unwrap_or("").to_string();
+                    let body = it.next().map(str::trim).filter(|b| !b.is_empty());
+                    let result: Result<String, String> = async {
+                        let client = api::ApiClient::new(profile).map_err(|e| e.to_string())?;
+                        let url = client.resolve_api_path(&path).map_err(|e| e.to_string())?;
+                        let body = match body {
+                            Some(b) => Some(serde_json::from_str::<serde_json::Value>(b).map_err(|e| format!("body is not JSON: {e}"))?),
+                            None => None,
+                        };
+                        let method = if body.is_some() && method == "GET" { "POST".to_string() } else { method };
+                        let (status, text) = client.raw(&method, &url, body).await.map_err(|e| e.to_string())?;
+                        let pretty = serde_json::from_str::<serde_json::Value>(&text)
+                            .ok()
+                            .and_then(|v| serde_json::to_string_pretty(&v).ok())
+                            .unwrap_or_else(|| if text.trim_start().starts_with('<') { "(HTML page)".into() } else { text.clone() });
+                        let lines: Vec<&str> = pretty.lines().collect();
+                        let shown = lines.iter().take(40).cloned().collect::<Vec<_>>().join("\n");
+                        let more = if lines.len() > 40 { format!("\n… +{} lines (strobes api {path} for all)", lines.len() - 40) } else { String::new() };
+                        if (200..300).contains(&status) {
+                            Ok(format!("{method} {path} → {status}\n{shown}{more}"))
+                        } else {
+                            Err(format!("{method} {path} → HTTP {status}: {}", pretty.lines().next().unwrap_or("")))
+                        }
+                    }
+                    .await;
+                    dtx.send(match result {
+                        Ok(m) => DeferResult::Notice(m),
+                        Err(e) => DeferResult::Error(e),
+                    }).ok();
+                });
+            }
+            Some(Defer::Browser(args)) => {
+                let dtx = defer_tx.clone();
+                app.set_busy("browser…");
+                // The agent's browser is strobes_pt's local Chrome (it reuses a
+                // live one via its profile), so drive it with the same local
+                // runner, HOME and workspace mirror the agent's code uses.
+                let mut base = serde_json::json!({ "language": "python", "_thread_id": app.thread_id.clone() });
+                if let Some(ws) = &profile.workspace_id {
+                    base["_workspace_id"] = serde_json::json!(ws);
+                }
+                tokio::spawn(async move {
+                    let mut it = args.split_whitespace();
+                    let sub = it.next().unwrap_or("").to_lowercase();
+                    let rest: String = it.collect::<Vec<_>>().join(" ");
+                    let py = |code: String| {
+                        let mut input = base.clone();
+                        input["code"] = serde_json::json!(code);
+                        input
+                    };
+                    let run = |input: serde_json::Value| async move {
+                        let r = local::run_tool("execute_code", &input).await;
+                        match r.error {
+                            Some(e) => Err(e),
+                            None if r.exit_code.unwrap_or(0) != 0 => Err(r.output.lines().last().unwrap_or("browser command failed").to_string()),
+                            None => Ok(r.output),
+                        }
+                    };
+                    let msg: Result<String, String> = match sub.as_str() {
+                        "" | "status" => {
+                            let out = run(py(BROWSER_STATUS_PY.to_string())).await;
+                            let mode = if std::env::var("STROBES_BROWSER_HEADLESS").as_deref() == Ok("1") { "headless" } else { "visible window" };
+                            out.map(|o| format!(
+                                "browser ({mode}): {}\n/browser open <url> — sign in to a target there; the agent continues in that session\n/browser show · hide · close · attach <port> (drive your own Chrome for browser_* tools)",
+                                o.trim()
+                            ))
+                        }
+                        "open" | "login" if !rest.is_empty() => {
+                            let url = if rest.contains("://") { rest.clone() } else { format!("https://{rest}") };
+                            std::env::remove_var("STROBES_BROWSER_HEADLESS");
+                            run(py(BROWSER_OPEN_PY.replace("__URL__", &serde_json::to_string(&url).unwrap()))).await
+                                .map(|name| format!(
+                                    "opened {url} in the agent's browser (session \"{}\") — sign in there, then tell the agent to continue in that session",
+                                    name.trim()
+                                ))
+                        }
+                        "show" | "headed" => {
+                            std::env::remove_var("STROBES_BROWSER_HEADLESS");
+                            browser::set_headless(false).await;
+                            Ok("the agent's browser opens as a visible window (from its next launch; /browser close restarts it)".into())
+                        }
+                        "hide" | "headless" => {
+                            std::env::set_var("STROBES_BROWSER_HEADLESS", "1");
+                            browser::set_headless(true).await;
+                            Ok("the agent's browser runs headless (from its next launch; /browser close restarts it)".into())
+                        }
+                        "close" => {
+                            let n = browser::close_all().await;
+                            run(py(BROWSER_CLOSE_PY.to_string())).await.map(|o| format!("{}{}", o.trim(), if n > 0 { format!(" (+{n} tool browser)") } else { String::new() }))
+                        }
+                        "attach" => {
+                            let ep = if rest.is_empty() { "9222".to_string() } else { rest.clone() };
+                            browser::attach(&ep).await
+                                .map(|b| format!("attached: browser_* tools now drive your {b} (/browser detach to stop)"))
+                                .map_err(|e| e.to_string())
+                        }
+                        "detach" => {
+                            browser::detach().await;
+                            Ok("detached — browser_* tools use the agent's own browser again".into())
+                        }
+                        other => Err(format!("unknown /browser {other} — try /browser for options")),
+                    };
+                    dtx.send(match msg {
+                        Ok(m) => DeferResult::Notice(m),
+                        Err(e) => DeferResult::Error(e),
+                    }).ok();
+                });
+            }
+            Some(Defer::Bash(cmd)) => {
+                let id = app.bash_started(&cmd);
+                let dtx = defer_tx.clone();
+                let mut input = serde_json::json!({ "command": cmd, "_thread_id": app.thread_id.clone() });
+                let ws = profile.workspace_id.clone();
+                if let Some(ws) = &ws {
+                    input["_workspace_id"] = serde_json::json!(ws);
+                }
+                let ctx = jobs::RunCtx {
+                    call_id: id.clone(),
+                    label: cmd.lines().next().unwrap_or("").to_string(),
+                    sink: pulse::job_sink(app_tx.clone()),
+                };
+                tokio::spawn(async move {
+                    // Same workspace mirror sync as the agent's own commands.
+                    let sandbox = local::sandbox_dir_for(input.get("_thread_id").and_then(|v| v.as_str()));
+                    if let Some(ws) = ws.as_deref() {
+                        wsync::before(ws, &sandbox).await;
+                    }
+                    let r = local::run_tool_ctx("execute_command", &input, Some(ctx)).await;
+                    if let Some(ws) = ws.as_deref() {
+                        wsync::after(ws, &sandbox).await;
+                    }
+                    let ok = r.error.is_none() && matches!(r.exit_code, Some(0) | None);
+                    let mut out = r.output;
+                    if let Some(e) = r.error {
+                        out = if out.trim().is_empty() { e } else { format!("{out}\n{e}") };
+                    } else if let Some(code) = r.exit_code.filter(|c| *c != 0) {
+                        out.push_str(&format!("\n(exit {code})"));
+                    }
+                    dtx.send(DeferResult::Bash(id, out, ok)).ok();
+                });
             }
             Some(Defer::OpenFiles) => {
                 let dir = local::sandbox_dir();
@@ -8322,23 +9737,17 @@ pub async fn run_chat(
                         app.set_workspace_name(w.name.clone());
                     }
                 }
-                app.notice(&format!("✔ bound workspace {} — ^F findings · ^A approvals", &id[..8.min(id.len())]));
+                let ws_label = app.workspace_label().unwrap_or_else(|| id[..8.min(id.len())].to_string());
+                app.notice(&format!("✔ switched to workspace {ws_label}"));
                 // Sync the workspace files locally IN THE BACKGROUND so the
                 // agent's local tools see the real files without freezing the UI.
                 spawn_workspace_sync(profile.clone(), id.clone(), app_tx.clone());
-                // Lead straight into choosing a new chat or an existing thread
-                // for this workspace.
-                let threads_res = client.list_threads(Some(&id)).await;
+                // Straight into a fresh chat there (threads are created under
+                // a workspace; /resume lists its older chats).
                 app.clear_busy();
                 app.clear_loading();
-                match threads_res {
-                    Ok(ts) => app.open_overlay(
-                        app::OverlayKind::Threads,
-                        "New chat or existing thread".into(),
-                        thread_items(ts, &thread_id, true),
-                    ),
-                    Err(_) => app.close_overlay(),
-                }
+                app.close_overlay();
+                defer_tx.send(DeferResult::Then(Defer::SwitchThread("__new__".into()))).ok();
             }
             Some(Defer::SwitchThread(sel)) => {
                 // Paint the centered loader once before the blocking reconnect +
@@ -8366,6 +9775,14 @@ pub async fn run_chat(
                             app_tx = nclone;
                             app.reset_for_thread(new_thread.clone());
                             load_thread_data(&client, &new_thread, profile.workspace_id.as_deref(), &mut app).await;
+                            // Remember it so `strobes -c` reopens this chat.
+                            {
+                                let mut c = Config::load();
+                                let p = c.profile_mut(tenant);
+                                p.thread_id = Some(new_thread.clone());
+                                p.workspace_id = profile.workspace_id.clone();
+                                let _ = c.save();
+                            }
                         }
                         Err(e) => app.on_app_event(pulse::AppEvent::Error(format!("switch failed: {e}"))),
                     }
@@ -8688,6 +10105,38 @@ fn approval_items(aps: Vec<api::Approval>) -> Vec<app::OverlayItem> {
         .collect()
 }
 
+/// Seconds since the Unix epoch for an ISO-8601 timestamp (UTC assumed,
+/// fractional seconds and offset ignored) — enough for "3h ago".
+fn iso_epoch(s: &str) -> Option<i64> {
+    let b = s.as_bytes();
+    if b.len() < 19 {
+        return None;
+    }
+    let n = |r: std::ops::Range<usize>| s.get(r)?.parse::<i64>().ok();
+    let (y, m, d) = (n(0..4)?, n(5..7)?, n(8..10)?);
+    let (hh, mm, ss) = (n(11..13)?, n(14..16)?, n(17..19)?);
+    // Days from civil (Howard Hinnant).
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + doe - 719468;
+    Some(days * 86400 + hh * 3600 + mm * 60 + ss)
+}
+
+/// Compact relative age: "just now", "5m ago", "3h ago", "2d ago".
+fn ago(secs: i64) -> String {
+    match secs.max(0) {
+        s if s < 60 => "just now".into(),
+        s if s < 3600 => format!("{}m ago", s / 60),
+        s if s < 86400 => format!("{}h ago", s / 3600),
+        s if s < 86400 * 30 => format!("{}d ago", s / 86400),
+        s => format!("{}mo ago", s / (86400 * 30)),
+    }
+}
+
 fn thread_items(ts: Vec<api::Thread>, current: &str, in_workspace: bool) -> Vec<app::OverlayItem> {
     let new_label = if in_workspace {
         "➕  New chat (in this workspace)".to_string()
@@ -8699,10 +10148,29 @@ fn thread_items(ts: Vec<api::Thread>, current: &str, in_workspace: bool) -> Vec<
         detail: vec!["Press Enter to start a new chat thread.".into()],
         action: Some("__new__".into()),
     }];
-    items.extend(ts.into_iter().map(|t| {
-        let here = if t.id == current { " ●" } else { "" };
-        let title = if t.title.is_empty() { "(untitled)".into() } else { t.title.clone() };
-        let label = format!("{title}{here}  · {}  {}", t.status, trunc(&t.last_message, 50));
+    // Default titles say nothing; the last message is the better name. Chats
+    // nobody ever wrote in are hidden (except the one you're in).
+    let generic = |t: &str| t.is_empty() || t == "CLI session" || t == "Chat with Strobes AI" || t == "New chat";
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    items.extend(ts.into_iter().filter(|t| t.id == current || !(generic(&t.title) && t.last_message.trim().is_empty())).map(|t| {
+        let here = if t.id == current { "  (current)" } else { "" };
+        let title = if generic(&t.title) && !t.last_message.trim().is_empty() {
+            trunc(t.last_message.trim(), 70)
+        } else if t.title.is_empty() {
+            "(empty chat)".into()
+        } else {
+            trunc(&t.title, 70)
+        };
+        let state = match t.status.as_str() {
+            "running" => "  ⟳ running",
+            "failed" => "  ✗ failed",
+            _ => "",
+        };
+        let age = t.created_at.as_deref().and_then(iso_epoch).map(|e| format!("  · {}", ago(now - e))).unwrap_or_default();
+        let label = format!("{title}{state}{age}{here}");
         let detail = vec![title, format!("status: {}", t.status), format!("id: {}", t.id),
             String::new(), "Press Enter to switch to this thread.".into()];
         app::OverlayItem { label, detail, action: Some(t.id) }
@@ -8734,8 +10202,10 @@ fn workspace_items(
         };
         let cr = credits.get(&w.id).copied().unwrap_or(0.0);
         let opens = cfg.workspace_open_count(&w.id);
-        let recent = if opens > 0 { format!(" · ↻ recent ×{opens}") } else { String::new() };
-        let label = format!("{name}{bound}  · {} · {tcount} · ◈ {cr:.2} cr{recent}", w.status);
+        let bound = if bound.is_empty() { "" } else { "  (current)" };
+        let usage = if cr > 0.0 { format!("  · {cr:.2} cr") } else { String::new() };
+        let state = if w.status == "active" || w.status.is_empty() { String::new() } else { format!("  · {}", w.status) };
+        let label = format!("{name}{state}{usage}{bound}");
         let mut detail = vec![name, format!("status: {}", w.status), format!("threads: {tcount}"),
             format!("credits: {cr:.3}")];
         if opens > 0 {
@@ -8772,9 +10242,10 @@ async fn workspace_overlay_items(
             .cmp(&cfg.workspace_open_count(&a.id))
             .then(cfg.workspace_last_opened(&b.id).cmp(&cfg.workspace_last_opened(&a.id)))
     });
-    let (counts, credits) =
-        tokio::join!(workspace_thread_counts(client, &ws), workspace_credits_map(client));
-    Ok(workspace_items(ws, &counts, &credits, profile, &cfg))
+    // No per-workspace thread counts here: that's one request per workspace
+    // and made the picker take ~20s to open on a busy org.
+    let credits = workspace_credits_map(client).await;
+    Ok(workspace_items(ws, &[], &credits, profile, &cfg))
 }
 
 /// `workspace_overlay_items` wrapped as a `DeferResult`, for the background
@@ -8787,7 +10258,7 @@ async fn fetch_workspaces_overlay(profile: &config::Profile) -> DeferResult {
         Err(e) => return DeferResult::Error(e.to_string()),
     };
     match workspace_overlay_items(&client, profile).await {
-        Ok(items) => DeferResult::OpenOverlay(app::OverlayKind::Workspaces, "Workspaces".into(), items),
+        Ok(items) => DeferResult::OpenOverlay(app::OverlayKind::Workspaces, "Switch workspace".into(), items),
         Err(e) => DeferResult::Error(e.to_string()),
     }
 }
@@ -9130,6 +10601,32 @@ mod tests {
     use tokio_tungstenite::tungstenite::Message;
 
     #[test]
+    fn iso_epoch_and_ago() {
+        assert_eq!(iso_epoch("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(iso_epoch("2000-03-01T12:30:15.123+00:00"), Some(951_913_815));
+        assert_eq!(iso_epoch("bad"), None);
+        assert_eq!(ago(30), "just now");
+        assert_eq!(ago(7200), "2h ago");
+    }
+
+    #[test]
+    fn batch_target_slugs_are_file_safe() {
+        assert_eq!(target_slug("https://a.example.com/login?x=1"), "a.example.com_login_x_1");
+        assert_eq!(target_slug("10.0.0.1"), "10.0.0.1");
+        assert_eq!(target_slug("///"), "target");
+    }
+
+    #[test]
+    fn subcommand_after_global_flag_is_not_a_prompt() {
+        let a = |v: &[&str]| subcommand_first(v.iter().map(|s| s.to_string()).collect());
+        assert_eq!(a(&["strobes", "--tenant", "x", "status"]), vec!["strobes", "status", "--tenant", "x"]);
+        assert_eq!(a(&["strobes", "scan", "status", "page"]), vec!["strobes", "scan", "status", "page"]);
+        assert_eq!(a(&["strobes", "status"]), vec!["strobes", "status"]);
+        // After a non-global flag, a subcommand name is just the prompt.
+        assert_eq!(a(&["strobes", "-p", "login"]), vec!["strobes", "-p", "login"]);
+    }
+
+    #[test]
     fn fmt_bytes_scales_units() {
         assert_eq!(fmt_bytes(0), "0 B");
         assert_eq!(fmt_bytes(512), "512 B");
@@ -9210,6 +10707,67 @@ mod tests {
     /// Verifies the full CLI_LOCAL round-trip in Rust against a mock pulse
     /// server: server sends a `tool.local_execute`, the client runs it on the
     /// local machine and replies with `tool.local_result` carrying the output.
+    /// The server marks its own cells `internal` and sends the agent's
+    /// unwrapped input as `display`: internal cells still run but never reach
+    /// the transcript; agent cells show `display`, not the wrapped input.
+    #[test]
+    fn upload_refs_name_files_or_their_folder() {
+        assert_eq!(upload_refs(&["burp.xml".into()]), "[workspace file: burp.xml]");
+        assert_eq!(upload_refs(&["a.png".into(), "b.har".into()]), "[workspace file: a.png] [workspace file: b.har]");
+        let tree: Vec<String> = (0..9).map(|i| format!("src/f{i}.py")).chain(["README.md".to_string()]).collect();
+        assert_eq!(upload_refs(&tree), "[workspace file: src/] [workspace file: README.md]");
+        assert_eq!(upload_refs(&[]), "");
+    }
+
+    #[tokio::test]
+    async fn local_execute_internal_and_display() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(stream).await.unwrap();
+            for ev in [
+                serde_json::json!({"type": "tool", "data": {"status": "local_execute", "toolName": "execute_command",
+                    "requestId": "int1", "internal": true, "input": {"command": "echo SETUP"}}}),
+                serde_json::json!({"type": "tool", "data": {"status": "local_execute", "toolName": "execute_command",
+                    "requestId": "ag1", "internal": false, "input": {"command": "echo WRAPPED; echo AGENT"},
+                    "display": {"command": "echo AGENT"}}}),
+            ] {
+                ws.send(Message::Text(ev.to_string())).await.unwrap();
+            }
+            let mut got = 0;
+            while let Some(Ok(msg)) = ws.next().await {
+                if let Message::Text(t) = msg {
+                    if t.contains("tool.local_result") {
+                        got += 1;
+                        if got == 2 {
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+        let profile = config::Profile {
+            base_url: format!("http://127.0.0.1:{port}"),
+            org_id: "o".into(),
+            master_key: "k".into(),
+            deployment: "enterprise".into(),
+            ..Default::default()
+        };
+        let (tx, mut rx) = mpsc::unbounded_channel::<pulse::AppEvent>();
+        let _handle = pulse::connect(&profile, "t", tx, None, None).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), server).await.expect("both cells ran").unwrap();
+        let mut starts = Vec::new();
+        while let Ok(Some(ev)) = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
+            if let pulse::AppEvent::Stream(item) = ev {
+                if item.kind == "tool_start" {
+                    starts.push((item.call_id.clone().unwrap_or_default(), item.detail.clone().unwrap_or_default()));
+                }
+            }
+        }
+        assert_eq!(starts, vec![("ag1".to_string(), "echo AGENT".to_string())]);
+    }
+
     #[tokio::test]
     async fn local_execute_roundtrip() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

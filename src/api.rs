@@ -95,7 +95,7 @@ pub struct ThreadHistory {
     pub active_run: Option<ActiveRun>,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize, Default)]
 pub struct Finding {
     #[serde(default)]
     pub id: i64,
@@ -147,35 +147,88 @@ pub struct SlashCmd {
 /// ID `0` is the sentinel that means "use the org's configured default"
 /// (no `llm_model` key is sent in the context).
 pub const BUILTIN_MODELS: &[(i64, &str)] = &[
-    (0,  "Default (org setting)"),
-    (4,  "Claude Haiku 4.5"),
-    (10, "Claude Sonnet 4.5"),
-    (18, "Claude Sonnet 4.6"),
-    (11, "Claude Opus 4.5"),
-    (14, "Claude Opus 4.6"),
-    (21, "Claude Opus 4.7"),
-    (24, "Claude Opus 4.8"),
-    (12, "Nova 2 Lite"),
-    (15, "DeepSeek-R1"),
-    (16, "MiniMax M2"),
-    (19, "MiniMax M2.5"),
-    (17, "Kimi K2 Thinking"),
-    (22, "Kimi K2.5"),
-    (20, "GLM 5"),
-    (25, "GPT-5.4"),
-    (26, "GPT-5.5"),
-    (27, "Gemma 4 31B"),
-    (28, "Gemma 4 26B-A4B"),
+    // Synced with strobes/app/models/connectors_models.py llm_model_choices
+    // (2026-11-19). Retired ids (10, 11, 22, 23, 25, 26, 29) are gone.
+    (0,   "Default (org setting)"),
+    (46,  "SAI"),
+    (999, "Smart Router"),
+    (42,  "Claude Haiku 5.5"),
+    (4,   "Claude Haiku 4.5"),
+    (18,  "Claude Sonnet 4.6"),
+    (40,  "Claude Sonnet 5.5"),
+    (43,  "Claude Sonnet 5.5 (Claude Platform on AWS)"),
+    (14,  "Claude Opus 4.6"),
+    (21,  "Claude Opus 4.7"),
+    (24,  "Claude Opus 4.8"),
+    (33,  "Claude Opus 5"),
+    (41,  "Claude Opus 5.5 (Claude Platform on AWS)"),
+    (45,  "Claude Mythos 5.1 (Claude Platform on AWS)"),
+    (12,  "Nova 2 Lite"),
+    (15,  "DeepSeek-R1"),
+    (16,  "MiniMax M2"),
+    (19,  "MiniMax M2.5"),
+    (17,  "Kimi K2 Thinking"),
+    (34,  "Kimi K3"),
+    (30,  "GPT-5.6 Sol"),
+    (31,  "GPT-5.6 Terra"),
+    (32,  "GPT-5.6 Luna"),
+    (35,  "Daybreak Blue (GPT-5.6 Sol)"),
+    (36,  "GPT-6 Sol"),
+    (37,  "GPT-6 Luna"),
+    (38,  "GPT-6.1 Sol"),
+    (39,  "Grok 4.7"),
+    (20,  "GLM 5"),
+    (44,  "GLM 5.3"),
+    (27,  "Gemma 4 31B"),
+    (28,  "Gemma 4 26B-A4B"),
 ];
+
+/// The org's models as the server lists them (`/cli/models/`), once loaded;
+/// `BUILTIN_MODELS` until then (or against a server without the route).
+static LIVE_MODELS: std::sync::RwLock<Vec<(i64, String)>> = std::sync::RwLock::new(Vec::new());
+
+/// Models to offer: (id, name), "Default" first.
+pub fn models() -> Vec<(i64, String)> {
+    let live = LIVE_MODELS.read().map(|m| m.clone()).unwrap_or_default();
+    if live.is_empty() {
+        return BUILTIN_MODELS.iter().map(|&(id, n)| (id, n.to_string())).collect();
+    }
+    live
+}
+
+/// `/model <query>`: an exact id, else the matching model with the highest
+/// version number (ties → the plainer, shorter name). "sonnet" → Sonnet 5.5,
+/// "opus" → Opus 5.5, "sai" → SAI.
+pub fn find_model(query: &str) -> Option<(i64, String)> {
+    let q = query.trim().to_lowercase();
+    let all = models();
+    if let Some(hit) = all.iter().find(|(id, _)| id.to_string() == q) {
+        return Some(hit.clone());
+    }
+    let version = |name: &str| -> f64 {
+        name.split(|c: char| c == ' ' || c == '(' || c == ')')
+            .find_map(|t| t.trim_start_matches(|c: char| !c.is_ascii_digit()).parse::<f64>().ok())
+            .unwrap_or(0.0)
+    };
+    all.into_iter()
+        .filter(|(_, n)| n.to_lowercase().contains(&q))
+        .max_by(|a, b| {
+            version(&a.1)
+                .partial_cmp(&version(&b.1))
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(b.1.len().cmp(&a.1.len()))
+        })
+}
 
 /// Display name for a model id, or "Default" when None/0.
 pub fn model_name(id: Option<i64>) -> String {
     match id {
         None | Some(0) => "Default".to_string(),
-        Some(id) => BUILTIN_MODELS
-            .iter()
+        Some(id) => models()
+            .into_iter()
             .find(|(mid, _)| *mid == id)
-            .map(|(_, name)| name.to_string())
+            .map(|(_, name)| name)
+            .or_else(|| BUILTIN_MODELS.iter().find(|(mid, _)| *mid == id).map(|(_, n)| n.to_string()))
             .unwrap_or_else(|| format!("model:{id}")),
     }
 }
@@ -206,6 +259,42 @@ impl ApiClient {
 
     fn url(&self, path: &str) -> Result<String> {
         Ok(format!("{}{}", self.profile.http_base()?, path))
+    }
+
+    /// `strobes api` path resolution: a full URL as-is; `/v1/…` under the API
+    /// root; anything else relative to the org (`/cli/workspaces/` →
+    /// `<root>/organizations/<org>/cli/workspaces/`). `{org}` is filled in.
+    pub fn resolve_api_path(&self, path: &str) -> Result<String> {
+        let p = path.trim().replace("{org}", &self.profile.org_id);
+        if p.starts_with("http://") || p.starts_with("https://") {
+            return Ok(p);
+        }
+        let p = if p.starts_with('/') { p } else { format!("/{p}") };
+        for v in ["/v1/", "/v2/"] {
+            if let Some(rest) = p.strip_prefix(v) {
+                let root = self.profile.api_prefix().trim_end_matches("/v1");
+                return self.url(&format!("{root}{}{rest}", &v[..v.len()]));
+            }
+        }
+        self.url(&self.org_path(&p))
+    }
+
+    /// One raw authenticated request (for `strobes api`): (status, body).
+    pub async fn raw(&self, method: &str, url: &str, body: Option<serde_json::Value>) -> Result<(u16, String)> {
+        let m = reqwest::Method::from_bytes(method.to_uppercase().as_bytes())
+            .map_err(|_| anyhow!("unknown HTTP method {method}"))?;
+        let mut req = self
+            .http
+            .request(m, url)
+            .header("Authorization", format!("token {}", self.profile.master_key))
+            .header("Accept", "application/json")
+            .timeout(std::time::Duration::from_secs(120));
+        if let Some(b) = body {
+            req = req.json(&b);
+        }
+        let resp = req.send().await.map_err(|e| anyhow!("{method} {url}: {e}"))?;
+        let status = resp.status().as_u16();
+        Ok((status, resp.text().await.unwrap_or_default()))
     }
 
     async fn get_json(&self, path: &str) -> Result<serde_json::Value> {
@@ -255,6 +344,100 @@ impl ApiClient {
             self.profile.org_id,
             suffix
         )
+    }
+
+    /// Load the org's model list (custom models included) for /model.
+    pub async fn load_models(&self) -> Result<()> {
+        let v = self.cli_json("GET", "/cli/models/", None).await?;
+        let default_name = v
+            .get("default_id")
+            .and_then(|d| d.as_i64())
+            .and_then(|d| v["models"].as_array()?.iter().find(|m| m["id"].as_i64() == Some(d)))
+            .and_then(|m| m["name"].as_str())
+            .map(|n| format!("Default (org setting: {n})"))
+            .unwrap_or_else(|| "Default (org setting)".into());
+        let mut list = vec![(0, default_name)];
+        for m in v.get("models").and_then(|m| m.as_array()).cloned().unwrap_or_default() {
+            if let (Some(id), Some(name)) = (m.get("id").and_then(|i| i.as_i64()), m.get("name").and_then(|n| n.as_str())) {
+                list.push((id, name.to_string()));
+            }
+        }
+        if list.len() > 1 {
+            if let Ok(mut w) = LIVE_MODELS.write() {
+                *w = list;
+            }
+        }
+        Ok(())
+    }
+
+    /// `{"error","message"}` → a readable error, else the status line.
+    fn cli_error(status: u16, body: &str) -> anyhow::Error {
+        let v: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
+        let msg = v.get("message").or_else(|| v.get("detail")).or_else(|| v.get("error"))
+            .and_then(|m| m.as_str()).map(str::to_string)
+            .unwrap_or_else(|| html_error_reason(body));
+        anyhow!("HTTP {status}: {msg}")
+    }
+
+    /// JSON call to an org-relative CLI route (`/cli/...`).
+    pub async fn cli_json(&self, method: &str, suffix: &str, body: Option<serde_json::Value>) -> Result<serde_json::Value> {
+        let url = self.url(&self.org_path(suffix))?;
+        let (status, text) = self.raw(method, &url, body).await?;
+        if !(200..300).contains(&status) {
+            return Err(Self::cli_error(status, &text));
+        }
+        Ok(serde_json::from_str(&text).unwrap_or(serde_json::Value::Null))
+    }
+
+    /// Multipart upload (one `file` plus text fields) to a CLI route.
+    pub async fn cli_upload(
+        &self,
+        suffix: &str,
+        fields: &[(&str, String)],
+        filename: &str,
+        bytes: Vec<u8>,
+    ) -> Result<serde_json::Value> {
+        let url = self.url(&self.org_path(suffix))?;
+        let mime = mime_for(filename);
+        let part = reqwest::multipart::Part::bytes(bytes).file_name(filename.to_string()).mime_str(mime)?;
+        let mut form = reqwest::multipart::Form::new().part("file", part);
+        for (k, v) in fields {
+            form = form.text(k.to_string(), v.clone());
+        }
+        let resp = self
+            .http
+            .post(&url)
+            .header("Authorization", format!("token {}", self.profile.master_key))
+            .header("Accept", "application/json")
+            .multipart(form)
+            .timeout(std::time::Duration::from_secs(300))
+            .send()
+            .await?;
+        let status = resp.status().as_u16();
+        let text = resp.text().await.unwrap_or_default();
+        if !(200..300).contains(&status) {
+            return Err(Self::cli_error(status, &text));
+        }
+        Ok(serde_json::from_str(&text).unwrap_or(serde_json::Value::Null))
+    }
+
+    /// Raw bytes from a CLI route (downloads).
+    pub async fn cli_bytes(&self, suffix: &str, query: &[(&str, &str)]) -> Result<Vec<u8>> {
+        let url = self.url(&self.org_path(suffix))?;
+        let resp = self
+            .http
+            .get(&url)
+            .query(query)
+            .header("Authorization", format!("token {}", self.profile.master_key))
+            .timeout(std::time::Duration::from_secs(300))
+            .send()
+            .await?;
+        let status = resp.status().as_u16();
+        let bytes = resp.bytes().await?.to_vec();
+        if !(200..300).contains(&status) {
+            return Err(Self::cli_error(status, &String::from_utf8_lossy(&bytes)));
+        }
+        Ok(bytes)
     }
 
     /// Fetch all workspaces, paging through the backend's limit/offset
@@ -966,5 +1149,39 @@ mod trunc_tests {
         let body = out.strip_suffix('…').unwrap();
         assert!(body.len() <= 101);
         assert!(body.len() % 2 == 0); // never split a 2-byte "é"
+    }
+}
+
+#[cfg(test)]
+mod model_tests {
+    use super::find_model;
+
+    #[test]
+    fn model_queries_pick_the_newest_plain_match() {
+        assert_eq!(find_model("sai").map(|m| m.0), Some(46));
+        assert_eq!(find_model("46").map(|m| m.0), Some(46));
+        assert_eq!(find_model("sonnet").map(|m| m.0), Some(40));
+        assert_eq!(find_model("haiku").map(|m| m.0), Some(42));
+        assert_eq!(find_model("gpt").map(|m| m.0), Some(38));
+        assert_eq!(find_model("nope"), None);
+    }
+}
+
+/// Content type from a file name, for uploads.
+pub fn mime_for(name: &str) -> &'static str {
+    let ext = name.rsplit('.').next().unwrap_or("").to_lowercase();
+    match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "pdf" => "application/pdf",
+        "json" | "har" => "application/json",
+        "xml" => "application/xml",
+        "zip" => "application/zip",
+        "csv" => "text/csv",
+        "md" => "text/markdown",
+        "txt" | "log" => "text/plain",
+        _ => "application/octet-stream",
     }
 }

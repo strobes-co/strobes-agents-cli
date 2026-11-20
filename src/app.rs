@@ -78,6 +78,10 @@ enum ToolStatus {
 /// One transcript entry.
 /// Max lines of a code/command tool call shown before a "ctrl+o" hint.
 const CODE_PREVIEW_LINES: usize = 5;
+/// Live output lines shown under a running local command.
+const LIVE_TAIL_LINES: usize = 3;
+/// Lines of a tool's output shown under the call before "+N lines".
+const RESULT_PREVIEW_LINES: usize = 3;
 
 enum Block {
     User(String),
@@ -92,7 +96,16 @@ enum Block {
     /// only matching by tool NAME (as this used to) let one agent's
     /// completion event settle a same-named call that actually belonged to
     /// the other, leaving the real match stuck Running (blinking) forever.
-    Tool { name: String, detail: String, status: ToolStatus, agent: String },
+    Tool {
+        name: String,
+        detail: String,
+        status: ToolStatus,
+        agent: String,
+        /// Server call id (`callId`) and the local execution's request id —
+        /// whichever an event carries finds this call.
+        call_id: Option<String>,
+        local_id: Option<String>,
+    },
     /// The agent's self-managed to-do list, rendered as a checklist. Each
     /// add/complete/delete finds and updates THIS agent's existing Todos
     /// block in place rather than appending a fresh one — a checklist
@@ -100,6 +113,23 @@ enum Block {
     /// per item, so a 5-item list rendered as 5 growing, near-duplicate
     /// checklists stacked on top of each other.
     Todos { agent: String, items: Vec<TodoItem> },
+    /// A tool call's result, shown as "  ⎿  first lines…" under the call.
+    ToolResult { text: String, failed: bool, ms: Option<u64> },
+    /// Where a sub-agent's work sits in the main transcript (index into
+    /// `App::subs`). Its own text and tool calls live in that run, never
+    /// interleaved with the main agent's.
+    SubAgent(usize),
+}
+
+/// One sub-agent's separate transcript, rendered as a collapsed group.
+struct SubAgentRun {
+    name: String,
+    blocks: Vec<Block>,
+    stream: Option<Stream>,
+    started: std::time::Instant,
+    last_activity: std::time::Instant,
+    /// Built from history (no meaningful timings).
+    replayed: bool,
 }
 
 #[derive(Clone)]
@@ -167,6 +197,12 @@ fn is_todo_tool(name: &str) -> bool {
     )
 }
 
+/// Tools whose call line is redundant with what the UI already shows (the
+/// human-input prompt renders as its own question + answer).
+fn is_silent_tool(name: &str) -> bool {
+    matches!(name, "request_human_input" | "workspace_request_human_input" | "ask_user")
+}
+
 struct Stream {
     thinking: bool,
     agent: String,
@@ -179,6 +215,8 @@ struct Pending {
     fields: Vec<Field>,
     idx: usize,
     answers: Map<String, Value>,
+    /// Highlighted option for a choice field.
+    sel: usize,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -189,6 +227,10 @@ pub enum OverlayKind {
     Workspaces,
     Files,
     Models,
+    /// Ctrl-R: search previously sent prompts.
+    History,
+    /// /jobs: local background commands.
+    Jobs,
 }
 
 /// One row in an overlay browser. `detail` lines are shown when the row is
@@ -319,6 +361,165 @@ pub struct App {
     /// `lines_fingerprint` against a cheap content hash each frame instead.
     lines_cache: Vec<Line<'static>>,
     lines_fingerprint: u64,
+    /// `?` on an empty prompt shows the shortcuts panel under the input.
+    pub show_help: bool,
+    /// The user interrupted; re-sent if the run only starts afterwards.
+    pub cancel_requested: bool,
+    /// One-shot footer hint ("Press Ctrl-C again to exit", …) and when it
+    /// was armed; it expires after a couple of seconds.
+    armed: Option<(Armed, std::time::Instant)>,
+    /// `@` file mentions: files under the launch directory (relative paths),
+    /// listed lazily the first time `@` is typed.
+    mention_files: Option<Vec<String>>,
+    mention_sel: usize,
+    /// Counter for `!cmd` call ids.
+    bash_seq: u64,
+    /// Percent of the context window in use (from `context.usage`).
+    context_pct: Option<f64>,
+    /// Sub-agent runs, each with its own transcript (see Block::SubAgent).
+    subs: Vec<SubAgentRun>,
+    /// Something other than reply text happened since the last token.
+    stream_break: bool,
+    /// Duration of the tool result about to be attached (one-shot).
+    next_result_ms: Option<u64>,
+    /// Latest output lines of running local commands, by tool-call id.
+    live_tails: HashMap<String, std::collections::VecDeque<String>>,
+    live_gen: u64,
+    /// Set while replaying history, so new sub-agent groups are marked.
+    replaying: bool,
+    /// Big pastes, shown in the prompt as "[Pasted text #n +L lines]" and
+    /// expanded back when the message is sent.
+    pastes: Vec<String>,
+    /// Previously sent prompts (oldest first) for ↑/↓ recall.
+    history: Vec<String>,
+    /// Position while browsing `history`, plus the draft it replaced.
+    hist_pos: Option<(usize, String)>,
+}
+
+/// A key that needs a second press to act.
+#[derive(Clone, Copy, PartialEq)]
+pub enum Armed {
+    Quit,
+    ClearInput,
+}
+
+/// Client-side slash commands, handled by the CLI itself (never sent to the
+/// agent). Listed first in the `/` menu.
+pub const BUILTIN_COMMANDS: &[(&str, &str)] = &[
+    ("help", "Show commands and keyboard shortcuts"),
+    ("new", "Start a new chat (alias /clear)"),
+    ("resume", "Switch to another chat in this workspace"),
+    ("workspace", "Switch or bind a workspace"),
+    ("model", "Choose the AI model (or /model sonnet)"),
+    ("findings", "Browse this workspace's findings"),
+    ("approvals", "Review pending approvals"),
+    ("files", "Browse the workspace's local files"),
+    ("jobs", "Background commands: status, output, stop (alias /bg)"),
+    ("permissions", "Ask before approval-gated actions, or approve automatically"),
+    ("api", "Call the Strobes API: /api [METHOD] /cli/workspaces/ [json]"),
+    ("browser", "Agent's browser: open <url> to sign in · show · hide · attach <port> · close"),
+    ("copy", "Copy the transcript to the clipboard"),
+    ("thinking", "Show or hide the agent's reasoning"),
+    ("markdown", "Toggle rendered / raw markdown"),
+    ("status", "Show tenant, workspace, chat and usage"),
+    ("login", "Sign in through the browser (switch org/workspace)"),
+    ("logout", "Sign out of this tenant"),
+    ("exit", "Quit (alias /quit)"),
+];
+
+/// Resolve a typed `/name` to a built-in command (aliases included).
+pub fn builtin_command(name: &str) -> Option<&'static str> {
+    let n = match name {
+        "clear" | "reset" => "new",
+        "quit" | "q" => "exit",
+        "threads" | "chats" => "resume",
+        "workspaces" | "ws" => "workspace",
+        "bg" | "tasks" => "jobs",
+        "models" => "model",
+        "?" | "h" => "help",
+        other => other,
+    };
+    all_builtin_commands().find(|(c, _)| *c == n).map(|(c, _)| *c)
+}
+
+/// Built-ins plus the argument-taking commands in `crate::commands`.
+pub fn all_builtin_commands() -> impl Iterator<Item = &'static (&'static str, &'static str)> {
+    let n = BUILTIN_COMMANDS.len();
+    BUILTIN_COMMANDS[..n - 1]
+        .iter()
+        .chain(crate::commands::COMMANDS.iter())
+        .chain(BUILTIN_COMMANDS[n - 1..].iter())
+}
+
+/// Files under the current directory for `@` mentions — relative paths,
+/// skipping VCS/build/dependency dirs, capped so a huge tree stays instant.
+fn list_mention_files() -> Vec<String> {
+    const SKIP: &[&str] = &[".git", "node_modules", "target", "dist", "build", ".venv", "venv", "__pycache__", ".next", ".cache", "Library"];
+    let root = match std::env::current_dir() { Ok(d) => d, Err(_) => return Vec::new() };
+    let mut out = Vec::new();
+    let mut stack = vec![(root.clone(), 0usize)];
+    while let Some((dir, depth)) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        let mut entries: Vec<_> = rd.flatten().collect();
+        entries.sort_by_key(|e| e.file_name());
+        for e in entries {
+            let name = e.file_name().to_string_lossy().to_string();
+            let Ok(ft) = e.file_type() else { continue };
+            if ft.is_dir() {
+                if depth < 8 && !SKIP.contains(&name.as_str()) && !(name.starts_with('.') && depth == 0 && name != ".github") {
+                    stack.push((e.path(), depth + 1));
+                }
+            } else if ft.is_file() {
+                if let Ok(rel) = e.path().strip_prefix(&root) {
+                    out.push(rel.to_string_lossy().replace('\\', "/"));
+                }
+            }
+            if out.len() >= 5000 {
+                return out;
+            }
+        }
+    }
+    out
+}
+
+fn history_path() -> Option<std::path::PathBuf> {
+    dirs::config_dir().map(|d| d.join("strobes-ai").join("prompt_history"))
+}
+
+/// Prompts are stored one JSON string per line, newest last (older files
+/// used a lossy `\n` escape; those lines are read the old way).
+fn load_prompt_history() -> Vec<String> {
+    history_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|s| {
+            s.lines()
+                .filter(|l| !l.is_empty())
+                .map(|l| serde_json::from_str::<String>(l).unwrap_or_else(|_| l.replace("\\n", "\n")))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Write the history privately (prompts can contain secrets).
+fn save_prompt_history(lines: &[String]) {
+    let Some(p) = history_path() else { return };
+    let body: String = lines.iter().map(|h| serde_json::to_string(h).unwrap_or_default() + "\n").collect();
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    if let Ok(mut f) = opts.open(&p) {
+        use std::io::Write;
+        let _ = f.write_all(body.as_bytes());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
+        }
+    }
 }
 
 /// ASCII banner shown at the top of a fresh chat transcript and the pickers.
@@ -367,6 +568,7 @@ impl App {
             status: "connecting…".into(),
             connected: false,
             running: false,
+            stream_break: false,
             show_thinking: false,
             markdown: true,
             show_full_code: false,
@@ -408,10 +610,26 @@ impl App {
             // practice, but even if it did, an empty cache just means the
             // first draw does one harmless extra rebuild.
             lines_fingerprint: 0,
+            show_help: false,
+            cancel_requested: false,
+            armed: None,
+            pastes: Vec::new(),
+            mention_files: None,
+            mention_sel: 0,
+            bash_seq: 0,
+            context_pct: None,
+            subs: Vec::new(),
+            next_result_ms: None,
+            live_tails: HashMap::new(),
+            live_gen: 0,
+            replaying: false,
+            history: load_prompt_history(),
+            hist_pos: None,
         };
         let org = if org_id.len() > 8 { &org_id[..8] } else { &org_id };
         app.auth_line = format!("✔ authenticated · tenant: {tenant} · {} · org {org}", app.base);
         app.push_banner();
+        app.set_slash_commands(Vec::new());
         app
     }
 
@@ -420,15 +638,24 @@ impl App {
     /// when the chat opens and again whenever the transcript is cleared for
     /// another thread, so the logo is always the very first thing in it.
     fn push_banner(&mut self) {
-        const LEFT: &str = "   ";
-        for line in banner_spans(LEFT) {
-            self.blocks.push(Block::Plain(line));
-        }
-        self.blocks.push(Block::Plain(Line::from(Span::styled(
-            format!("{LEFT}{}", self.auth_line),
-            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
-        ))));
-        self.sys("Enter: send · Ctrl-C: cancel/quit · Esc: quit · PgUp/PgDn: scroll · Ctrl-T: thinking · Ctrl-R: markdown · Ctrl-O: full code");
+        let dim = Style::default().fg(Color::DarkGray);
+        self.blocks.push(Block::Plain(Line::from(vec![
+            Span::styled("✦ ", Style::default().fg(STROBES_GREEN).add_modifier(Modifier::BOLD)),
+            Span::styled("Strobes Agents", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("  v{}", env!("CARGO_PKG_VERSION")), dim),
+        ])));
+        let host = self.base.split("://").nth(1).unwrap_or(&self.base).split('/').next().unwrap_or("").to_string();
+        let tenant = self.auth_line.split("tenant: ").nth(1).and_then(|t| t.split(" · ").next()).unwrap_or("").to_string();
+        self.blocks.push(Block::Plain(Line::from(Span::styled(format!("  {tenant} · {host}"), dim))));
+        self.blocks.push(Block::Plain(Line::from(vec![
+            Span::styled("  ", dim),
+            Span::styled("/", Style::default().fg(Color::White)),
+            Span::styled(" commands · ", dim),
+            Span::styled("?", Style::default().fg(Color::White)),
+            Span::styled(" shortcuts · ", dim),
+            Span::styled("esc", Style::default().fg(Color::White)),
+            Span::styled(" interrupts the agent", dim),
+        ])));
     }
 
     // ---- transcript mutation -------------------------------------------
@@ -544,12 +771,32 @@ impl App {
         if md.trim().is_empty() {
             return;
         }
-        if let Some(Block::Assistant { agent: prev_agent, md: prev_md }) = self.blocks.last_mut() {
-            if *prev_agent == agent {
-                prev_md.push_str("\n\n");
-                prev_md.push_str(&md);
-                self.follow = true;
-                return;
+        // The server's cancel receipt reads like the agent talking; show it
+        // as a quiet status line instead.
+        if is_cancel_receipt(&md) {
+            self.push_interrupted();
+            return;
+        }
+        // The reply this continues: the last block, or the last one before a
+        // run of thinking blocks (hidden by default) — servers interleave
+        // thinking between fragments of one reply.
+        let prev = self
+            .blocks
+            .iter()
+            .rposition(|b| !matches!(b, Block::Thinking(_)))
+            .filter(|_| !self.show_thinking || matches!(self.blocks.last(), Some(Block::Assistant { .. })));
+        if let Some(i) = prev {
+            if let Block::Assistant { agent: prev_agent, md: prev_md } = &mut self.blocks[i] {
+                // A segment the server sent twice (whole, or just its last chunk).
+                if *prev_agent == agent && is_replay(prev_md, &md) {
+                    return;
+                }
+                if *prev_agent == agent {
+                    prev_md.push_str(segment_joint(prev_md, &md));
+                    prev_md.push_str(&md);
+                    self.follow = true;
+                    return;
+                }
             }
         }
         self.blocks.push(Block::Assistant { agent, md });
@@ -606,8 +853,30 @@ impl App {
     }
 
     fn feed(&mut self, agent: Option<String>, text: String, thinking: bool) {
+        // The server can replay a finished segment as one more token carrying
+        // the whole text. Appending it would print the answer twice.
+        if text.trim().len() >= 8 {
+            let replay = match &self.stream {
+                Some(s) if s.thinking == thinking => is_replay(&s.buf, &text),
+                Some(_) => false,
+                None => matches!(self.blocks.last(),
+                    Some(Block::Assistant { md, .. }) if !thinking && is_replay(md, &text))
+                    || matches!(self.blocks.last(), Some(Block::Thinking(t)) if thinking && t.trim() == text.trim()),
+            };
+            if replay {
+                return;
+            }
+        }
+        let resumed = std::mem::take(&mut self.stream_break);
         match &mut self.stream {
-            Some(s) if s.thinking == thinking => s.buf.push_str(&text),
+            Some(s) if s.thinking == thinking => {
+                // The reply picked up again after other work (a sub-agent ran
+                // meanwhile): join like separate segments, not glued words.
+                if resumed {
+                    s.buf.push_str(segment_joint(&s.buf, &text));
+                }
+                s.buf.push_str(&text)
+            }
             _ => {
                 self.flush_stream();
                 self.stream = Some(Stream {
@@ -622,6 +891,14 @@ impl App {
 
     pub fn on_app_event(&mut self, ev: AppEvent) {
         match ev {
+            AppEvent::InsertInput(text) => {
+                // Keep a space between it and whatever is already typed.
+                let before = self.input[..self.input_cursor.min(self.input.len())].chars().last();
+                if before.is_some_and(|c| !c.is_whitespace()) {
+                    self.input_insert_str(" ");
+                }
+                self.input_insert_str(&format!("{text} "));
+            }
             AppEvent::Connected => {
                 self.connected = true;
                 self.status = "connected".into();
@@ -659,12 +936,79 @@ impl App {
                 }
             }
             AppEvent::RunFinished(label) => {
+                // Settle the last reply now (also turns a cancel receipt into
+                // the "Interrupted" line).
+                self.flush_stream();
+                self.flush_subagents();
                 self.running = false;
                 self.settle_running_tools();
                 self.last_elapsed = self.run_started.take().map(|t| t.elapsed());
                 let took = self.last_elapsed.map(|d| format!(" · {}", fmt_elapsed(d))).unwrap_or_default();
                 self.status = format!("idle ({label}){took}");
-                self.rule(&label);
+                if label != "completed" {
+                    self.flush_stream();
+                    match label.as_str() {
+                        "cancelled" | "canceled" | "interrupted" => self.push_interrupted(),
+                        other => self.blocks.push(Block::Plain(Line::from(Span::styled(
+                            format!("  ⎿  Run {other}"),
+                            Style::default().fg(Color::Red),
+                        )))),
+                    }
+                }
+                self.follow = true;
+            }
+            AppEvent::Context(p) => self.context_pct = Some(p),
+            AppEvent::LocalLine { call_id, line } => {
+                let tail = self.live_tails.entry(call_id).or_default();
+                let line = line.replace('\r', "");
+                if !line.trim().is_empty() {
+                    tail.push_back(truncate(line.trim_end(), 300));
+                    while tail.len() > LIVE_TAIL_LINES {
+                        tail.pop_front();
+                    }
+                    self.live_gen += 1;
+                }
+            }
+            AppEvent::ApprovalRequest { id, agent, module, preview } => {
+                self.flush_stream();
+                self.running = false;
+                self.status = "approval needed".into();
+                // The preview names the action ("Create finding: 'X'"); the
+                // module ("findings") is just a tag.
+                let mut lines = preview.lines().filter(|l| !l.trim().is_empty());
+                let head = lines.next().map(str::to_string).unwrap_or_else(|| "an action".into());
+                let who = if agent.is_empty() || is_main_agent(&agent) { String::new() } else { format!(" · {agent}") };
+                let tag = if module.is_empty() { String::new() } else { format!("  {}{who}", module.replace('_', " ")) };
+                self.push(Line::default());
+                self.push(Line::from(vec![
+                    Span::styled("? ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                    Span::styled(format!("Approve: {head}"), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                    Span::styled(tag, Style::default().fg(Color::DarkGray)),
+                ]));
+                for l in lines.take(8) {
+                    self.push(Line::from(Span::styled(format!("  {l}"), Style::default().fg(Color::Gray))));
+                }
+                let field = Field {
+                    key: "decision".into(),
+                    label: "Allow it?".into(),
+                    ftype: "select".into(),
+                    options: vec![
+                        ("Yes".into(), Value::from("approved")),
+                        ("Yes, and don't ask again this session".into(), Value::from("always")),
+                        ("No".into(), Value::from("rejected")),
+                    ],
+                    default: None,
+                };
+                self.pending = Some(Pending { id: format!("approval:{id}"), fields: vec![field], idx: 0, answers: Map::new(), sel: 0 });
+                self.follow = true;
+            }
+            AppEvent::JobDone { job, exit, command } => {
+                let how = match exit {
+                    Some(0) => "finished".to_string(),
+                    Some(c) => format!("exited {c}"),
+                    None => "stopped".to_string(),
+                };
+                self.notice(&format!("background job #{job} {how} — {} · /jobs to view", truncate(&command, 60)));
             }
             AppEvent::Notice(n) => self.notice(&n),
             AppEvent::Progress(Some(msg)) => self.set_busy(msg),
@@ -687,17 +1031,20 @@ impl App {
             AppEvent::Interrupt { id, title, message, fields } => {
                 self.running = false;
                 self.status = "input needed ⏸".into();
-                self.push(Line::from(Span::styled(
-                    format!("⏸ {title}"),
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-                )));
+                self.flush_stream();
+                self.push(Line::default());
+                self.push(Line::from(vec![
+                    Span::styled("? ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                    Span::styled(title, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                ]));
                 if !message.is_empty() {
-                    self.push(Line::from(Span::styled(
-                        format!("   {message}"),
-                        Style::default().fg(Color::Cyan),
-                    )));
+                    for l in message.lines() {
+                        self.push(Line::from(Span::styled(format!("  {l}"), Style::default().fg(Color::Gray))));
+                    }
                 }
-                self.pending = Some(Pending { id, fields, idx: 0, answers: Map::new() });
+                let mut p = Pending { id, fields, idx: 0, answers: Map::new(), sel: 0 };
+                p.sel = default_choice(&p);
+                self.pending = Some(p);
                 self.follow = true;
             }
             AppEvent::Stream(item) => self.on_stream(item),
@@ -723,11 +1070,99 @@ impl App {
         })
     }
 
+    /// Choices for the field being answered (select options, or Yes/No for a
+    /// checkbox); empty for free-text fields.
+    pub fn pending_choices(&self) -> Vec<String> {
+        let Some(p) = &self.pending else { return Vec::new() };
+        let Some(f) = p.fields.get(p.idx) else { return Vec::new() };
+        field_choices(f).into_iter().map(|(l, _)| l).collect()
+    }
+
+    pub fn pending_move(&mut self, up: bool) {
+        let n = self.pending_choices().len();
+        if let Some(p) = &mut self.pending {
+            if n > 0 {
+                p.sel = if up { (p.sel + n - 1) % n } else { (p.sel + 1) % n };
+            }
+        }
+    }
+
+    /// Answer the current choice field with option `idx` (or the highlighted
+    /// one). Returns the full response once every field is answered.
+    pub fn submit_choice(&mut self, idx: Option<usize>) -> Option<(String, Value)> {
+        let (label, value) = {
+            let p = self.pending.as_ref()?;
+            let f = p.fields.get(p.idx)?;
+            let ch = field_choices(f);
+            let i = idx.unwrap_or(p.sel);
+            ch.get(i)?.clone()
+        };
+        self.record_answer(&label, value)
+    }
+
+    /// The approval id when the open prompt is an approval request.
+    pub fn pending_approval_id(&self) -> Option<String> {
+        self.pending.as_ref().and_then(|p| p.id.strip_prefix("approval:").map(String::from))
+    }
+
+    /// Stop answering: the run is cancelled by the caller.
+    pub fn decline_interrupt(&mut self) {
+        if self.pending.take().is_some() {
+            self.push(Line::from(Span::styled("  ⎿  Declined", Style::default().fg(Color::DarkGray))));
+        }
+    }
+
+    fn record_answer(&mut self, shown: &str, value: Value) -> Option<(String, Value)> {
+        let (key, label) = {
+            let p = self.pending.as_ref()?;
+            let f = p.fields.get(p.idx)?;
+            (f.key.clone(), f.label.clone())
+        };
+        self.push(Line::from(vec![
+            Span::styled(format!("  ⎿  {label}: "), Style::default().fg(Color::DarkGray)),
+            Span::styled(shown.to_string(), Style::default().fg(Color::White)),
+        ]));
+        let p = self.pending.as_mut()?;
+        p.answers.insert(key, value);
+        p.idx += 1;
+        if p.idx >= p.fields.len() {
+            let done = self.pending.take().unwrap();
+            self.running = true;
+            self.status = "resuming…".into();
+            self.run_started.get_or_insert_with(std::time::Instant::now);
+            Some((done.id, Value::Object(done.answers)))
+        } else {
+            let mut np = self.pending.take().unwrap();
+            np.sel = default_choice(&np);
+            self.pending = Some(np);
+            None
+        }
+    }
+
     /// Feed the typed value as the answer to the current interrupt field.
     /// Returns `Some((interrupt_id, response_data))` once all fields are filled.
     pub fn submit_interrupt_value(&mut self, text: &str) -> Option<(String, Value)> {
+        // Choice fields: a typed number or option text picks that option.
+        let choices = self.pending_choices();
+        if !choices.is_empty() {
+            let t = text.trim().to_lowercase();
+            let idx = t.parse::<usize>().ok().filter(|n| *n >= 1 && *n <= choices.len()).map(|n| n - 1)
+                .or_else(|| choices.iter().position(|c| c.to_lowercase().starts_with(&t) && !t.is_empty()));
+            return self.submit_choice(idx);
+        }
+        // Empty answer takes the field's default, if it has one.
+        let default_text = self.pending.as_ref()
+            .and_then(|p| p.fields.get(p.idx))
+            .and_then(|f| f.default.clone())
+            .map(|d| d.as_str().map(String::from).unwrap_or_else(|| d.to_string()));
+        let owned;
+        let text = if text.trim().is_empty() {
+            match default_text { Some(d) => { owned = d; owned.as_str() } None => text }
+        } else {
+            text
+        };
         // Read the current field (short immutable borrow), compute the value.
-        let (key, label, value) = {
+        let (_key, _label, value) = {
             let p = self.pending.as_ref()?;
             let field = p.fields.get(p.idx)?;
             let value: Value = match field.ftype.as_str() {
@@ -744,28 +1179,71 @@ impl App {
             };
             (field.key.clone(), field.label.clone(), value)
         };
+        let is_secret = self.pending.as_ref().and_then(|p| p.fields.get(p.idx)).map(|f| f.ftype == "password").unwrap_or(false);
+        let shown = if is_secret { "••••••".to_string() } else { text.to_string() };
+        self.record_answer(&shown, value)
+    }
 
-        // Echo the answer (mutable borrow — no `pending` borrow held here).
-        self.push(Line::from(Span::styled(
-            format!("   {label} = {text}"),
-            Style::default().fg(Color::Magenta),
-        )));
-
-        // Record it and advance.
-        let p = self.pending.as_mut()?;
-        p.answers.insert(key, value);
-        p.idx += 1;
-        if p.idx >= p.fields.len() {
-            let done = self.pending.take().unwrap();
-            self.running = true;
-            self.status = "resuming…".into();
-            Some((done.id, Value::Object(done.answers)))
+    /// Route a stream item: sub-agent work goes to that agent's own
+    /// transcript, everything else to the main one.
+    fn on_stream(&mut self, item: StreamItem) {
+        let agent = item.agent.clone().unwrap_or_default();
+        if is_main_agent(&agent) || item.kind == "approval" {
+            if !matches!(item.kind.as_str(), "token" | "thinking") {
+                self.stream_break = true;
+            }
+            self.on_stream_main(item);
         } else {
-            None
+            self.in_agent_ctx(&agent, |s| s.on_stream_main(item));
+            // Set after: the sub-agent's own text goes through feed() too.
+            self.stream_break = true;
         }
     }
 
-    fn on_stream(&mut self, item: StreamItem) {
+    /// Run `f` with `agent`'s sub-agent transcript swapped in as the current
+    /// one, creating the group (at this point in the main transcript) on
+    /// first sight. All the tool-pairing/streaming logic then applies as-is.
+    fn in_agent_ctx(&mut self, agent: &str, f: impl FnOnce(&mut Self)) {
+        let idx = match self.subs.iter().position(|r| r.name == agent) {
+            Some(i) => i,
+            None => {
+                // The main agent's in-progress text is left streaming (it
+                // renders below the group) rather than cut mid-sentence.
+                let now = std::time::Instant::now();
+                self.subs.push(SubAgentRun {
+                    name: agent.to_string(),
+                    blocks: Vec::new(),
+                    stream: None,
+                    started: now,
+                    last_activity: now,
+                    replayed: self.replaying,
+                });
+                let i = self.subs.len() - 1;
+                self.blocks.push(Block::SubAgent(i));
+                i
+            }
+        };
+        std::mem::swap(&mut self.blocks, &mut self.subs[idx].blocks);
+        std::mem::swap(&mut self.stream, &mut self.subs[idx].stream);
+        let (lt, lk) = (self.last_tool.take(), self.last_task.take());
+        f(self);
+        self.last_tool = lt;
+        self.last_task = lk;
+        std::mem::swap(&mut self.stream, &mut self.subs[idx].stream);
+        std::mem::swap(&mut self.blocks, &mut self.subs[idx].blocks);
+        self.subs[idx].last_activity = std::time::Instant::now();
+        self.follow = true;
+    }
+
+    /// Settle every sub-agent's streamed text (end of a run).
+    fn flush_subagents(&mut self) {
+        let names: Vec<String> = self.subs.iter().filter(|r| r.stream.is_some()).map(|r| r.name.clone()).collect();
+        for n in names {
+            self.in_agent_ctx(&n, |s| s.flush_stream());
+        }
+    }
+
+    fn on_stream_main(&mut self, item: StreamItem) {
         match item.kind.as_str() {
             "token" => {
                 if let Some(t) = item.text {
@@ -785,32 +1263,56 @@ impl App {
                 // RESULT (tool_output) instead of a generic call line here —
                 // the args alone (e.g. `todo(action='complete', id=3)`)
                 // don't carry enough to render the full list anyway.
-                if is_todo_tool(&name) {
+                if is_todo_tool(&name) || is_silent_tool(&name) {
                     return;
                 }
-                // One compact line per tool call: "⏺ name(args)". A tool often
-                // emits an empty `start` then a detailed `local_execute` for the
-                // same call — collapse them by replacing the previous line.
-                if self.last_tool.as_ref() == Some(&(agent.clone(), name.clone())) {
-                    // Same call from the same agent: enrich the earlier
-                    // (often empty) start in place.
-                    if let Some(Block::Tool { detail: d, .. }) = self.blocks.last_mut() {
-                        if !detail.is_empty() {
-                            *d = detail;
+                // One line per call. The server sends an arg-less "early"
+                // start while the model streams arguments, then a full start;
+                // the local execution it triggers (execute_command for
+                // workspace_execute_shell_command) and a re-announce after it
+                // finished are the same call too. Fill/skip instead of adding.
+                self.flush_stream();
+                let id = item.call_id.clone();
+                if let Some(i) = self.tool_by_id(id.as_deref()) {
+                    // Known call: an early start getting its args, or a
+                    // re-announce. Its args also tell us whether a local
+                    // execution got paired with the wrong parallel call.
+                    self.settle_call_args(i, &detail);
+                    self.follow = true;
+                    return;
+                }
+                let found = self.match_tool_start(&agent, &name, &detail, item.local);
+                if let (Some(i), Some(new_id)) = (found, id.clone()) {
+                    if let Block::Tool { call_id, local_id, .. } = &mut self.blocks[i] {
+                        if item.local && local_id.is_none() {
+                            *local_id = Some(new_id);
+                        } else if !item.local && call_id.is_none() {
+                            *call_id = Some(new_id);
                         }
-                    } else {
-                        self.blocks.push(Block::Tool { name: name.clone(), detail, status: ToolStatus::Running, agent: agent.clone() });
                     }
-                } else {
-                    self.flush_stream();
-                    self.blocks.push(Block::Tool { name: name.clone(), detail, status: ToolStatus::Running, agent: agent.clone() });
-                    self.last_task = None;
-                    self.last_tool = Some((agent, name));
+                }
+                match found {
+                    Some(i) => {
+                        if let Block::Tool { detail: d, .. } = &mut self.blocks[i] {
+                            if d.trim().is_empty() && !detail.trim().is_empty() {
+                                *d = detail;
+                            }
+                        }
+                    }
+                    None => {
+                        let (call_id, local_id) = if item.local { (None, id) } else { (id, None) };
+                        self.blocks.push(Block::Tool { name: name.clone(), detail, status: ToolStatus::Running, agent: agent.clone(), call_id, local_id });
+                        self.last_task = None;
+                        self.last_tool = Some((agent, name));
+                    }
                 }
                 self.follow = true;
             }
             "tool_output" => {
                 let name = item.tool_name.clone().unwrap_or_default();
+                if is_silent_tool(&name) {
+                    return;
+                }
                 let agent = item.agent.clone().unwrap_or_else(|| "agent".into());
                 // Todo tools never got a Block::Tool pushed at tool_start
                 // above — nothing to settle. Try to render a fresh checklist
@@ -835,16 +1337,19 @@ impl App {
                         return;
                     }
                 }
-                // Result rendered as a dim child line under the tool call.
-                let ms = item.status.map(|s| format!("  ·{s}")).unwrap_or_default();
+                // Result rendered as a dim child block under ITS call.
+                self.next_result_ms = item.status.as_deref().and_then(|s| s.trim_end_matches("ms").trim().parse::<f64>().ok()).map(|v| v as u64);
                 let d = item.detail.unwrap_or_default();
-                let body = if d.is_empty() { "(ok)".to_string() } else { concise_tool_result(&d) };
+                let body = if d.is_empty() {
+                    "(ok)".to_string()
+                } else {
+                    let raw = serde_json::from_str::<Value>(&d).unwrap_or(Value::String(d.clone()));
+                    tool_summary(&name, &raw).unwrap_or_else(|| concise_tool_result(&d))
+                };
                 self.flush_stream();
-                self.finish_last_tool(&agent, true); // dot → green
-                self.blocks.push(Block::Plain(Line::from(Span::styled(
-                    format!("  ⎿ {body}{ms}"),
-                    Style::default().fg(Color::DarkGray),
-                ))));
+                if !self.attach_by_id(item.call_id.as_deref(), &body, false) {
+                    self.attach_tool_result(&agent, &name, body, false);
+                }
                 self.last_tool = None;
                 self.follow = true;
             }
@@ -853,12 +1358,12 @@ impl App {
                     self.last_tool = None;
                 }
                 let agent = item.agent.unwrap_or_else(|| "agent".into());
+                let name = item.tool_name.unwrap_or_default();
                 self.flush_stream();
-                self.finish_last_tool(&agent, false); // dot → red
-                self.blocks.push(Block::Plain(Line::from(Span::styled(
-                    format!("  ⎿ ✗ {}", truncate(&item.detail.unwrap_or_default(), 220)),
-                    Style::default().fg(Color::Red),
-                ))));
+                let text = truncate(&item.detail.unwrap_or_default(), 600);
+                if !self.attach_by_id(item.call_id.as_deref(), &text, true) {
+                    self.attach_tool_result(&agent, &name, text, true);
+                }
                 self.last_tool = None;
                 self.follow = true;
             }
@@ -938,57 +1443,79 @@ impl App {
     /// Markdown. Must stay defensive: anything `build_lines()`/`render_md`/
     /// `render_thinking` read has to be reflected here, or the cache goes
     /// stale and the transcript stops updating.
+    /// Hash what `build_block_lines` would render for `blocks`.
+    fn fp_blocks(&self, blocks: &[Block], h: &mut std::collections::hash_map::DefaultHasher) {
+        use std::hash::Hash;
+        for b in blocks {
+            match b {
+                Block::User(t) => {
+                    0u8.hash(h);
+                    t.len().hash(h);
+                }
+                Block::Assistant { agent, md } => {
+                    1u8.hash(h);
+                    agent.len().hash(h);
+                    md.len().hash(h);
+                }
+                Block::Thinking(s) => {
+                    2u8.hash(h);
+                    s.len().hash(h);
+                }
+                Block::Plain(_) => 3u8.hash(h),
+                Block::Tool { name, detail, status, agent, .. } => {
+                    4u8.hash(h);
+                    name.len().hash(h);
+                    detail.len().hash(h);
+                    agent.len().hash(h);
+                    // Only a Running tool's dot animates, so its phase is
+                    // the only thing that can change frame-to-frame.
+                    match status {
+                        ToolStatus::Running => {
+                            5u8.hash(h);
+                            (self.spinner / 3 % 2).hash(h);
+                        }
+                        ToolStatus::Done => 6u8.hash(h),
+                        ToolStatus::Failed => 7u8.hash(h),
+                    }
+                }
+                Block::Rule(l) => {
+                    8u8.hash(h);
+                    l.len().hash(h);
+                }
+                Block::ToolResult { text, failed, .. } => {
+                    10u8.hash(h);
+                    text.len().hash(h);
+                    failed.hash(h);
+                }
+                Block::SubAgent(i) => {
+                    11u8.hash(h);
+                    if let Some(sub) = self.subs.get(*i) {
+                        self.fp_blocks(&sub.blocks, h);
+                        sub.stream.as_ref().map(|s| (s.buf.len(), s.thinking)).hash(h);
+                        if self.sub_busy(sub) {
+                            (self.spinner / 3 % 2).hash(h);
+                            sub.started.elapsed().as_secs().hash(h);
+                        }
+                    }
+                }
+                Block::Todos { agent, items } => {
+                    9u8.hash(h);
+                    agent.len().hash(h);
+                    for t in items {
+                        t.content.len().hash(h);
+                        t.status.hash(h);
+                    }
+                }
+            }
+        }
+    }
+
     fn content_fingerprint(&self, width: u16) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
         // Width changes rewrap the code boxes, so it must bust the cache.
         width.hash(&mut h);
-        for b in &self.blocks {
-            match b {
-                Block::User(t) => {
-                    0u8.hash(&mut h);
-                    t.len().hash(&mut h);
-                }
-                Block::Assistant { agent, md } => {
-                    1u8.hash(&mut h);
-                    agent.len().hash(&mut h);
-                    md.len().hash(&mut h);
-                }
-                Block::Thinking(s) => {
-                    2u8.hash(&mut h);
-                    s.len().hash(&mut h);
-                }
-                Block::Plain(_) => 3u8.hash(&mut h),
-                Block::Tool { name, detail, status, agent } => {
-                    4u8.hash(&mut h);
-                    name.len().hash(&mut h);
-                    detail.len().hash(&mut h);
-                    agent.len().hash(&mut h);
-                    // Only a Running tool's dot animates, so its phase is
-                    // the only thing that can change frame-to-frame.
-                    match status {
-                        ToolStatus::Running => {
-                            5u8.hash(&mut h);
-                            (self.spinner / 3 % 2).hash(&mut h);
-                        }
-                        ToolStatus::Done => 6u8.hash(&mut h),
-                        ToolStatus::Failed => 7u8.hash(&mut h),
-                    }
-                }
-                Block::Rule(l) => {
-                    8u8.hash(&mut h);
-                    l.len().hash(&mut h);
-                }
-                Block::Todos { agent, items } => {
-                    9u8.hash(&mut h);
-                    agent.len().hash(&mut h);
-                    for t in items {
-                        t.content.len().hash(&mut h);
-                        t.status.hash(&mut h);
-                    }
-                }
-            }
-        }
+        self.fp_blocks(&self.blocks, &mut h);
         match &self.stream {
             Some(s) => {
                 1u8.hash(&mut h);
@@ -1005,6 +1532,7 @@ impl App {
             }
             None => 0u8.hash(&mut h),
         }
+        self.live_gen.hash(&mut h);
         self.show_thinking.hash(&mut h);
         self.markdown.hash(&mut h);
         self.show_full_code.hash(&mut h);
@@ -1012,33 +1540,66 @@ impl App {
     }
 
     fn build_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let mut out = self.build_block_lines(&self.blocks, self.stream.as_ref(), width);
+        out.iter_mut().for_each(win_safe_line);
+        // Wrap here (not in the Paragraph) so continuation lines hang under
+        // their text — "⏺ long reply…" continues under the reply, not at col 0.
+        let w = width as usize;
+        out.into_iter().flat_map(|l| wrap_hanging(l, w)).collect()
+    }
+
+    /// Render a block list (the main transcript, or one sub-agent's).
+    fn build_block_lines(&self, blocks: &[Block], stream: Option<&Stream>, width: u16) -> Vec<Line<'static>> {
         let mut out: Vec<Line<'static>> = Vec::new();
         // Track the agent currently "speaking" so we only print the agent
         // header when it changes (not on every segment or after every tool).
         let mut cur_agent: Option<String> = None;
-        for b in &self.blocks {
+        for b in blocks {
             match b {
+                Block::SubAgent(i) => {
+                    cur_agent = None;
+                    if let Some(sub) = self.subs.get(*i) {
+                        self.render_subagent(sub, width, &mut out);
+                    }
+                }
                 Block::User(text) => {
                     cur_agent = None; // next agent reply re-prints its header
                     blank(&mut out);
                     out.push(Line::from(vec![
-                        Span::styled("› ".to_string(), Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
-                        Span::styled(text.clone(), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                        Span::styled("> ".to_string(), Style::default().fg(Color::DarkGray)),
+                        Span::styled(text.clone(), Style::default().fg(Color::Gray)),
                     ]));
                     blank(&mut out);
                 }
                 Block::Assistant { agent, md } => {
-                    if cur_agent.as_deref() != Some(agent.as_str()) {
+                    let first = cur_agent.as_deref() != Some(agent.as_str());
+                    if first {
                         blank(&mut out);
-                        out.push(agent_header(agent));
+                        if !is_main_agent(agent) {
+                            out.push(agent_header(agent));
+                        }
                         cur_agent = Some(agent.clone());
                     }
-                    self.render_md(md, &mut out);
+                    self.render_reply(md, first, &mut out);
                 }
                 Block::Thinking(s) => self.render_thinking(s, &mut out),
-                Block::Plain(l) => out.push(l.clone()),
-                Block::Tool { name, detail, status, agent: _ } => {
-                    // Dot: blinks while running, green when done, red on failure.
+                Block::Plain(l) => {
+                    // A notice between replies: the next reply gets its ⏺ again.
+                    cur_agent = None;
+                    out.push(l.clone());
+                }
+                Block::Tool { name, detail, status, local_id, call_id, .. } => {
+                    // Live tail of a running local command (rendered after the call line).
+                    let live: Vec<String> = if *status == ToolStatus::Running {
+                        [local_id, call_id]
+                            .iter()
+                            .filter_map(|id| id.as_ref().and_then(|i| self.live_tails.get(i)))
+                            .next()
+                            .map(|t| t.iter().cloned().collect())
+                            .unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    };
                     let dot_style = match status {
                         ToolStatus::Running => {
                             // ~3 ticks per state → a calm ≈0.7s blink cycle.
@@ -1055,37 +1616,85 @@ impl App {
                         }
                     };
                     let name_span = Span::styled(
-                        name.clone(),
-                        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                        tool_label(name),
+                        Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
                     );
                     let dot = Span::styled("⏺ ".to_string(), dot_style);
                     let code_style = Style::default().fg(Color::Gray);
                     let dim = Style::default().fg(Color::DarkGray);
 
-                    if crate::pulse::is_verbatim_tool(name) && !detail.trim().is_empty() {
+                    blank(&mut out);
+                    cur_agent = None;
+                    if crate::pulse::is_verbatim_tool(name) && detail.trim().lines().count() > 1 {
                         // Code / shell-command calls render their source in a box:
                         // the tool name on its own line, then up to
                         // CODE_PREVIEW_LINES source lines wrapped INSIDE the box
                         // (never overflowing), in a code-style color, with a
                         // "+N more · ctrl+o" hint in the bottom border. ^O expands.
-                        out.push(Line::from(vec![dot, name_span]));
-                        out.extend(code_box_lines(detail, width, self.show_full_code));
+                        if self.show_full_code {
+                            out.push(Line::from(vec![dot, name_span]));
+                            out.extend(code_box_lines(detail, width, true));
+                        } else {
+                            // Collapsed: "⏺ Run code(first real line" + one more,
+                            // like Claude Code's Bash(…) — never a wall of code.
+                            out.extend(code_call_lines(dot, name_span, detail, width));
+                        }
                     } else {
                         // Other tools: "⏺ name(args)" on one line, args in a
                         // readable gray with dim parens.
                         let mut spans = vec![dot, name_span];
+                        let detail = detail.trim();
                         if !detail.is_empty() {
                             spans.push(Span::styled("(".to_string(), dim));
-                            spans.push(Span::styled(detail.clone(), code_style));
+                            spans.push(Span::styled(truncate(detail, 160), code_style));
                             spans.push(Span::styled(")".to_string(), dim));
                         }
                         out.push(Line::from(spans));
+                    }
+                    for (i, l) in live.iter().enumerate() {
+                        let lead = if i == 0 { "  ⎿  " } else { "     " };
+                        out.push(Line::from(Span::styled(
+                            format!("{lead}{l}"),
+                            Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+                        )));
                     }
                 }
                 Block::Rule(label) => {
                     cur_agent = None;
                     blank(&mut out);
                     out.push(rule_line(label));
+                }
+                Block::ToolResult { text, failed, ms } => {
+                    let style = if *failed {
+                        Style::default().fg(Color::Red)
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    };
+                    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+                    let limit = if self.show_full_code { usize::MAX } else { RESULT_PREVIEW_LINES };
+                    if lines.is_empty() {
+                        out.push(Line::from(Span::styled("  ⎿  (no output)".to_string(), style)));
+                    }
+                    for (i, l) in lines.iter().take(limit).enumerate() {
+                        let lead = if i == 0 { "  ⎿  " } else { "     " };
+                        let mut spans = vec![Span::styled(format!("{lead}{}", truncate(l, 400)), style)];
+                        // How long slow calls took (≥ 5s) — scans, crawls, sub-agents.
+                        if let (0, Some(ms)) = (i, ms) {
+                            if *ms >= 5000 {
+                                spans.push(Span::styled(
+                                    format!("  · {}", fmt_elapsed(std::time::Duration::from_millis(*ms))),
+                                    Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+                                ));
+                            }
+                        }
+                        out.push(Line::from(spans));
+                    }
+                    if lines.len() > limit {
+                        out.push(Line::from(Span::styled(
+                            format!("     … +{} lines (ctrl+o to expand)", lines.len() - limit),
+                            Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+                        )));
+                    }
                 }
                 Block::Todos { agent: _, items } => {
                     cur_agent = None;
@@ -1105,43 +1714,84 @@ impl App {
                 }
             }
         }
-        if let Some(s) = &self.stream {
+        if let Some(s) = stream {
             if s.thinking {
                 if self.show_thinking {
                     self.render_thinking(&s.buf, &mut out);
-                } else {
-                    // Collapsed: animated dot + elapsed time + live token count.
-                    let on = (self.spinner / 3) % 2 == 0;
-                    let dot_style = Style::default()
-                        .fg(if on { Color::Magenta } else { Color::DarkGray })
-                        .add_modifier(Modifier::BOLD);
-                    let text_style = Style::default()
-                        .fg(Color::DarkGray)
-                        .add_modifier(Modifier::ITALIC);
-                    let el = self
-                        .run_started
-                        .map(|t| format!("  {}", fmt_elapsed(t.elapsed())))
-                        .unwrap_or_default();
-                    let tok = if self.run_tokens > 0 {
-                        format!("  {}", fmt_tokens(self.run_tokens))
-                    } else {
-                        String::new()
-                    };
-                    out.push(Line::from(vec![
-                        Span::styled("✻ ", dot_style),
-                        Span::styled(format!("thinking…{el}{tok}"), text_style),
-                    ]));
                 }
+                // Collapsed thinking shows on the activity line instead.
             } else {
-                if cur_agent.as_deref() != Some(s.agent.as_str()) {
+                let first = cur_agent.as_deref() != Some(s.agent.as_str());
+                if first {
                     blank(&mut out);
-                    out.push(agent_header(&s.agent));
+                    if !is_main_agent(&s.agent) {
+                        out.push(agent_header(&s.agent));
+                    }
                 }
-                self.render_md(&s.buf, &mut out);
+                self.render_reply(&s.buf, first, &mut out);
             }
         }
-        out.iter_mut().for_each(win_safe_line);
         out
+    }
+
+    /// Is this sub-agent still doing something we can see?
+    fn sub_busy(&self, sub: &SubAgentRun) -> bool {
+        sub.stream.is_some()
+            || sub.blocks.iter().any(|b| matches!(b, Block::Tool { status: ToolStatus::Running, .. }))
+    }
+
+    /// A sub-agent as one group: its name, its latest tool calls and a status
+    /// line — or (ctrl+o) its whole transcript, indented under the name.
+    fn render_subagent(&self, sub: &SubAgentRun, width: u16, out: &mut Vec<Line<'static>>) {
+        let dim = Style::default().fg(Color::DarkGray);
+        let busy = self.sub_busy(sub);
+        blank(out);
+        let dot = if busy {
+            let on = (self.spinner / 3) % 2 == 0;
+            Style::default().fg(if on { Color::Cyan } else { Color::DarkGray }).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+        };
+        out.push(Line::from(vec![
+            Span::styled("⏺ ", dot),
+            Span::styled(sub.name.clone(), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            Span::styled("  sub-agent", dim),
+        ]));
+        let calls: Vec<String> = sub.blocks.iter().filter_map(|b| match b {
+            Block::Tool { name, detail, .. } => {
+                let d = detail.lines().next().unwrap_or("").trim();
+                Some(if d.is_empty() { tool_label(name) } else { format!("{}({})", tool_label(name), truncate(d, 80)) })
+            }
+            _ => None,
+        }).collect();
+        if self.show_full_code {
+            // Expanded: the sub-agent's own transcript, indented.
+            let inner = self.build_block_lines(&sub.blocks, sub.stream.as_ref(), width.saturating_sub(4));
+            for mut l in inner {
+                l.spans.insert(0, Span::raw("    "));
+                out.push(l);
+            }
+            out.push(Line::default());
+            return;
+        }
+        const SHOW: usize = 3;
+        let skip = calls.len().saturating_sub(SHOW);
+        for (i, c) in calls.iter().skip(skip).enumerate() {
+            let lead = if i == 0 { "  ⎿  " } else { "     " };
+            out.push(Line::from(Span::styled(format!("{lead}{c}"), Style::default().fg(Color::Gray))));
+        }
+        let n = calls.len();
+        let uses = format!("{n} tool use{}", if n == 1 { "" } else { "s" });
+        let lead = if calls.is_empty() { "  ⎿  " } else { "     " };
+        let status = if busy {
+            let el = if sub.replayed { String::new() } else { format!(" · {}", fmt_elapsed(sub.started.elapsed())) };
+            format!("{lead}Working… ({uses}{el}) · ctrl+o to expand")
+        } else {
+            let el = if sub.replayed { String::new() } else { format!(" · {}", fmt_elapsed(sub.last_activity - sub.started)) };
+            let more = if skip > 0 { format!("+{skip} more · ") } else { String::new() };
+            format!("{lead}{more}Done ({uses}{el}) · ctrl+o to expand")
+        };
+        out.push(Line::from(Span::styled(status, dim)));
     }
 
     fn render_md(&self, md: &str, out: &mut Vec<Line<'static>>) {
@@ -1157,6 +1807,25 @@ impl App {
         }
     }
 
+    /// An agent reply: "⏺ " on its first line, the rest indented under it.
+    fn render_reply(&self, md: &str, bullet: bool, out: &mut Vec<Line<'static>>) {
+        let start = out.len();
+        self.render_md(md, out);
+        let mut lead = bullet;
+        for l in out[start..].iter_mut() {
+            if l.spans.iter().all(|s| s.content.trim().is_empty()) {
+                continue; // blank stays blank (keeps paragraph spacing single)
+            }
+            let pre = if lead {
+                Span::styled("⏺ ", Style::default().fg(Color::White))
+            } else {
+                Span::raw("  ")
+            };
+            lead = false;
+            l.spans.insert(0, pre);
+        }
+    }
+
     fn render_thinking(&self, s: &str, out: &mut Vec<Line<'static>>) {
         if !self.show_thinking {
             return;
@@ -1165,7 +1834,7 @@ impl App {
         let body = Style::default()
             .fg(Color::DarkGray)
             .add_modifier(Modifier::BOLD | Modifier::ITALIC);
-        out.push(Line::from(Span::styled("✻ thinking", header)));
+        out.push(Line::from(Span::styled("✦ thinking", header)));
         for l in s.split('\n') {
             out.push(Line::from(Span::styled(format!("  {l}"), body)));
         }
@@ -1177,13 +1846,20 @@ impl App {
         // Input box grows with the wrapped message (borders + content), capped
         // so the transcript, hint and status rows always remain on screen.
         let tw = Self::input_text_width(f.area().width);
-        let cap = f.area().height.saturating_sub(3).max(3);
-        let input_h = (self.input_visual_rows(tw) + 2).clamp(3, cap);
+        let help = if self.show_help { self.help_lines_for(f.area().width) } else { Vec::new() };
+        let footer_h = (help.len() as u16).max(1);
+        let cap = f.area().height.saturating_sub(3 + footer_h).max(3);
+        let rows = match self.pending_choices().len() {
+            0 => self.input_visual_rows(tw),
+            n => n as u16,
+        };
+        let input_h = (rows + 2).clamp(3, cap);
+        let activity_h = if self.activity_line().is_some() { 1 } else { 0 };
         let chunks = Layout::vertical([
             Constraint::Min(1),
+            Constraint::Length(activity_h),
             Constraint::Length(input_h),
-            Constraint::Length(1),
-            Constraint::Length(1),
+            Constraint::Length(footer_h),
         ])
         .split(f.area());
         if self.overlay.is_some() {
@@ -1193,7 +1869,12 @@ impl App {
         } else {
             // Show tasks side panel when there are tasks and the screen is wide enough.
             let body_area = chunks[0];
-            if !self.tasks.is_empty() && body_area.width > 60 {
+            // One task ("Exploring & Planning") is just noise; the panel earns
+            // its space once the agent has a real plan.
+            // …and only while there's work in flight: a finished plan gives the
+            // width back to the transcript.
+            let open = self.running || self.tasks.iter().any(|t| matches!(t.status, TaskStatus::Running | TaskStatus::Created));
+            if self.tasks.len() >= 2 && open && body_area.width > 80 {
                 let panel_w = (body_area.width / 4).clamp(22, 36);
                 let hchunks = Layout::horizontal([
                     Constraint::Min(1),
@@ -1206,16 +1887,24 @@ impl App {
             }
             if self.slash_open() {
                 self.draw_slash_popup(f, chunks[0]);
+            } else if self.mention_open_now() {
+                self.draw_mention_popup(f, chunks[0]);
             }
         }
-        self.draw_input(f, chunks[1]);
-        self.draw_hint(f, chunks[2]);
-        self.draw_status(f, chunks[3]);
+        if let Some(l) = self.activity_line() {
+            f.render_widget(Paragraph::new(l), chunks[1]);
+        }
+        self.draw_input(f, chunks[2]);
+        if self.show_help {
+            f.render_widget(Paragraph::new(help), chunks[3]);
+        } else {
+            self.draw_footer(f, chunks[3]);
+        }
         // Centered animated loader, drawn LAST so it floats on top of the chat
         // UI during an in-chat fetch (overlay open, thread switch, …).
-        if let Some(label) = &self.loading {
-            crate::picker::draw_loader(f, label, self.spinner, self.loading_seed);
-        }
+        // In-chat fetches show on the activity line (see activity_line), not
+        // as a full-screen loader.
+        let _ = self.loading_seed;
     }
 
     fn draw_overlay(&self, f: &mut Frame, area: Rect) {
@@ -1259,27 +1948,19 @@ impl App {
                 width: area.width,
                 height: h,
             };
-            let esc_hint = match o.kind {
-                OverlayKind::Threads => "Esc → workspaces",
-                OverlayKind::Workspaces => "Esc quit",
-                OverlayKind::Models => "Esc close · ^P toggle",
-                _ => "Esc close",
-            };
-            // Show the live search filter (the pickers are type-to-search).
-            let search = if o.filter.is_empty() {
-                if self.overlay_searchable() { " · type to search".to_string() } else { String::new() }
-            } else {
-                format!(" · search: {}", o.filter)
-            };
+            // Keys live in the footer; the title just names the list and
+            // echoes the live filter.
+            let search = if o.filter.is_empty() { String::new() } else { format!(" · “{}”", o.filter) };
             let list = List::new(items)
                 .block(
                     TuiBlock::default()
                         .borders(Borders::ALL)
-                        .title(format!(" {} ({count}) — Enter select · {esc_hint} · ^C quit{search} ", o.title))
-                        .border_style(Style::default().fg(Color::Cyan)),
+                        .border_type(ratatui::widgets::BorderType::Rounded)
+                        .title(format!(" {} ({count}){search} ", o.title))
+                        .border_style(Style::default().fg(Color::DarkGray)),
                 )
-                .highlight_style(Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD))
-                .highlight_symbol("➤ ");
+                .highlight_style(Style::default().fg(Color::White).bg(Color::Rgb(40, 44, 52)).add_modifier(Modifier::BOLD))
+                .highlight_symbol("› ");
             // ASCII banner (+ authenticated line) above the bottom-anchored picker.
             let top_h = area.height.saturating_sub(h);
             if top_h >= 3 {
@@ -1343,6 +2024,7 @@ impl App {
         f.render_widget(panel, area);
     }
 
+    #[allow(dead_code)]
     fn draw_hint(&self, f: &mut Frame, area: Rect) {
         let text = if self.overlay.is_some() {
             let back = match self.overlay_kind() {
@@ -1384,31 +2066,10 @@ impl App {
         let lines = self.lines_cache.clone();
         // Only top + bottom bars (no left/right borders) for a cleaner, wider
         // transcript; horizontal padding keeps text off the edges.
-        let mut block = TuiBlock::default()
-            .borders(Borders::TOP | Borders::BOTTOM)
-            .title(" transcript ")
-            .border_style(Style::default().fg(Color::Cyan))
-            .padding(Padding::new(PAD_X, PAD_X, PAD_Y, PAD_Y));
-        // Top-right: where work runs — workspace · current task.
-        let mut loc: Vec<String> = Vec::new();
-        if let Some(ws) = &self.workspace_name {
-            loc.push(format!("⊞ {}", truncate(ws, 28)));
-        }
-        if let Some(t) = &self.task_label {
-            loc.push(format!("▷ {}", truncate(t, 32)));
-        }
-        if !loc.is_empty() {
-            block = block.title_top(
-                Line::from(Span::styled(
-                    format!(" {} ", loc.join("  ·  ")),
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-                ))
-                .right_aligned(),
-            );
-        }
-        // No side borders → only the horizontal padding eats into the width.
+        // No chrome around the transcript — just padding, like a terminal.
+        let block = TuiBlock::default().padding(Padding::new(PAD_X, PAD_X, PAD_Y, 0));
         let inner_w = area.width.saturating_sub(2 * PAD_X);
-        let inner_h = area.height.saturating_sub(2 + 2 * PAD_Y);
+        let inner_h = area.height.saturating_sub(PAD_Y);
 
         let para = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
         let total = para.line_count(inner_w) as u16;
@@ -1430,12 +2091,53 @@ impl App {
     pub fn input_insert_char(&mut self, c: char) {
         self.input.insert(self.input_cursor, c);
         self.input_cursor += c.len_utf8();
+        if c == '@' {
+            self.mention_sel = 0;
+            let _ = self.mention_open(); // list files on first use
+        }
     }
 
     /// Insert a block of text (e.g. a bracketed paste) at the cursor.
     pub fn input_insert_str(&mut self, s: &str) {
         self.input.insert_str(self.input_cursor, s);
         self.input_cursor += s.len();
+    }
+
+    /// A paste: small ones go in verbatim; big ones become a placeholder so
+    /// the prompt stays readable (expanded by `take_message`).
+    pub fn input_paste(&mut self, s: &str) {
+        let s = s.replace("\r\n", "\n").replace('\r', "\n");
+        let lines = s.lines().count();
+        if lines > 4 || s.len() > 600 {
+            self.pastes.push(s);
+            let tag = format!("[Pasted text #{} +{lines} lines]", self.pastes.len());
+            self.input_insert_str(&tag);
+        } else {
+            self.input_insert_str(&s);
+        }
+        self.end_history_browse();
+    }
+
+    /// The prompt as it should be sent: paste placeholders expanded.
+    pub fn expand_pastes(&self, text: &str) -> String {
+        let mut out = text.to_string();
+        for (i, p) in self.pastes.iter().enumerate() {
+            let n = i + 1;
+            let lines = p.lines().count();
+            out = out.replace(&format!("[Pasted text #{n} +{lines} lines]"), p);
+        }
+        out
+    }
+
+    /// `\` right before the cursor + Enter → replace it with a newline.
+    pub fn input_backslash_newline(&mut self) -> bool {
+        if self.input_cursor > 0 && self.input[..self.input_cursor].ends_with('\\') {
+            self.input.remove(self.input_cursor - 1);
+            self.input_cursor -= 1;
+            self.input_newline();
+            return true;
+        }
+        false
     }
 
     /// Insert a newline (Alt/Shift+Enter) for composing a multiline message.
@@ -1545,6 +2247,7 @@ impl App {
     pub fn input_clear(&mut self) {
         self.input.clear();
         self.input_cursor = 0;
+        self.pastes.clear();
     }
 
     /// Text width available per visual row: terminal width minus the input
@@ -1594,15 +2297,38 @@ impl App {
     }
 
     fn draw_input(&self, f: &mut Frame, area: Rect) {
+        let choices = self.pending_choices();
+        if !choices.is_empty() {
+            let sel = self.pending.as_ref().map(|p| p.sel).unwrap_or(0);
+            let lines: Vec<Line<'static>> = choices.iter().enumerate().map(|(i, c)| {
+                let on = i == sel;
+                let style = if on { Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD) } else { Style::default().fg(Color::Gray) };
+                Line::from(vec![
+                    Span::styled(if on { "❯ " } else { "  " }, style),
+                    Span::styled(format!("{}. {c}", i + 1), style),
+                ])
+            }).collect();
+            let block = TuiBlock::default()
+                .borders(Borders::ALL)
+                .border_type(ratatui::widgets::BorderType::Rounded)
+                .title(format!(" {} ", self.pending_label().unwrap_or_default()))
+                .border_style(Style::default().fg(Color::Cyan))
+                .padding(Padding::horizontal(1));
+            f.render_widget(Paragraph::new(lines).block(block).wrap(Wrap { trim: false }), area);
+            return;
+        }
         let (title, color) = if let Some(label) = self.pending_label() {
-            (format!(" answer: {label} (Enter to submit) "), Color::Cyan)
-        } else if self.running {
-            (" message (Enter send · ^J newline · ^C cancels) ".to_string(), Color::Yellow)
+            (format!(" {label} "), Color::Cyan)
+        } else if self.input.starts_with('/') {
+            (String::new(), Color::Cyan)
+        } else if self.input.starts_with('!') {
+            (" bash ".to_string(), Color::Magenta)
         } else {
-            (" message (Enter send · ^J newline) ".to_string(), Color::Green)
+            (String::new(), Color::DarkGray)
         };
         let block = TuiBlock::default()
             .borders(Borders::ALL)
+            .border_type(ratatui::widgets::BorderType::Rounded)
             .title(title)
             .border_style(Style::default().fg(color))
             .padding(Padding::horizontal(1));
@@ -1616,10 +2342,28 @@ impl App {
             .iter()
             .enumerate()
             .map(|(i, &(s, e))| {
-                let prefix = if i == 0 { "› " } else { "  " };
+                let prefix = if i == 0 { "> " } else { "  " };
                 Line::from(win_safe(&format!("{prefix}{}", &self.input[s..e])).into_owned())
             })
             .collect();
+        // Placeholder on an empty prompt, like a search box.
+        let lines = if self.input.is_empty() && self.pending.is_none() {
+            let tip = if self.running {
+                "Type to queue a follow-up · esc to interrupt"
+            } else {
+                if area.width >= 76 {
+                    "Ask anything — e.g. \"find exposed admin panels on example.com\""
+                } else {
+                    "Ask anything…"
+                }
+            };
+            vec![Line::from(vec![
+                Span::raw("> "),
+                Span::styled(tip, Style::default().fg(Color::DarkGray)),
+            ])]
+        } else {
+            lines
+        };
 
         // Scroll so the cursor's row stays visible when the message is taller
         // than the (capped) box.
@@ -1633,6 +2377,301 @@ impl App {
         f.set_cursor_position(ratatui::layout::Position { x: cx, y: cy });
     }
 
+    /// The line above the prompt while something is in flight:
+    /// "✦ Working… (12s · esc to interrupt)". None when idle.
+    fn activity_line(&self) -> Option<Line<'static>> {
+        let (glyph, glyph_style) = strobie_frame(self.spinner);
+        let (label, extra) = if let Some(msg) = &self.loading {
+            (format!("{msg}…"), String::new())
+        } else if let Some(msg) = &self.busy {
+            (msg.clone(), String::new())
+        } else if self.running {
+            let mut parts: Vec<String> = Vec::new();
+            if let Some(t) = self.run_started {
+                parts.push(fmt_elapsed(t.elapsed()));
+            }
+            if self.run_tokens > 0 {
+                parts.push(format!("↓ {}", fmt_tokens(self.run_tokens)));
+            }
+            if crate::jobs::foreground_running() > 0 {
+                parts.push("ctrl+b to background".into());
+            }
+            parts.push("esc to interrupt".into());
+            // What the agent is doing right now, most specific first.
+            let running_tool = self.blocks.iter().rev().take(3).find_map(|b| match b {
+                Block::Tool { name, status: ToolStatus::Running, .. } => Some(tool_label(name)),
+                _ => None,
+            });
+            let what = if let Some(t) = running_tool {
+                format!("Running {t}…")
+            } else if matches!(&self.stream, Some(s) if s.thinking) {
+                "Thinking…".to_string()
+            } else if self.stream.is_some() {
+                "Writing…".to_string()
+            } else {
+                self.task_label.clone().map(|t| format!("{}…", truncate(&t, 48))).unwrap_or_else(|| "Working…".into())
+            };
+            (what, format!(" ({})", parts.join(" · ")))
+        } else if !self.connected && !self.status.is_empty() && self.status != "connecting…" {
+            return Some(Line::from(Span::styled(
+                format!(" ○ {}", self.status),
+                Style::default().fg(Color::Red),
+            )));
+        } else {
+            return None;
+        };
+        Some(Line::from(vec![
+            Span::styled(format!(" {glyph} "), glyph_style),
+            Span::styled(label, Style::default().fg(STROBES_GREEN)),
+            Span::styled(extra, Style::default().fg(Color::DarkGray)),
+        ]))
+    }
+
+    /// One quiet line under the prompt: a contextual hint on the left, where
+    /// the work runs (workspace · model · usage) on the right.
+    fn draw_footer(&self, f: &mut Frame, area: Rect) {
+        let dim = Style::default().fg(Color::DarkGray);
+        let left = if let Some(a) = self.armed_now() {
+            match a {
+                Armed::Quit => match crate::jobs::background_running() {
+                    0 => "  Press Ctrl-C again to exit".to_string(),
+                    n => format!("  Press Ctrl-C again to exit (stops {n} background job{})", if n == 1 { "" } else { "s" }),
+                },
+                Armed::ClearInput => "  Esc again to clear".to_string(),
+            }
+        } else if self.overlay.is_some() {
+            let search = if self.overlay_searchable() { "type to filter · " } else { "" };
+            let extra = if self.overlay_kind() == Some(OverlayKind::Jobs) { " · x stop · r refresh" } else { "" };
+            format!("  {search}↑↓ select · enter open{extra} · esc back")
+        } else if self.pending.is_some() && !self.pending_choices().is_empty() {
+            "  ↑↓ or 1-9 to choose · enter to confirm · esc to decline".to_string()
+        } else if self.pending.is_some() {
+            let def = self.pending.as_ref().and_then(|p| p.fields.get(p.idx)).and_then(|f| f.default.clone());
+            match def {
+                Some(d) => format!("  type your answer · enter to submit (empty = {}) · esc to decline", d.as_str().map(String::from).unwrap_or_else(|| d.to_string())),
+                None => "  type your answer · enter to submit · esc to decline".to_string(),
+            }
+        } else if self.select_mode {
+            "  select mode — drag to select, ⌘C copies · ctrl+s to exit".to_string()
+        } else if self.slash_open() || self.mention_open_now() {
+            "  ↑↓ select · tab/enter complete · esc cancel".to_string()
+        } else if self.input.starts_with('!') {
+            "  ! bash mode — runs locally in the agent's sandbox, not sent to the agent".to_string()
+        } else if self.input.contains('\n') {
+            "  enter to send · \\+enter newline".to_string()
+        } else if !self.input.is_empty() {
+            "  enter to send · \\+enter newline · ctrl+c clear".to_string()
+        } else {
+            "  ? for shortcuts".to_string()
+        };
+        let mut right: Vec<String> = Vec::new();
+        match &self.workspace_name {
+            Some(ws) => right.push(format!("⊞ {}", truncate(ws, 24))),
+            None => right.push("no workspace".into()),
+        }
+        right.push(match self.current_model {
+            None | Some(0) => "default model".to_string(),
+            m => crate::api::model_name(m).to_string(),
+        });
+        if self.thread_credits > 0.0 {
+            right.push(format!("{:.2} cr", self.thread_credits));
+        }
+        // Like Claude Code: only mention context once it's getting full.
+        if let Some(p) = self.context_pct.filter(|p| *p >= 60.0) {
+            right.insert(0, format!("context {:.0}% used — /new for a fresh chat", p));
+        }
+        // Narrow terminals keep the most useful item only.
+        if area.width < 80 && right.len() > 1 {
+            right.truncate(1);
+        }
+        let mut right = format!("{} ", right.join(" · "));
+        let max_r = (area.width / 2) as usize;
+        if right.chars().count() > max_r {
+            right = format!("{} ", truncate(right.trim_end(), max_r.saturating_sub(2)));
+        }
+        let rw = (right.chars().count() as u16).min(area.width / 2);
+        let parts = Layout::horizontal([Constraint::Min(1), Constraint::Length(rw)]).split(area);
+        let lstyle = if self.armed_now().is_some() { Style::default().fg(Color::Yellow) } else { dim };
+        f.render_widget(Paragraph::new(win_safe(&left).into_owned()).style(lstyle), parts[0]);
+        f.render_widget(
+            Paragraph::new(win_safe(&right).into_owned()).style(dim).alignment(ratatui::layout::Alignment::Right),
+            parts[1],
+        );
+    }
+
+    /// The `?` shortcuts panel (replaces the footer until the next key).
+    fn help_lines(&self) -> Vec<Line<'static>> {
+        self.help_lines_for(u16::MAX)
+    }
+
+    /// The shortcuts table: two columns when it fits, else one.
+    fn help_lines_for(&self, width: u16) -> Vec<Line<'static>> {
+        let rows: [(&str, &str, &str, &str); 10] = [
+            ("/", "commands", "ctrl+p", "model"),
+            ("!", "run a shell command locally", "ctrl+l", "local files"),
+            ("@", "mention a file in this folder", "ctrl+e", "open workspace folder"),
+            ("esc", "interrupt the agent", "ctrl+w", "workspaces"),
+            ("ctrl+c", "clear input · twice to quit", "ctrl+f", "findings"),
+            ("\\ enter", "newline (or ctrl+j)", "ctrl+o", "expand tool output"),
+            ("↑ / ↓", "previous prompts", "ctrl+t", "show thinking"),
+            ("pgup/pgdn", "scroll the chat", "ctrl+y", "copy transcript"),
+            ("ctrl+r", "search prompt history", "ctrl+s", "select mode (copy text)"),
+            ("ctrl+b", "run the current command in background", "/jobs", "background commands"),
+        ];
+        let key = Style::default().fg(Color::White);
+        let dim = Style::default().fg(Color::DarkGray);
+        if width < 80 {
+            return rows
+                .iter()
+                .flat_map(|(k1, d1, k2, d2)| [(*k1, *d1), (*k2, *d2)])
+                .map(|(k, d)| Line::from(vec![Span::styled(format!("  {k:<10}"), key), Span::styled(d.to_string(), dim)]))
+                .collect();
+        }
+        rows.iter()
+            .map(|(k1, d1, k2, d2)| {
+                Line::from(vec![
+                    Span::styled(format!("  {k1:<10}"), key),
+                    Span::styled(format!("{d1:<34}"), dim),
+                    Span::styled(format!("{k2:<8}"), key),
+                    Span::styled(d2.to_string(), dim),
+                ])
+            })
+            .collect()
+    }
+
+    /// Arm a two-press key; the footer shows its hint until it expires.
+    pub fn arm(&mut self, a: Armed) {
+        self.armed = Some((a, std::time::Instant::now()));
+    }
+
+    /// True if `a` was armed within the last two seconds (and disarms it).
+    pub fn take_armed(&mut self, a: Armed) -> bool {
+        let hit = self.armed_now() == Some(a);
+        self.armed = None;
+        hit
+    }
+
+    pub fn disarm(&mut self) {
+        self.armed = None;
+    }
+
+    fn armed_now(&self) -> Option<Armed> {
+        self.armed
+            .filter(|(_, t)| t.elapsed() < std::time::Duration::from_secs(2))
+            .map(|(a, _)| a)
+    }
+
+    /// Record a sent prompt for ↑ recall (and persist it, capped).
+    pub fn remember_prompt(&mut self, text: &str) {
+        self.hist_pos = None;
+        if text.trim().is_empty() || self.history.last().map(|l| l == text).unwrap_or(false) {
+            return;
+        }
+        self.history.push(text.to_string());
+        if self.history.len() > 500 {
+            let cut = self.history.len() - 500;
+            self.history.drain(..cut);
+        }
+        save_prompt_history(&self.history);
+    }
+
+    /// ↑ on an empty (or recalled) prompt: step back through sent prompts.
+    /// Returns false when there's nothing to recall (caller scrolls instead).
+    pub fn history_prev(&mut self) -> bool {
+        if self.history.is_empty() || (self.hist_pos.is_none() && !self.input.is_empty()) {
+            return false;
+        }
+        let idx = match &self.hist_pos {
+            None => {
+                self.hist_pos = Some((self.history.len() - 1, self.input.clone()));
+                self.history.len() - 1
+            }
+            Some((0, _)) => return true,
+            Some((i, d)) => {
+                let i = i - 1;
+                self.hist_pos = Some((i, d.clone()));
+                i
+            }
+        };
+        self.input = self.history[idx].clone();
+        self.input_cursor = self.input.len();
+        true
+    }
+
+    /// ↓ while browsing history: step forward, restoring the draft at the end.
+    pub fn history_next(&mut self) -> bool {
+        let Some((i, draft)) = self.hist_pos.clone() else { return false };
+        if i + 1 >= self.history.len() {
+            self.input = draft;
+            self.hist_pos = None;
+        } else {
+            self.hist_pos = Some((i + 1, draft));
+            self.input = self.history[i + 1].clone();
+        }
+        self.input_cursor = self.input.len();
+        true
+    }
+
+    /// Any edit ends history browsing (the recalled text becomes the draft).
+    pub fn end_history_browse(&mut self) {
+        self.hist_pos = None;
+    }
+
+    /// Print the built-in commands + shortcuts into the transcript (`/help`).
+    pub fn show_help_text(&mut self) {
+        self.flush_stream();
+        let key = Style::default().fg(Color::White);
+        let dim = Style::default().fg(Color::DarkGray);
+        self.blocks.push(Block::Plain(Line::default()));
+        self.blocks.push(Block::Plain(Line::from(Span::styled("Commands", key.add_modifier(Modifier::BOLD)))));
+        for (name, desc) in all_builtin_commands() {
+            self.blocks.push(Block::Plain(Line::from(vec![
+                Span::styled(format!("  /{name:<12}"), key),
+                Span::styled(desc.to_string(), dim),
+            ])));
+        }
+        let skills = self.slash_commands.len();
+        if skills > 0 {
+            self.blocks.push(Block::Plain(Line::from(Span::styled(
+                format!("  …plus {skills} agent skills — type / to browse them"),
+                dim,
+            ))));
+        }
+        self.blocks.push(Block::Plain(Line::default()));
+        self.blocks.push(Block::Plain(Line::from(Span::styled("Shortcuts", key.add_modifier(Modifier::BOLD)))));
+        for l in self.help_lines() {
+            self.blocks.push(Block::Plain(l));
+        }
+        self.follow = true;
+        self.pinned = false;
+    }
+
+    /// `/status`: where this chat runs and what it has used.
+    pub fn show_status_text(&mut self) {
+        self.flush_stream();
+        let key = Style::default().fg(Color::White);
+        let dim = Style::default().fg(Color::DarkGray);
+        let ws = self.workspace_name.clone().unwrap_or_else(|| "(none)".into());
+        let title = if self.title.is_empty() { "(untitled)".into() } else { self.title.clone() };
+        let rows = vec![
+            ("connection", format!("{} {}", if self.connected { "● connected" } else { "○ offline" }, self.base)),
+            ("workspace", ws),
+            ("chat", format!("{title}  ({})", self.thread_id)),
+            ("model", crate::api::model_name(self.current_model).to_string()),
+            ("usage", format!("{:.3} credits · {} this chat", self.thread_credits, fmt_tokens(self.thread_tokens))),
+        ];
+        self.blocks.push(Block::Plain(Line::default()));
+        for (k, v) in rows {
+            self.blocks.push(Block::Plain(Line::from(vec![
+                Span::styled(format!("  {k:<12}"), key),
+                Span::styled(v, dim),
+            ])));
+        }
+        self.follow = true;
+        self.pinned = false;
+    }
+
+    #[allow(dead_code)]
     fn draw_status(&self, f: &mut Frame, area: Rect) {
         let dot = if self.connected { "●" } else { "○" };
         let chat = if self.title.is_empty() {
@@ -1745,7 +2784,6 @@ impl App {
         if messages.is_empty() {
             return;
         }
-        self.rule("history");
         for m in messages {
             if m.text.trim().is_empty() {
                 continue;
@@ -1763,143 +2801,167 @@ impl App {
                 other => self.sys(&format!("· {other}: {}", m.text)),
             }
         }
-        self.rule("live");
         self.follow = true;
     }
 
     /// Seed the transcript from full-fidelity persisted events (ordered by seq):
     /// user/agent messages, tool calls + results, tasks, thinking.
+    /// Replay one persisted event into the current transcript.
+    fn seed_event(&mut self, e: &Value) {
+        let etype = e.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        let p = e.get("payload").cloned().unwrap_or(Value::Null);
+        let pstr = |k: &str| p.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let actor = e.get("actor").and_then(|a| a.as_str()).unwrap_or("");
+        let agent = e.get("agentName").and_then(|a| a.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "Strobes AI Supervisor".into());
+
+        match etype {
+            "message.created" if actor == "user" => {
+                let t = pstr("text");
+                if !t.trim().is_empty() {
+                    self.echo_user(&t);
+                }
+            }
+            "message.segment.completed" => {
+                self.push_assistant(agent, pstr("text"));
+            }
+            "thinking.completed" => {
+                self.push_thinking(pstr("text"));
+            }
+            "tool.start" => {
+                // Historical calls are already complete → Done (green dot);
+                // a following tool.failed downgrades it to Failed. Summarize
+                // the args the same way the live path does (code/command,
+                // not a raw JSON dump).
+                let name = pstr("toolName");
+                if is_silent_tool(&name) {
+                    return;
+                }
+                let args = crate::pulse::tool_detail(&name, p.get("arguments").unwrap_or(&Value::Null));
+                self.flush_stream();
+                // Same wrapper/local pairing as the live path: one call, one line.
+                let dup = self.blocks.iter().rev().take(3).any(|b| matches!(b,
+                    Block::Tool { agent: a, detail: d, .. } if a == &agent && (d == &args || args.trim().is_empty())));
+                let cid = Some(pstr("callId")).filter(|c| !c.is_empty());
+                if let Some(i) = self.tool_by_id(cid.as_deref()) {
+                    self.settle_call_args(i, &args);
+                } else if !dup || cid.is_some() {
+                    self.blocks.push(Block::Tool { name, detail: args, status: ToolStatus::Done, agent: agent.clone(), call_id: cid, local_id: None });
+                }
+            }
+            "tool.output" if is_silent_tool(&pstr("toolName")) => {}
+            "tool.output" => {
+                self.next_result_ms = p.get("durationMs").and_then(|d| d.as_f64().or_else(|| d.as_str().and_then(|s| s.parse().ok()))).map(|v| v as u64);
+                let body = match p.get("result") {
+                    Some(v) => tool_summary(&pstr("toolName"), v).unwrap_or_else(|| concise_result_value(v)),
+                    None => "(ok)".to_string(),
+                };
+                let body = if body.is_empty() { "(ok)".to_string() } else { body };
+                let cid = pstr("callId");
+                if !self.attach_by_id(Some(&cid), &body, false) {
+                    self.push_tool_result(body, false);
+                }
+            }
+            "tool.failed" => {
+                let cid = pstr("callId");
+                if !self.attach_by_id(Some(&cid), &pstr("error"), true) {
+                    self.finish_last_tool(&agent, false);
+                    self.push_tool_result(pstr("error"), true);
+                }
+            }
+            t if t.starts_with("task.") => {
+                let title = pstr("title");
+                let task_id = e.get("taskId").and_then(|v| v.as_str()).map(|s| s.to_string());
+                let hist_status = match t {
+                    "task.started"      => TaskStatus::Running,
+                    "task.completed"    => TaskStatus::Completed,
+                    "task.failed"       => TaskStatus::Failed,
+                    "task.blocked"      => TaskStatus::Blocked,
+                    "task.inconclusive" => TaskStatus::Inconclusive,
+                    _                   => TaskStatus::Created,
+                };
+                // Upsert into the tasks panel.
+                if let Some(ref id) = task_id {
+                    if let Some(existing) = self.tasks.iter_mut().find(|t| &t.id == id) {
+                        existing.status = hist_status;
+                        if !title.trim().is_empty() {
+                            existing.title = title.clone();
+                        }
+                    } else if !title.trim().is_empty() {
+                        self.tasks.push(Task {
+                            id: id.clone(),
+                            title: title.clone(),
+                            status: hist_status,
+                            agent: e.get("agentName").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                        });
+                    }
+                }
+                // Inline marker only for task.created events.
+                if t == "task.created" && !title.trim().is_empty()
+                    && self.last_task.as_deref() != Some(title.as_str())
+                {
+                    self.flush_stream();
+                    self.blocks.push(Block::Plain(Line::from(Span::styled(
+                        format!("◇ {title}"),
+                        Style::default().fg(Color::Yellow).add_modifier(Modifier::DIM),
+                    ))));
+                    self.last_task = Some(title);
+                    self.last_tool = None;
+                }
+            }
+            "plan.updated" => {
+                // Batch task upserts from workspace_add_tasks — panel only, no inline markers.
+                if let Some(tasks) = p.get("tasks").and_then(|t| t.as_array()) {
+                    for task in tasks {
+                        let tid = task.get("id").and_then(|v| v.as_str()).map(|s| s.to_string());
+                        let title = task.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        if title.is_empty() { continue; }
+                        let status_str = task.get("status").and_then(|v| v.as_str()).unwrap_or("pending");
+                        let hist_status = match status_str {
+                            "running"      => TaskStatus::Running,
+                            "completed"    => TaskStatus::Completed,
+                            "failed"       => TaskStatus::Failed,
+                            "blocked"      => TaskStatus::Blocked,
+                            "inconclusive" => TaskStatus::Inconclusive,
+                            _              => TaskStatus::Created,
+                        };
+                        if let Some(ref id) = tid {
+                            if let Some(existing) = self.tasks.iter_mut().find(|t| &t.id == id) {
+                                existing.status = hist_status;
+                                if !title.is_empty() { existing.title = title.clone(); }
+                            } else {
+                                self.tasks.push(Task {
+                                    id: id.clone(),
+                                    title,
+                                    status: hist_status,
+                                    agent: task.get("agentName").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
     pub fn seed_history_events(&mut self, events: Vec<Value>) {
         if events.is_empty() {
             return;
         }
-        self.rule("history");
+        self.replaying = true;
         for e in &events {
-            let etype = e.get("type").and_then(|t| t.as_str()).unwrap_or("");
-            let p = e.get("payload").cloned().unwrap_or(Value::Null);
-            let pstr = |k: &str| p.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let actor = e.get("actor").and_then(|a| a.as_str()).unwrap_or("");
-            let agent = e.get("agentName").and_then(|a| a.as_str())
-                .filter(|s| !s.is_empty())
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| "Strobes AI Supervisor".into());
-
-            match etype {
-                "message.created" if actor == "user" => {
-                    let t = pstr("text");
-                    if !t.trim().is_empty() {
-                        self.echo_user(&t);
-                    }
-                }
-                "message.segment.completed" => {
-                    self.push_assistant(agent, pstr("text"));
-                }
-                "thinking.completed" => {
-                    self.push_thinking(pstr("text"));
-                }
-                "tool.start" => {
-                    // Historical calls are already complete → Done (green dot);
-                    // a following tool.failed downgrades it to Failed. Summarize
-                    // the args the same way the live path does (code/command,
-                    // not a raw JSON dump).
-                    let name = pstr("toolName");
-                    let args = crate::pulse::tool_detail(&name, p.get("arguments").unwrap_or(&Value::Null));
-                    self.flush_stream();
-                    self.blocks.push(Block::Tool { name, detail: args, status: ToolStatus::Done, agent: agent.clone() });
-                }
-                "tool.output" => {
-                    let dur = p.get("durationMs").and_then(|d| d.as_i64())
-                        .map(|d| format!("  ·{d}ms")).unwrap_or_default();
-                    let body = match p.get("result") {
-                        Some(v) => concise_result_value(v),
-                        None => "(ok)".to_string(),
-                    };
-                    let body = if body.is_empty() { "(ok)".to_string() } else { body };
-                    self.push(Line::from(Span::styled(
-                        format!("  ⎿ {body}{dur}"), Style::default().fg(Color::DarkGray))));
-                }
-                "tool.failed" => {
-                    self.finish_last_tool(&agent, false);
-                    self.push(Line::from(Span::styled(
-                        format!("  ⎿ ✗ {}", pstr("error")),
-                        Style::default().fg(Color::Red))));
-                }
-                t if t.starts_with("task.") => {
-                    let title = pstr("title");
-                    let task_id = e.get("taskId").and_then(|v| v.as_str()).map(|s| s.to_string());
-                    let hist_status = match t {
-                        "task.started"      => TaskStatus::Running,
-                        "task.completed"    => TaskStatus::Completed,
-                        "task.failed"       => TaskStatus::Failed,
-                        "task.blocked"      => TaskStatus::Blocked,
-                        "task.inconclusive" => TaskStatus::Inconclusive,
-                        _                   => TaskStatus::Created,
-                    };
-                    // Upsert into the tasks panel.
-                    if let Some(ref id) = task_id {
-                        if let Some(existing) = self.tasks.iter_mut().find(|t| &t.id == id) {
-                            existing.status = hist_status;
-                            if !title.trim().is_empty() {
-                                existing.title = title.clone();
-                            }
-                        } else if !title.trim().is_empty() {
-                            self.tasks.push(Task {
-                                id: id.clone(),
-                                title: title.clone(),
-                                status: hist_status,
-                                agent: e.get("agentName").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                            });
-                        }
-                    }
-                    // Inline marker only for task.created events.
-                    if t == "task.created" && !title.trim().is_empty()
-                        && self.last_task.as_deref() != Some(title.as_str())
-                    {
-                        self.flush_stream();
-                        self.blocks.push(Block::Plain(Line::from(Span::styled(
-                            format!("◇ {title}"),
-                            Style::default().fg(Color::Yellow).add_modifier(Modifier::DIM),
-                        ))));
-                        self.last_task = Some(title);
-                        self.last_tool = None;
-                    }
-                }
-                "plan.updated" => {
-                    // Batch task upserts from workspace_add_tasks — panel only, no inline markers.
-                    if let Some(tasks) = p.get("tasks").and_then(|t| t.as_array()) {
-                        for task in tasks {
-                            let tid = task.get("id").and_then(|v| v.as_str()).map(|s| s.to_string());
-                            let title = task.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                            if title.is_empty() { continue; }
-                            let status_str = task.get("status").and_then(|v| v.as_str()).unwrap_or("pending");
-                            let hist_status = match status_str {
-                                "running"      => TaskStatus::Running,
-                                "completed"    => TaskStatus::Completed,
-                                "failed"       => TaskStatus::Failed,
-                                "blocked"      => TaskStatus::Blocked,
-                                "inconclusive" => TaskStatus::Inconclusive,
-                                _              => TaskStatus::Created,
-                            };
-                            if let Some(ref id) = tid {
-                                if let Some(existing) = self.tasks.iter_mut().find(|t| &t.id == id) {
-                                    existing.status = hist_status;
-                                    if !title.is_empty() { existing.title = title.clone(); }
-                                } else {
-                                    self.tasks.push(Task {
-                                        id: id.clone(),
-                                        title,
-                                        status: hist_status,
-                                        agent: task.get("agentName").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                                    });
-                                }
-                            }
-                        }
-                    }
-                }
-                _ => {}
+            let agent = e.get("agentName").and_then(|a| a.as_str()).unwrap_or("").to_string();
+            if is_main_agent(&agent) {
+                self.seed_event(e);
+            } else {
+                self.in_agent_ctx(&agent, |s| s.seed_event(e));
             }
         }
-        self.rule("live");
+        self.flush_subagents();
+        self.replaying = false;
         self.follow = true;
     }
 
@@ -1947,8 +3009,87 @@ impl App {
     pub fn overlay_searchable(&self) -> bool {
         matches!(
             self.overlay.as_ref().map(|o| o.kind),
-            Some(OverlayKind::Threads) | Some(OverlayKind::Workspaces) | Some(OverlayKind::Models)
+            Some(OverlayKind::Threads) | Some(OverlayKind::Workspaces) | Some(OverlayKind::Models) | Some(OverlayKind::History)
         )
+    }
+
+    /// The selected overlay row's action id.
+    pub fn overlay_current_action(&self) -> Option<String> {
+        let o = self.overlay.as_ref()?;
+        let i = o.current()?;
+        o.items.get(i).and_then(|it| it.action.clone())
+    }
+
+    /// /jobs: local commands (newest first) with status and log tail.
+    pub fn open_jobs(&mut self) {
+        let jobs = crate::jobs::list();
+        if jobs.is_empty() {
+            self.notice("no local commands yet — press ctrl+b while one runs to move it to the background");
+            return;
+        }
+        let items: Vec<OverlayItem> = jobs
+            .iter()
+            .map(|j| {
+                let el = fmt_elapsed(j.finished.unwrap_or_else(std::time::Instant::now) - j.started);
+                let state = if j.running() {
+                    if j.background { format!("⟳ background {el}") } else { format!("⟳ running {el}") }
+                } else if j.stopped {
+                    format!("✗ stopped · {el}")
+                } else {
+                    let bg = if j.background { " (background)" } else { "" };
+                    match j.exit {
+                        Some(0) => format!("✓ done{bg} · {el}"),
+                        Some(c) => format!("✗ exit {c}{bg} · {el}"),
+                        None => format!("done{bg} · {el}"),
+                    }
+                };
+                let cmd = if j.command.is_empty() { "(command)".to_string() } else { j.command.clone() };
+                let mut detail = vec![cmd.clone(), state.clone()];
+                if let Some(log) = &j.log {
+                    detail.push(format!("log: {}", log.display()));
+                    detail.push(String::new());
+                    detail.extend(crate::jobs::tail(j.id, 60));
+                } else if j.running() {
+                    detail.push(String::new());
+                    detail.push("Running in the foreground — the agent is waiting on it. ctrl+b moves it to the background.".into());
+                }
+                if j.running() {
+                    detail.push(String::new());
+                    detail.push("x stops it".into());
+                }
+                OverlayItem { label: format!("#{}  {state}   {}", j.id, truncate(&cmd, 80)), detail, action: Some(j.id.to_string()) }
+            })
+            .collect();
+        self.open_overlay(OverlayKind::Jobs, "Local commands".into(), items);
+    }
+
+    /// Ctrl-R: a searchable list of sent prompts, newest first.
+    pub fn open_history_search(&mut self) {
+        let mut seen = std::collections::HashSet::new();
+        let items: Vec<OverlayItem> = self
+            .history
+            .iter()
+            .rev()
+            .filter(|h| seen.insert(h.as_str()))
+            .take(300)
+            .map(|h| OverlayItem {
+                label: truncate(&h.replace('\n', " ⏎ "), 160),
+                detail: vec![h.clone()],
+                action: Some(h.clone()),
+            })
+            .collect();
+        if items.is_empty() {
+            self.notice("no previous prompts yet");
+            return;
+        }
+        self.open_overlay(OverlayKind::History, "Search prompt history".into(), items);
+    }
+
+    /// Put a recalled prompt in the input, ready to edit or send.
+    pub fn set_input(&mut self, text: &str) {
+        self.input = text.to_string();
+        self.input_cursor = self.input.len();
+        self.hist_pos = None;
     }
 
     pub fn overlay_active(&self) -> bool {
@@ -1968,10 +3109,23 @@ impl App {
     }
 
     pub fn set_title(&mut self, title: String) {
+        let generic = title.is_empty() || title == "CLI session" || title == "Chat with Strobes AI";
+        let first_ask = self.blocks.iter().find_map(|b| match b {
+            Block::User(t) => Some(t.lines().next().unwrap_or("").to_string()),
+            _ => None,
+        });
+        match (generic, first_ask) {
+            (true, Some(ask)) => set_terminal_title(&ask),
+            _ => set_terminal_title(&title),
+        }
         self.title = title;
     }
 
     /// Name of the bound workspace (shown top-right in the transcript).
+    pub fn workspace_label(&self) -> Option<String> {
+        self.workspace_name.clone()
+    }
+
     pub fn set_workspace_name(&mut self, name: String) {
         self.workspace_name = if name.is_empty() { None } else { Some(name) };
     }
@@ -1998,10 +3152,19 @@ impl App {
     }
 
     /// Plain-text dump of the whole conversation (for ^Y → clipboard).
-    pub fn transcript_plaintext(&self) -> String {
-        let mut out = String::new();
-        for b in &self.blocks {
+    fn plain_blocks(&self, blocks: &[Block], out: &mut String) {
+        for b in blocks {
             match b {
+                Block::SubAgent(i) => {
+                    if let Some(sub) = self.subs.get(*i) {
+                        out.push_str(&format!("⏺ {} (sub-agent)\n", sub.name));
+                        let mut inner = String::new();
+                        self.plain_blocks(&sub.blocks, &mut inner);
+                        for l in inner.lines() {
+                            out.push_str(&format!("    {l}\n"));
+                        }
+                    }
+                }
                 Block::User(t) => out.push_str(&format!("You: {t}\n")),
                 Block::Assistant { agent, md } => out.push_str(&format!("{agent}: {md}\n")),
                 Block::Thinking(t) => out.push_str(&format!("[thinking] {t}\n")),
@@ -2019,6 +3182,7 @@ impl App {
                     }
                 }
                 Block::Rule(t) => out.push_str(&format!("{t}\n")),
+                Block::ToolResult { text, .. } => out.push_str(&format!("  ⎿ {text}\n")),
                 Block::Todos { agent: _, items } => {
                     for t in items {
                         let mark = match t.status.as_str() {
@@ -2031,6 +3195,11 @@ impl App {
                 }
             }
         }
+    }
+
+    pub fn transcript_plaintext(&self) -> String {
+        let mut out = String::new();
+        self.plain_blocks(&self.blocks, &mut out);
         if let Some(s) = &self.stream {
             out.push_str(&s.buf);
             out.push('\n');
@@ -2038,10 +3207,112 @@ impl App {
         out
     }
 
+    // ---- @ file mentions -----------------------------------------------
+
+    /// The `@query` word the cursor is at the end of, if any.
+    fn mention_query(&self) -> Option<(usize, &str)> {
+        let before = &self.input[..self.input_cursor];
+        let start = before.rfind(|c: char| c.is_whitespace()).map(|i| i + 1).unwrap_or(0);
+        let word = &before[start..];
+        let q = word.strip_prefix('@')?;
+        // "@" inside an email-ish word isn't a mention.
+        if start > 0 && !before[..start].ends_with(char::is_whitespace) {
+            return None;
+        }
+        Some((start, q))
+    }
+
+    fn mention_matches(&self) -> Vec<String> {
+        let Some((_, q)) = self.mention_query() else { return Vec::new() };
+        let Some(files) = &self.mention_files else { return Vec::new() };
+        let q = q.to_lowercase();
+        // Filename hits rank above path hits; shorter paths first.
+        let mut hits: Vec<(u8, &String)> = files
+            .iter()
+            .filter_map(|f| {
+                let lf = f.to_lowercase();
+                let name = lf.rsplit('/').next().unwrap_or(&lf);
+                if q.is_empty() || name.starts_with(&q) {
+                    Some((0, f))
+                } else if name.contains(&q) {
+                    Some((1, f))
+                } else if lf.contains(&q) {
+                    Some((2, f))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        hits.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.len().cmp(&b.1.len())));
+        hits.into_iter().take(8).map(|(_, f)| f.clone()).collect()
+    }
+
+    /// True while an `@` completion menu should show (loads the file list
+    /// on first use).
+    pub fn mention_open(&mut self) -> bool {
+        if self.mention_query().is_none() || self.pending.is_some() {
+            return false;
+        }
+        if self.mention_files.is_none() {
+            self.mention_files = Some(list_mention_files());
+        }
+        !self.mention_matches().is_empty()
+    }
+
+    fn mention_open_now(&self) -> bool {
+        self.mention_query().is_some() && self.pending.is_none() && !self.mention_matches().is_empty()
+    }
+
+    pub fn mention_move(&mut self, up: bool) {
+        let n = self.mention_matches().len();
+        if n > 0 {
+            self.mention_sel = if up { (self.mention_sel + n - 1) % n } else { (self.mention_sel + 1) % n };
+        }
+    }
+
+    /// Replace the `@query` word with the chosen file's path (absolute, so the
+    /// agent's local tools can open it from any working directory).
+    pub fn mention_complete(&mut self) {
+        let m = self.mention_matches();
+        let Some(pick) = m.get(self.mention_sel.min(m.len().saturating_sub(1))).cloned() else { return };
+        let Some((start, _)) = self.mention_query() else { return };
+        let abs = std::env::current_dir().map(|d| d.join(&pick)).unwrap_or_else(|_| pick.clone().into());
+        let rep = format!("@{} ", abs.display());
+        self.input.replace_range(start..self.input_cursor, &rep);
+        self.input_cursor = start + rep.len();
+        self.mention_sel = 0;
+    }
+
+    fn draw_mention_popup(&self, f: &mut Frame, above: Rect) {
+        let m = self.mention_matches();
+        if m.is_empty() {
+            return;
+        }
+        let h = (m.len() as u16 + 2).min(above.height);
+        let area = Rect { x: above.x, y: above.y + above.height.saturating_sub(h), width: above.width, height: h };
+        let sel = self.mention_sel.min(m.len() - 1);
+        let items: Vec<ListItem> = m.iter().map(|p| ListItem::new(Line::from(Span::styled(p.clone(), Style::default().fg(Color::Gray))))).collect();
+        let mut state = ListState::default();
+        state.select(Some(sel));
+        let list = List::new(items)
+            .block(TuiBlock::default().borders(Borders::ALL)
+                .border_type(ratatui::widgets::BorderType::Rounded)
+                .border_style(Style::default().fg(Color::DarkGray)))
+            .highlight_style(Style::default().fg(Color::White).bg(Color::Rgb(40, 44, 52)).add_modifier(Modifier::BOLD))
+            .highlight_symbol("› ");
+        f.render_widget(ratatui::widgets::Clear, area);
+        f.render_stateful_widget(list, area, &mut state);
+    }
+
     // ---- slash-command autocomplete -----------------------------------
 
     pub fn set_slash_commands(&mut self, cmds: Vec<crate::api::SlashCmd>) {
-        self.slash_commands = cmds;
+        // Built-ins first; a server command can't shadow one.
+        let mut all: Vec<crate::api::SlashCmd> = all_builtin_commands()
+            .map(|(n, d)| crate::api::SlashCmd { name: n.to_string(), description: d.to_string(), argument_hint: String::new() })
+            .collect();
+        all.extend(cmds.into_iter().filter(|c| builtin_command(&c.name).is_none()));
+        self.slash_commands = all;
     }
 
     /// The command-name prefix being typed (input is "/name…" with no space yet).
@@ -2110,19 +3381,18 @@ impl App {
             let c = &self.slash_commands[i];
             let hint = if c.argument_hint.is_empty() { String::new() } else { format!(" {}", c.argument_hint) };
             ListItem::new(Line::from(vec![
-                Span::styled(format!("/{}", c.name), Style::default().fg(Color::Cyan)),
-                Span::styled(hint, Style::default().fg(Color::DarkGray)),
-                Span::styled(format!("  {}", truncate(&c.description, 60)), Style::default().fg(Color::Gray)),
+                Span::styled(format!("/{:<22}", format!("{}{hint}", c.name)), Style::default().fg(Color::Cyan)),
+                Span::styled(format!("  {}", truncate(&c.description, 70)), Style::default().fg(Color::DarkGray)),
             ]))
         }).collect();
         let mut state = ListState::default();
         state.select(Some(sel.min(shown.saturating_sub(1))));
         let list = List::new(items)
             .block(TuiBlock::default().borders(Borders::ALL)
-                .title(format!(" /commands ({}) — Tab complete · Esc cancel ", matches.len()))
-                .border_style(Style::default().fg(Color::Cyan)))
-            .highlight_style(Style::default().fg(Color::Black).bg(Color::Cyan))
-            .highlight_symbol("➤ ");
+                .border_type(ratatui::widgets::BorderType::Rounded)
+                .border_style(Style::default().fg(Color::DarkGray)))
+            .highlight_style(Style::default().fg(Color::White).bg(Color::Rgb(40, 44, 52)).add_modifier(Modifier::BOLD))
+            .highlight_symbol("› ");
         f.render_widget(ratatui::widgets::Clear, area);
         let mut s = state;
         f.render_stateful_widget(list, area, &mut s);
@@ -2162,10 +3432,11 @@ impl App {
 
     /// A non-error informational line (workspace bound, hints, etc.).
     pub fn notice(&mut self, text: &str) {
-        self.push(Line::from(Span::styled(
-            format!("  · {text}"),
-            Style::default().fg(Color::Cyan),
-        )));
+        for (i, l) in text.lines().enumerate() {
+            let lead = if i == 0 { "  · " } else { "    " };
+            let style = if i == 0 { Style::default().fg(Color::Cyan) } else { Style::default().fg(Color::DarkGray) };
+            self.push(Line::from(Span::styled(format!("{lead}{l}"), style)));
+        }
     }
 
     /// Duration (seconds) the most recently finished run took, if known —
@@ -2201,12 +3472,12 @@ impl App {
     pub fn overlay_enter(&mut self) -> Option<(OverlayKind, String)> {
         let o = self.overlay.as_mut()?;
         match o.kind {
-            OverlayKind::Findings | OverlayKind::Approvals | OverlayKind::Files => {
+            OverlayKind::Findings | OverlayKind::Approvals | OverlayKind::Files | OverlayKind::Jobs => {
                 o.detail_open = !o.detail_open;
                 o.dscroll = 0;
                 None
             }
-            OverlayKind::Threads | OverlayKind::Workspaces | OverlayKind::Models => {
+            OverlayKind::Threads | OverlayKind::Workspaces | OverlayKind::Models | OverlayKind::History => {
                 let idx = o.current()?;
                 o.items.get(idx).and_then(|it| it.action.clone()).map(|a| (o.kind, a))
             }
@@ -2244,11 +3515,19 @@ impl App {
         self.task_label = None;
         self.thread_credits = 0.0;
         self.thread_tokens = 0;
+        self.context_pct = None;
+        self.subs.clear();
         self.tasks.clear();
+        set_terminal_title("");
         self.push_banner();
     }
 
     pub fn echo_user(&mut self, text: &str) {
+        // Generic thread titles say nothing; name the tab after the first ask.
+        let generic = self.title.is_empty() || self.title == "CLI session" || self.title == "Chat with Strobes AI";
+        if generic && !self.blocks.iter().any(|b| matches!(b, Block::User(_))) {
+            set_terminal_title(text.lines().next().unwrap_or(""));
+        }
         self.flush_stream();
         self.blocks.push(Block::User(text.to_string()));
         self.last_task = None;
@@ -2257,9 +3536,218 @@ impl App {
         self.follow = true;
         self.pinned = false;
         // Start the turn's elapsed timer at send (covers the wait before the
-        // server's run.started arrives).
-        self.run_started = Some(std::time::Instant::now());
+        // server's run.started arrives) — but a follow-up queued mid-turn
+        // doesn't restart the running clock.
+        if !self.running || self.run_started.is_none() {
+            self.run_started = Some(std::time::Instant::now());
+        }
         self.last_elapsed = None;
+    }
+
+    /// "⎿ Interrupted · …" — once per interrupt.
+    fn push_interrupted(&mut self) {
+        let already = matches!(self.blocks.last(), Some(Block::Plain(l))
+            if l.spans.iter().any(|s| s.content.contains("Interrupted")));
+        if !already {
+            self.blocks.push(Block::Plain(Line::from(Span::styled(
+                "  ⎿  Interrupted · what should the agent do instead?".to_string(),
+                Style::default().fg(Color::Red),
+            ))));
+        }
+        self.follow = true;
+    }
+
+    /// True when nobody has written in this chat yet (so `/new` can reuse it).
+    pub fn chat_is_empty(&self) -> bool {
+        !self.running && !self.blocks.iter().any(|b| matches!(b, Block::User(_) | Block::Assistant { .. }))
+    }
+
+    /// `!cmd` bash mode: show the command as a running call.
+    pub fn bash_started(&mut self, cmd: &str) -> String {
+        self.flush_stream();
+        self.bash_seq += 1;
+        let id = format!("__bash__{}", self.bash_seq);
+        self.blocks.push(Block::Tool {
+            name: "__bash__".into(),
+            detail: cmd.to_string(),
+            status: ToolStatus::Running,
+            agent: "__user__".into(),
+            call_id: Some(id.clone()),
+            local_id: None,
+        });
+        self.follow = true;
+        self.pinned = false;
+        id
+    }
+
+    /// `!cmd` finished: settle the call and show its output.
+    pub fn bash_done(&mut self, id: &str, output: String, ok: bool) {
+        let text = if output.trim().is_empty() { "(no output)".to_string() } else { output };
+        if !self.attach_by_id(Some(id), &text, !ok) {
+            let ms = self.next_result_ms.take();
+            self.blocks.push(Block::ToolResult { text, failed: !ok, ms });
+        }
+        self.follow = true;
+    }
+
+    /// The call an event's id refers to (server call id or local request id).
+    fn tool_by_id(&self, id: Option<&str>) -> Option<usize> {
+        let id = id.filter(|s| !s.is_empty())?;
+        let lo = self.blocks.len().saturating_sub(200);
+        (lo..self.blocks.len()).rev().find(|&i| matches!(&self.blocks[i],
+            Block::Tool { call_id, local_id, .. }
+                if call_id.as_deref() == Some(id) || local_id.as_deref() == Some(id)))
+    }
+
+    /// A known call announced its real args. Fill them in; if a local
+    /// execution with *those* args was paired with a different parallel call,
+    /// swap the two calls' server ids so each result lands where it belongs.
+    fn settle_call_args(&mut self, i: usize, args: &str) {
+        let args = args.trim();
+        if args.is_empty() {
+            return;
+        }
+        let (cur, label, agent) = match &self.blocks[i] {
+            Block::Tool { detail, name, agent, .. } => (detail.trim().to_string(), tool_label(name), agent.clone()),
+            _ => return,
+        };
+        if cur.is_empty() {
+            if let Block::Tool { detail, .. } = &mut self.blocks[i] {
+                *detail = args.to_string();
+            }
+            return;
+        }
+        if cur == args {
+            return;
+        }
+        let lo = self.blocks.len().saturating_sub(40);
+        let other = (lo..self.blocks.len()).find(|&j| j != i && matches!(&self.blocks[j],
+            Block::Tool { detail, name, agent: a, .. }
+                if detail.trim() == args && tool_label(name) == label && a == &agent));
+        if let Some(j) = other {
+            let ci = match &self.blocks[i] { Block::Tool { call_id, .. } => call_id.clone(), _ => None };
+            let cj = match &self.blocks[j] { Block::Tool { call_id, .. } => call_id.clone(), _ => None };
+            if let Block::Tool { call_id, .. } = &mut self.blocks[i] { *call_id = cj; }
+            if let Block::Tool { call_id, .. } = &mut self.blocks[j] { *call_id = ci; }
+        }
+    }
+
+    /// Put a result under the call with this id. False if no call has it.
+    fn attach_by_id(&mut self, id: Option<&str>, text: &str, failed: bool) -> bool {
+        let text = &humanize_job_note(text);
+        let Some(i) = self.tool_by_id(id) else { return false };
+        if let Block::Tool { local_id, call_id, .. } = &self.blocks[i] {
+            for k in [local_id, call_id].into_iter().flatten() {
+                self.live_tails.remove(k);
+            }
+        }
+        if let Block::Tool { status, .. } = &mut self.blocks[i] {
+            if *status == ToolStatus::Running || failed {
+                *status = if failed { ToolStatus::Failed } else { ToolStatus::Done };
+            }
+        }
+        // One result per call: the wrapper and its local mirror both report.
+        if !matches!(self.blocks.get(i + 1), Some(Block::ToolResult { .. })) {
+            let ms = self.next_result_ms.take();
+            self.blocks.insert(i + 1, Block::ToolResult { text: text.to_string(), failed, ms });
+        }
+        self.follow = true;
+        true
+    }
+
+    /// Index of an on-screen call that a new tool start belongs to, if any.
+    fn match_tool_start(&self, agent: &str, name: &str, detail: &str, local: bool) -> Option<usize> {
+        let label = tool_label(name);
+        let lo = self.blocks.len().saturating_sub(40);
+        let same = |n: &str| n == name || tool_label(n) == label;
+        // Oldest first, so parallel calls of one tool fill in order.
+        let running = (lo..self.blocks.len()).find(|&i| matches!(&self.blocks[i],
+            Block::Tool { status: ToolStatus::Running, agent: a, name: n, detail: d, local_id: l, call_id: c, .. }
+                if a == agent && same(n)
+                    && (if local { l.is_none() } else { c.is_none() })
+                    && (d.trim().is_empty() || (local && d.trim() == detail.trim()) || (local && detail.trim().is_empty()))));
+        if running.is_some() {
+            return running;
+        }
+        if local {
+            // A local execution whose wrapper already has its args.
+            return (lo..self.blocks.len()).find(|&i| matches!(&self.blocks[i],
+                Block::Tool { status: ToolStatus::Running, agent: a, name: n, local_id: None, .. } if a == agent && same(n)));
+        }
+        // The local execution can be announced before its wrapper: a wrapper
+        // start then belongs to a local-only call with the same (or no) args,
+        // as long as nobody has spoken since.
+        let mut orphan = None;
+        for i in (lo..self.blocks.len()).rev() {
+            match &self.blocks[i] {
+                Block::User(_) | Block::Assistant { .. } => break,
+                Block::Tool { agent: a, name: n, detail: d, call_id: None, local_id: Some(_), .. }
+                    if a == agent && same(n) && (detail.trim().is_empty() || d.trim() == detail.trim()) => orphan = Some(i),
+                _ => {}
+            }
+        }
+        if orphan.is_some() {
+            return orphan;
+        }
+        // Re-announce of a finished call: same tool and args, and nobody has
+        // spoken since.
+        for i in (lo..self.blocks.len()).rev() {
+            match &self.blocks[i] {
+                Block::User(_) | Block::Assistant { .. } => return None,
+                Block::Tool { agent: a, name: n, detail: d, status, .. }
+                    if *status != ToolStatus::Running && a == agent && same(n)
+                        && (d.trim() == detail.trim() || detail.trim().is_empty()) => return Some(i),
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// Put a result under the call it answers (oldest running call of that
+    /// tool from that agent) and settle its dot; a duplicate report of the
+    /// same output (wrapper + local mirror) is dropped.
+    fn attach_tool_result(&mut self, agent: &str, name: &str, text: String, failed: bool) {
+        let text = humanize_job_note(&text);
+        let label = tool_label(name);
+        let lo = self.blocks.len().saturating_sub(40);
+        let target = (lo..self.blocks.len()).find(|&i| matches!(&self.blocks[i],
+            Block::Tool { status: ToolStatus::Running, agent: a, name: n, .. }
+                if a == agent && (n == name || tool_label(n) == label)))
+;
+        let Some(i) = target else {
+            // No call waiting: this is the second report of a finished call
+            // (wrapper + its local mirror) if that call already shows it.
+            let shown = (lo..self.blocks.len()).rev().any(|i| matches!(&self.blocks[i],
+                Block::Tool { agent: a, name: n, .. } if a == agent && tool_label(n) == label)
+                && matches!(self.blocks.get(i + 1), Some(Block::ToolResult { text: t, .. }) if t.trim() == text.trim()));
+            if !shown {
+                self.push_tool_result(text, failed);
+            }
+            return;
+        };
+        if let Block::Tool { status, .. } = &mut self.blocks[i] {
+            *status = if failed { ToolStatus::Failed } else { ToolStatus::Done };
+        }
+        let dup = matches!(self.blocks.get(i + 1), Some(Block::ToolResult { text: t, .. }) if t.trim() == text.trim());
+        if !dup {
+            let ms = self.next_result_ms.take();
+            self.blocks.insert(i + 1, Block::ToolResult { text, failed, ms });
+        }
+        self.follow = true;
+    }
+
+    /// Attach a tool's result under its call. The wrapper tool and the local
+    /// execution it drives both report the same output; show it once.
+    fn push_tool_result(&mut self, text: String, failed: bool) {
+        let text = humanize_job_note(&text);
+        // Only a report repeated back-to-back is a duplicate; another call
+        // that happens to return the same text keeps its own result.
+        let dup = matches!(self.blocks.last(), Some(Block::ToolResult { text: t, .. }) if t.trim() == text.trim());
+        if !dup {
+            let ms = self.next_result_ms.take();
+            self.blocks.push(Block::ToolResult { text, failed, ms });
+        }
+        self.follow = true;
     }
 
     /// Push a dim labelled separator (run boundaries, history/live markers).
@@ -2272,10 +3760,295 @@ impl App {
     }
 }
 
+/// (label, value) choices a field offers: its options, or Yes/No for a checkbox.
+fn field_choices(f: &Field) -> Vec<(String, Value)> {
+    if !f.options.is_empty() {
+        return f.options.clone();
+    }
+    if matches!(f.ftype.as_str(), "checkbox" | "boolean" | "bool" | "confirm") {
+        return vec![("Yes".into(), Value::Bool(true)), ("No".into(), Value::Bool(false))];
+    }
+    Vec::new()
+}
+
+/// The option to highlight first: the field's default, else the first.
+fn default_choice(p: &Pending) -> usize {
+    let Some(f) = p.fields.get(p.idx) else { return 0 };
+    let Some(d) = &f.default else { return 0 };
+    field_choices(f).iter().position(|(_, v)| v == d).unwrap_or(0)
+}
+
+/// Columns a wrapped line's continuation should be indented by: its leading
+/// whitespace plus a leading marker ("⏺ ", "⎿  ", "> ", "• ", "1. ", …).
+fn hang_indent(text: &str) -> usize {
+    let ws = text.chars().take_while(|c| *c == ' ').count();
+    let rest = &text[ws..];
+    for m in ["⏺ ", "⎿  ", "> ", "• ", "- ", "* ", "◆ ", "? ", "✦ "] {
+        if rest.starts_with(m) {
+            return ws + m.chars().count();
+        }
+    }
+    let digits = rest.chars().take_while(|c| c.is_ascii_digit()).count();
+    if digits > 0 && rest[digits..].starts_with(". ") {
+        return ws + digits + 2;
+    }
+    ws
+}
+
+/// Word-wrap a styled line to `width`, indenting continuation rows by
+/// `hang_indent`. Box-drawn content (code boxes, tables) is left as is.
+fn wrap_hanging(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
+    let sw = |t: &str| Span::raw(t.to_string()).width();
+    if width < 8 || line.width() <= width {
+        return vec![line];
+    }
+    let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+    if text.contains(['│', '┌', '└', '╭', '╰']) {
+        return vec![line];
+    }
+    let indent = hang_indent(&text).min(width / 2);
+    let mut rows: Vec<Line<'static>> = Vec::new();
+    let mut cur: Vec<Span<'static>> = Vec::new();
+    let mut cur_w = 0usize;
+    let push_tok = |cur: &mut Vec<Span<'static>>, tok: &str, style: Style| {
+        match cur.last_mut() {
+            Some(last) if last.style == style => {
+                let mut c = last.content.to_string();
+                c.push_str(tok);
+                last.content = c.into();
+            }
+            _ => cur.push(Span::styled(tok.to_string(), style)),
+        }
+    };
+    for span in &line.spans {
+        let style = span.style;
+        for tok in span.content.split_inclusive(' ') {
+            let tw = sw(tok);
+            let fits = cur_w + sw(tok.trim_end()) <= width;
+            if !fits && cur_w > indent {
+                rows.push(Line::from(std::mem::take(&mut cur)));
+                cur.push(Span::raw(" ".repeat(indent)));
+                cur_w = indent;
+                let t = tok.trim_start();
+                if t.is_empty() {
+                    continue;
+                }
+                // A single word longer than the row: hard-split it.
+                let mut rest = t.to_string();
+                while cur_w + sw(rest.as_str()) > width && rest.chars().count() > 1 {
+                    let room = width.saturating_sub(cur_w).max(1);
+                    let head: String = rest.chars().take(room).collect();
+                    rest = rest.chars().skip(room).collect();
+                    push_tok(&mut cur, &head, style);
+                    rows.push(Line::from(std::mem::take(&mut cur)));
+                    cur.push(Span::raw(" ".repeat(indent)));
+                    cur_w = indent;
+                }
+                cur_w += sw(rest.as_str());
+                push_tok(&mut cur, &rest, style);
+            } else {
+                cur_w += tw;
+                push_tok(&mut cur, tok, style);
+            }
+        }
+    }
+    if !cur.is_empty() {
+        rows.push(Line::from(cur));
+    }
+    rows
+}
+
+/// One-line results for discovery tools whose raw output is noise to a
+/// reader (a whole skill's text, a JSON catalogue). None = default view.
+fn tool_summary(name: &str, raw: &Value) -> Option<String> {
+    let text = match raw {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    };
+    match name {
+        "load_skill" | "workspace_load_skill" => {
+            let lines = text.lines().filter(|l| !l.trim().is_empty()).count();
+            if text.trim().is_empty() {
+                return None;
+            }
+            if text.to_lowercase().contains("not found") && lines < 4 {
+                return Some(format!("✗ {}", truncate(text.trim(), 160)));
+            }
+            Some(format!("loaded · {lines} lines"))
+        }
+        "search_skills" => {
+            let v: Value = match raw {
+                Value::String(s) => serde_json::from_str(s).ok()?,
+                other => other.clone(),
+            };
+            let slugs: Vec<String> = v.get("skills")?.as_array()?
+                .iter()
+                .filter_map(|k| k.get("slug").or_else(|| k.get("name")).and_then(|x| x.as_str()).map(String::from))
+                .collect();
+            Some(match slugs.len() {
+                0 => "no matching skills".to_string(),
+                n => format!("found {n}: {}", truncate(&slugs.join(", "), 160)),
+            })
+        }
+        "search_tools" => {
+            let names: Vec<String> = text
+                .lines()
+                .filter_map(|l| l.trim().strip_prefix("- "))
+                .filter_map(|l| l.split(|c: char| c == ' ' || c == '(' || c == ':').next())
+                .filter(|n| !n.is_empty())
+                .map(String::from)
+                .collect();
+            if names.is_empty() {
+                return Some(truncate(text.lines().next().unwrap_or("").trim(), 160));
+            }
+            let n = names.len();
+            Some(format!("loaded {n} tool{}: {}", if n == 1 { "" } else { "s" }, truncate(&names.join(", "), 160)))
+        }
+        _ => None,
+    }
+}
+
+/// Reader-facing tool name: `workspace_execute_shell_command` → "Shell",
+/// `browser_navigate` → "Browser navigate", anything else in sentence case.
+pub fn tool_label(name: &str) -> String {
+    let known = match name {
+        "__bash__" => Some("Bash"),
+        "load_skill" | "workspace_load_skill" => Some("Skill"),
+        "execute_command" | "workspace_execute_shell_command" => Some("Shell"),
+        "execute_code" | "workspace_execute_code" => Some("Run code"),
+        "read_file" | "workspace_read_file" => Some("Read"),
+        "write_file" | "workspace_write_file" => Some("Write"),
+        "edit_file" | "workspace_edit_file" => Some("Edit"),
+        "web_search" => Some("Web search"),
+        "web_fetch" | "fetch_url" => Some("Fetch"),
+        _ => None,
+    };
+    if let Some(k) = known {
+        return k.to_string();
+    }
+    // mcp__<server>__<tool> → "server · tool (MCP)", as Claude Code shows it.
+    if let Some((server, tool)) = name.strip_prefix("mcp__").and_then(|r| r.split_once("__")) {
+        return format!("{server} · {tool} (MCP)");
+    }
+    let base = name.strip_prefix("workspace_").unwrap_or(name).replace('_', " ");
+    let mut c = base.chars();
+    match c.next() {
+        Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+        None => name.to_string(),
+    }
+}
+
+/// Name the terminal tab after the chat (OSC title; ignored where unsupported).
+pub fn set_terminal_title(title: &str) {
+    let t = if title.trim().is_empty() || title == "CLI session" {
+        "strobes".to_string()
+    } else {
+        format!("✦ {}", truncate(title.trim(), 40))
+    };
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::SetTitle(t));
+}
+
+/// The agent-facing "moved to the background" note (see jobs.rs) reads as
+/// a short status line for people: "⟳ running in the background · job #3".
+fn humanize_job_note(text: &str) -> String {
+    const MARK: &str = "[The user moved this command to the background — it is still running as job #";
+    let Some(start) = text.find(MARK) else { return text.to_string() };
+    let rest = &text[start + MARK.len()..];
+    let id: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    let end = rest.find("later.]").map(|i| start + MARK.len() + i + "later.]".len()).unwrap_or(text.len());
+    let mut out = text[..start].trim_end().to_string();
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    out.push_str(&format!("⟳ moved to the background · job #{id} · /jobs"));
+    out.push_str(&text[end..]);
+    out
+}
+
+/// How to join two consecutive reply segments from one agent. Servers can
+/// persist one sentence as several segments (e.g. while a sub-agent runs),
+/// so a segment that clearly continues the previous one joins inline;
+/// otherwise they are separate paragraphs.
+fn segment_joint(prev: &str, next: &str) -> &'static str {
+    let Some(first) = next.chars().next() else { return "" };
+    let last = prev.chars().last().unwrap_or(' ');
+    if first.is_whitespace() || last.is_whitespace() {
+        return "";
+    }
+    if matches!(first, ';' | ',' | '.' | ':' | '!' | '?' | ')' | '-' | '\'' | '’') {
+        return "";
+    }
+    if first.is_lowercase() {
+        // "…the result in" + "one line" → a space; "Sub" + "agent" stays apart too.
+        return " ";
+    }
+    if !matches!(last, '.' | '!' | '?' | ':' | ')' | '`' | '*') && last.is_alphanumeric() && first.is_alphanumeric() {
+        // Mid-sentence cut before a capitalised word ("…on the" + "Linux host").
+        return " ";
+    }
+    "\n\n"
+}
+
+/// Is `chunk` a server re-send of text already shown? Older servers race two
+/// flushes of the same buffer, re-sending the whole segment or just its last
+/// chunk, so the same words land twice in a row. Short chunks are never
+/// treated as replays (they legitimately repeat: "a", " the", "\n").
+pub fn is_replay(shown: &str, chunk: &str) -> bool {
+    let c = chunk.trim();
+    c.chars().count() >= 12 && shown.trim_end().ends_with(c)
+}
+
+/// The server's "──── Run cancelled. Completed N operations…" message.
+fn is_cancel_receipt(md: &str) -> bool {
+    // e.g. "\n\n---\n**Run cancelled.** Completed 0 operations …"
+    let t = md.trim().trim_start_matches(|c: char| matches!(c, '─' | '-' | '*' | '_') || c.is_whitespace());
+    t.starts_with("Run cancelled") || t.starts_with("Run canceled")
+}
+
+/// Strobes brand green (#42BE65) and its glow tint (#6FDC8C).
+pub const STROBES_GREEN: Color = Color::Rgb(66, 190, 101);
+pub const STROBES_GLOW: Color = Color::Rgb(111, 220, 140);
+
+/// Strobie — the Strobes mascot, a green four-point star — as the working
+/// indicator: it holds, then twinkles (outline ✧ + glow) like a blink.
+/// `tick` advances every 120 ms.
+pub fn strobie_frame(tick: usize) -> (&'static str, Style) {
+    const FRAMES: [(&str, bool); 8] = [
+        ("✦", false), ("✦", false), ("✦", false), ("✦", true),
+        ("✧", true), ("✦", true), ("✦", false), ("✦", false),
+    ];
+    let (g, glow) = FRAMES[tick % FRAMES.len()];
+    let color = if glow { STROBES_GLOW } else { STROBES_GREEN };
+    (g, Style::default().fg(color).add_modifier(Modifier::BOLD))
+}
+
+/// The orchestrator is "the assistant" — it needs no name tag; sub-agents do.
+/// Agents that ran a chat themselves (not as sub-agents), e.g. a /agent
+/// specialist. Process-wide, like the names of the built-in supervisor.
+static MAIN_AGENTS: std::sync::RwLock<Vec<String>> = std::sync::RwLock::new(Vec::new());
+
+/// A specialist that runs a chat itself (opened with /agent): its replies are
+/// the main transcript, not a sub-agent group.
+pub fn mark_main_agent(agent: &str) {
+    if let Ok(mut v) = MAIN_AGENTS.write() {
+        if !v.iter().any(|a| a == agent) {
+            v.push(agent.to_string());
+        }
+    }
+}
+
+fn is_main_agent(agent: &str) -> bool {
+    agent.is_empty()
+        || agent == "agent"
+        || agent.contains("Supervisor")
+        || agent == "orchestrator"
+        || MAIN_AGENTS.read().map(|v| v.iter().any(|a| a == agent)).unwrap_or(false)
+}
+
 fn agent_header(agent: &str) -> Line<'static> {
     Line::from(Span::styled(
         format!("◆ {agent}"),
-        Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM),
     ))
 }
 
@@ -2310,12 +4083,19 @@ fn short(id: &str) -> String {
     if id.len() > 8 { format!("{}…", &id[..8]) } else { id.to_string() }
 }
 
+/// 950 tok · 12.3k tok · 2.35M tok · 1.2B tok.
 fn fmt_tokens(t: i64) -> String {
-    if t >= 1000 {
-        format!("{:.1}k tok", t as f64 / 1000.0)
-    } else {
-        format!("{t} tok")
-    }
+    let f = t as f64;
+    let (v, unit) = match t.abs() {
+        0..=999 => return format!("{t} tok"),
+        1_000..=999_949 => (f / 1e3, "k"),
+        999_950..=999_949_999 => (f / 1e6, "M"),
+        _ => (f / 1e9, "B"),
+    };
+    // Three significant figures: 2.35M, 23.5M, 235M.
+    let s = if v.abs() >= 100.0 { format!("{v:.0}") } else if v.abs() >= 10.0 { format!("{v:.1}") } else { format!("{v:.2}") };
+    let s = if s.contains('.') { s.trim_end_matches('0').trim_end_matches('.').to_string() } else { s };
+    format!("{s}{unit} tok")
 }
 
 /// Some terminals/fonts render these decorative glyphs as double-width while
@@ -2325,12 +4105,26 @@ fn fmt_tokens(t: i64) -> String {
 /// Windows console, but the same font-dependent double-width rendering can
 /// happen in terminals on any OS, so this applies everywhere rather than
 /// gating on `cfg(windows)`.
+/// ASCII fallbacks are for consoles that draw these glyphs at the wrong
+/// width (classic Windows conhost). Elsewhere they render fine, so keep them —
+/// unless STROBES_ASCII=1 asks for plain ASCII.
+fn ascii_glyphs() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cfg!(windows) || std::env::var("STROBES_ASCII").map(|v| v == "1" || v == "true").unwrap_or(false)
+    })
+}
+
 fn win_glyph(c: char) -> Option<&'static str> {
+    if !ascii_glyphs() {
+        return None;
+    }
     Some(match c {
-        '●' | '◆' | '⏺' | '◇' | '✻' | '◈' | '⛁' | '⊞' | '◐' | '★' => "*",
+        '●' | '◆' | '⏺' | '◇' | '✻' | '✺' | '✹' | '✸' | '✷' | '✶' | '✦' | '✧' | '◈' | '⛁' | '⊞' | '◐' | '★' => "*",
         '○' => "o",
         '⎿' => "L",
-        '▷' | '➤' | '›' | '↪' => ">",
+        '▷' | '➤' | '›' | '❯' | '↪' => ">",
+        '↓' => "v",
         '✔' => "+",
         '✗' => "x",
         '⚠' => "!",
@@ -2395,6 +4189,45 @@ fn wrap_chars(s: &str, w: usize) -> Vec<String> {
         return vec![String::new()];
     }
     chars.chunks(w).map(|c| c.iter().collect()).collect()
+}
+
+/// The non-blank lines of a code blob, for the collapsed call line.
+fn code_gist(detail: &str) -> Vec<&str> {
+    detail.lines().map(|l| l.trim_end()).filter(|l| !l.trim().is_empty()).collect()
+}
+
+/// Collapsed code/command call: `⏺ Run code(<gist line>` plus at most one more
+/// line, each cut to the width, closing with `…)` when there is more.
+fn code_call_lines(dot: Span<'static>, name: Span<'static>, detail: &str, width: u16) -> Vec<Line<'static>> {
+    const SHOWN: usize = 2;
+    let code_style = Style::default().fg(Color::Gray);
+    let dim = Style::default().fg(Color::DarkGray);
+    let gist = code_gist(detail);
+    let head = 2 + name.content.chars().count() + 1;
+    let w = (width as usize).saturating_sub(head + 3).max(16);
+    let more = gist.len() > SHOWN;
+    let mut out = Vec::new();
+    for (i, l) in gist.iter().take(SHOWN).enumerate() {
+        let last = i + 1 == gist.len().min(SHOWN);
+        let mut text = truncate(l, w);
+        if last && more {
+            text.push_str(" …");
+        }
+        let mut spans = if i == 0 {
+            vec![dot.clone(), name.clone(), Span::styled("(".to_string(), dim)]
+        } else {
+            vec![Span::raw(" ".repeat(head))]
+        };
+        spans.push(Span::styled(text, code_style));
+        if last {
+            spans.push(Span::styled(")".to_string(), dim));
+        }
+        out.push(Line::from(spans));
+    }
+    if out.is_empty() {
+        out.push(Line::from(vec![dot, name]));
+    }
+    out
 }
 
 /// Render a code/command blob as a bordered box, wrapping each source line to
@@ -2463,12 +4296,11 @@ fn concise_result_value(v: &Value) -> String {
             val.as_array()
                 .map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(" "))
                 .unwrap_or_default()
-                .replace('\n', " ")
         };
         if let Some(errs) = obj.get("errors") {
             let e = join_strs(errs);
             if !e.trim().is_empty() {
-                return format!("✗ {}", truncate(e.trim(), 200));
+                return format!("✗ {}", truncate(e.trim(), 2000));
             }
         }
         // Output-bearing results (outputs/stdout_tail/message/note) → show that.
@@ -2476,12 +4308,12 @@ fn concise_result_value(v: &Value) -> String {
             if let Some(val) = obj.get(key) {
                 let o = match val {
                     Value::Array(_) => join_strs(val),
-                    Value::String(s) => s.replace('\n', " "),
+                    Value::String(s) => s.clone(),
                     _ => String::new(),
                 };
                 let o = o.trim();
                 if !o.is_empty() {
-                    return truncate(o, 200);
+                    return truncate(o, 4000);
                 }
             }
         }
@@ -2496,7 +4328,10 @@ fn concise_result_value(v: &Value) -> String {
             return "(ok)".to_string();
         }
     }
-    compact_json(Some(v), 200)
+    if let Value::String(s) = v {
+        return truncate(s.trim(), 4000);
+    }
+    compact_json(Some(v), 300)
 }
 
 /// Beautify a raw tool-result string (live path). Parses JSON when possible,
@@ -2504,7 +4339,7 @@ fn concise_result_value(v: &Value) -> String {
 fn concise_tool_result(detail: &str) -> String {
     match serde_json::from_str::<Value>(detail) {
         Ok(v) => concise_result_value(&v),
-        Err(_) => truncate(detail, 220),
+        Err(_) => truncate(detail, 4000),
     }
 }
 
@@ -2595,6 +4430,401 @@ mod md_tests {
 #[cfg(test)]
 mod input_editor_tests {
     use super::*;
+
+    fn tool_ev(kind: &str, name: &str, detail: &str, local: bool) -> StreamItem {
+        StreamItem {
+            kind: kind.into(),
+            agent: Some("Strobes AI Supervisor".into()),
+            text: None,
+            tool_name: Some(name.into()),
+            detail: Some(detail.into()),
+            status: None,
+            local,
+            task_id: None, call_id: None,
+        }
+    }
+
+    #[test]
+    fn reply_resuming_after_a_sub_agent_is_not_glued() {
+        let mut a = App::new("t".into(), "http://x".into(), "ten".into(), "org".into());
+        a.on_app_event(AppEvent::RunStarted);
+        let tok = |agent: &str, t: &str| AppEvent::Stream(StreamItem {
+            kind: "token".into(), agent: Some(agent.into()), text: Some(t.into()),
+            tool_name: None, detail: None, status: None, local: false, task_id: None, call_id: None,
+        });
+        a.on_app_event(tok("Strobes AI Supervisor", "Waiting on its report."));
+        a.on_app_event(tok("Web Pentest Agent", "working"));
+        a.on_app_event(tok("Strobes AI Supervisor", "Sub-agent ran it."));
+        a.on_app_event(tok("Strobes AI Supervisor", " Done"));
+        let text = a.transcript_plaintext();
+        assert!(!text.contains("report.Sub-agent"), "{text}");
+        assert!(text.contains("ran it. Done"), "{text}");
+    }
+
+    #[test]
+    fn a_specialist_running_the_chat_is_the_main_agent() {
+        let mut a = App::new("t".into(), "http://x".into(), "ten".into(), "org".into());
+        mark_main_agent("Vulnerability Triage Agent");
+        a.on_app_event(AppEvent::RunStarted);
+        let tok = |agent: &str, t: &str| StreamItem {
+            kind: "token".into(), agent: Some(agent.into()), text: Some(t.into()),
+            tool_name: None, detail: None, status: None, local: false, task_id: None, call_id: None,
+        };
+        a.on_app_event(AppEvent::Stream(tok("Vulnerability Triage Agent", "I triage findings.")));
+        a.on_app_event(AppEvent::RunFinished("completed".into()));
+        assert!(a.subs.is_empty(), "shown as a sub-agent");
+        assert!(a.transcript_plaintext().contains("I triage findings."));
+    }
+
+    /// (label, detail, result) for every tool call on screen, in order.
+    fn calls(a: &App) -> Vec<(String, String, Option<String>)> {
+        let mut out = Vec::new();
+        for (i, b) in a.blocks.iter().enumerate() {
+            if let Block::Tool { name, detail, .. } = b {
+                let r = match a.blocks.get(i + 1) {
+                    Some(Block::ToolResult { text, .. }) => Some(text.clone()),
+                    _ => None,
+                };
+                out.push((tool_label(name), detail.clone(), r));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn wrapper_local_and_reannounce_render_as_one_call() {
+        // The exact sequence the backend sends for one shell command.
+        let mut a = app();
+        a.on_stream(tool_ev("tool_start", "workspace_execute_shell_command", "", false));
+        a.on_stream(tool_ev("tool_start", "execute_command", "echo hi", true));
+        a.on_stream(tool_ev("tool_output", "execute_command", "\"hi\"", false));
+        a.on_stream(tool_ev("tool_start", "workspace_execute_shell_command", "echo hi", false));
+        a.on_stream(tool_ev("tool_output", "workspace_execute_shell_command", "\"hi\"", false));
+        assert_eq!(calls(&a), vec![("Shell".into(), "echo hi".into(), Some("hi".into()))]);
+    }
+
+    fn tool_id(kind: &str, name: &str, detail: &str, local: bool, id: &str) -> StreamItem {
+        StreamItem { call_id: Some(id.into()), ..tool_ev(kind, name, detail, local) }
+    }
+
+    #[test]
+    fn parallel_shell_calls_pair_results_by_id() {
+        // Captured from the backend: locals run (and finish) in the opposite
+        // order to the wrapper calls' announcement.
+        let mut a = app();
+        let w = "workspace_execute_shell_command";
+        a.on_stream(tool_id("tool_start", w, "", false, "A"));
+        a.on_stream(tool_id("tool_start", w, "", false, "B"));
+        a.on_stream(tool_id("tool_start", "execute_command", "date +%Y", true, "L1"));
+        a.on_stream(tool_id("tool_start", "execute_command", "uname -s", true, "L2"));
+        a.on_stream(tool_id("tool_output", "execute_command", "\"2026\"", false, "L1"));
+        a.on_stream(tool_id("tool_output", "execute_command", "\"Darwin\"", false, "L2"));
+        a.on_stream(tool_id("tool_start", w, "uname -s", false, "A"));
+        a.on_stream(tool_id("tool_start", w, "date +%Y", false, "B"));
+        a.on_stream(tool_id("tool_output", w, "\"2026\"", false, "B"));
+        a.on_stream(tool_id("tool_output", w, "\"Darwin\"", false, "A"));
+        let mut c = calls(&a);
+        c.sort();
+        assert_eq!(c, vec![
+            ("Shell".into(), "date +%Y".into(), Some("2026".into())),
+            ("Shell".into(), "uname -s".into(), Some("Darwin".into())),
+        ]);
+    }
+
+    #[test]
+    fn local_announced_before_wrapper_is_still_one_call() {
+        let mut a = app();
+        let w = "workspace_execute_shell_command";
+        a.on_stream(tool_id("tool_start", "execute_command", "date", true, "L1"));
+        a.on_stream(tool_id("tool_start", w, "", false, "C1"));
+        a.on_stream(tool_id("tool_output", "execute_command", "\"Thu\"", false, "L1"));
+        a.on_stream(tool_id("tool_start", w, "date", false, "C1"));
+        a.on_stream(tool_id("tool_output", w, "\"Thu\"", false, "C1"));
+        assert_eq!(calls(&a), vec![("Shell".into(), "date".into(), Some("Thu".into()))]);
+    }
+
+    #[test]
+    fn parallel_calls_keep_their_own_results() {
+        let mut a = app();
+        // Early (arg-less) starts for three parallel calls, then full ones.
+        for _ in 0..3 {
+            a.on_stream(tool_ev("tool_start", "complete_task", "", false));
+        }
+        for t in ["t1", "t2", "t3"] {
+            a.on_stream(tool_ev("tool_start", "complete_task", t, false));
+        }
+        a.on_stream(tool_ev("tool_start", "write_table", "todos", false));
+        a.on_stream(tool_ev("tool_output", "write_table", "\"no table\"", false));
+        for t in ["done 1", "done 2", "done 3"] {
+            a.on_stream(tool_ev("tool_output", "complete_task", &format!("\"{t}\""), false));
+        }
+        let c = calls(&a);
+        assert_eq!(c.len(), 4, "{c:?}");
+        assert_eq!(c[0], ("Complete task".into(), "t1".into(), Some("done 1".into())));
+        assert_eq!(c[2], ("Complete task".into(), "t3".into(), Some("done 3".into())));
+        assert_eq!(c[3], ("Write table".into(), "todos".into(), Some("no table".into())));
+    }
+
+    #[test]
+    fn replayed_segment_token_is_dropped() {
+        let mut a = app();
+        let tok = |t: &str| StreamItem {
+            kind: "token".into(), agent: Some("Strobes AI Supervisor".into()), text: Some(t.into()),
+            tool_name: None, detail: None, status: None, local: false, task_id: None, call_id: None,
+        };
+        a.on_stream(tok("Hello there, "));
+        a.on_stream(tok("friend."));
+        a.on_stream(tok("Hello there, friend."));
+        assert_eq!(a.stream.as_ref().map(|s| s.buf.as_str()), Some("Hello there, friend."));
+    }
+
+    fn choice_interrupt(a: &mut App) {
+        let depth = Field {
+            key: "depth".into(), label: "Depth".into(), ftype: "select".into(),
+            options: vec![("Quick".into(), Value::from("quick")), ("Deep".into(), Value::from("deep"))],
+            default: Some(Value::from("deep")),
+        };
+        let subs = Field { key: "subs".into(), label: "Subdomains".into(), ftype: "checkbox".into(), options: vec![], default: None };
+        let note = Field { key: "note".into(), label: "Note".into(), ftype: "text".into(), options: vec![], default: Some(Value::from("none")) };
+        a.on_app_event(AppEvent::Interrupt { id: "i1".into(), title: "Configure".into(), message: "".into(), fields: vec![depth, subs, note] });
+    }
+
+    #[test]
+    fn choice_prompt_answers_by_key_default_and_text() {
+        let mut a = app();
+        choice_interrupt(&mut a);
+        // Highlight starts on the default.
+        assert_eq!(a.pending_choices(), vec!["Quick", "Deep"]);
+        assert_eq!(a.pending.as_ref().unwrap().sel, 1);
+        assert!(a.submit_choice(Some(0)).is_none()); // "1" → Quick
+        assert_eq!(a.pending_choices(), vec!["Yes", "No"]); // checkbox
+        a.pending_move(false);
+        assert!(a.submit_choice(None).is_none()); // No
+        // Free text, empty → default.
+        let (id, data) = a.submit_interrupt_value("").unwrap();
+        assert_eq!(id, "i1");
+        assert_eq!(data, serde_json::json!({"depth": "quick", "subs": false, "note": "none"}));
+        assert!(a.pending.is_none());
+    }
+
+    #[test]
+    fn choice_prompt_accepts_typed_number_and_decline() {
+        let mut a = app();
+        choice_interrupt(&mut a);
+        assert!(a.submit_interrupt_value("2").is_none());
+        assert_eq!(a.pending.as_ref().unwrap().answers.get("depth"), Some(&Value::from("deep")));
+        a.decline_interrupt();
+        assert!(a.pending.is_none());
+    }
+
+    #[test]
+    fn mention_completes_to_absolute_path() {
+        let mut a = app();
+        a.mention_files = Some(vec!["src/app.rs".into(), "src/main.rs".into(), "README.md".into()]);
+        a.input_insert_str("review @mai");
+        assert!(a.mention_open());
+        assert_eq!(a.mention_matches(), vec!["src/main.rs".to_string()]);
+        a.mention_complete();
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(a.input, format!("review @{} ", cwd.join("src/main.rs").display()));
+        // An email isn't a mention.
+        a.input_clear();
+        a.input_insert_str("mail me@exa");
+        assert!(a.mention_query().is_none());
+    }
+
+    #[test]
+    fn backslash_enter_makes_a_newline() {
+        let mut a = app();
+        a.input_insert_str("line one\\");
+        assert!(a.input_backslash_newline());
+        a.input_insert_str("two");
+        assert_eq!(a.input, "line one\ntwo");
+        assert!(!a.input_backslash_newline());
+    }
+
+    #[test]
+    fn token_counts_scale() {
+        assert_eq!(fmt_tokens(950), "950 tok");
+        assert_eq!(fmt_tokens(1_000), "1k tok");
+        assert_eq!(fmt_tokens(12_340), "12.3k tok");
+        assert_eq!(fmt_tokens(98_900), "98.9k tok");
+        assert_eq!(fmt_tokens(271_000), "271k tok");
+        assert_eq!(fmt_tokens(999_960), "1M tok");
+        assert_eq!(fmt_tokens(2_350_900), "2.35M tok");
+        assert_eq!(fmt_tokens(23_500_000), "23.5M tok");
+        assert_eq!(fmt_tokens(1_200_000_000), "1.2B tok");
+    }
+
+    #[test]
+    fn collapsed_code_call_is_two_lines_at_most() {
+        let code = "\nfor _g in [{\"url\": \"https://example.com/".to_string()
+            + &"a".repeat(600) + "\"}]:\n\n    print(_g)\nprint('done')\n";
+        let lines = code_call_lines(Span::raw("⏺ "), Span::raw("Run code"), &code, 100);
+        assert_eq!(lines.len(), 2);
+        let text: Vec<String> = lines.iter().map(|l| l.spans.iter().map(|s| s.content.to_string()).collect()).collect();
+        assert!(text[0].starts_with("⏺ Run code(for _g in"), "{:?}", text);
+        assert!(text.iter().all(|l| l.chars().count() <= 100), "{:?}", text);
+        assert!(text[1].ends_with("… )") || text[1].ends_with("…)"), "{:?}", text);
+    }
+
+    #[test]
+    fn cancel_receipt_becomes_interrupted_line() {
+        let mut a = app();
+        a.push_assistant("Strobes AI Supervisor".into(), "\n\n---\n**Run cancelled.** Completed 0 operations before cancellation.".into());
+        a.on_app_event(AppEvent::RunFinished("cancelled".into()));
+        let text = a.transcript_plaintext();
+        assert_eq!(text.matches("Interrupted").count(), 1, "{text}");
+        assert!(!text.contains("Run cancelled"));
+        assert!(!is_cancel_receipt("The run cancelled flag is set"));
+    }
+
+    #[test]
+    fn long_lines_hang_under_their_marker() {
+        let text = "⏺ one two three four five six seven eight nine ten";
+        let rows = wrap_hanging(Line::from(text.to_string()), 20);
+        let rows: Vec<String> = rows.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect()).collect();
+        assert!(rows.len() > 1);
+        for r in &rows[1..] {
+            assert!(r.starts_with("  ") && !r.starts_with("   "), "{r:?}");
+            assert!(r.chars().count() <= 20, "{r:?}");
+        }
+        assert_eq!(hang_indent("  ⎿  out"), 5);
+        assert_eq!(hang_indent("  12. item"), 6);
+        // Code boxes are left for the renderer.
+        assert_eq!(wrap_hanging(Line::from("│ ".to_string() + &"x".repeat(50)), 20).len(), 1);
+    }
+
+    #[test]
+    fn subagent_work_stays_in_its_own_group() {
+        let mut a = app();
+        let ev = |agent: &str, kind: &str, name: Option<&str>, text: Option<&str>, detail: Option<&str>, id: Option<&str>| StreamItem {
+            kind: kind.into(), agent: Some(agent.into()), text: text.map(String::from),
+            tool_name: name.map(String::from), detail: detail.map(String::from), status: None,
+            local: false, task_id: None, call_id: id.map(String::from),
+        };
+        let main = "Strobes AI Supervisor";
+        let sub = "Network Pentest Agent";
+        a.on_stream(ev(main, "token", None, Some("Dispatching a sub-agent."), None, None));
+        a.on_stream(ev(sub, "token", None, Some("I'll run whoami."), None, None));
+        // Main agent keeps talking while the sub-agent works.
+        a.on_stream(ev(main, "token", None, Some(" Waiting for it."), None, None));
+        a.on_stream(ev(sub, "tool_start", Some("execute_command"), None, Some("whoami"), Some("c1")));
+        a.on_stream(ev(sub, "tool_output", Some("execute_command"), None, Some("\"admin\""), Some("c1")));
+        a.on_stream(ev(sub, "token", None, Some("Result: admin."), None, None));
+        a.on_app_event(AppEvent::RunFinished("completed".into()));
+
+        // Main transcript: its text in one piece, plus a single group marker.
+        let main_text: Vec<&str> = a.blocks.iter().filter_map(|b| match b {
+            Block::Assistant { md, .. } => Some(md.as_str()), _ => None }).collect();
+        assert_eq!(main_text, vec!["Dispatching a sub-agent. Waiting for it."]);
+        assert_eq!(a.blocks.iter().filter(|b| matches!(b, Block::SubAgent(_))).count(), 1);
+        // The sub-agent's text and tool call live in its own run.
+        let run = &a.subs[0];
+        assert_eq!(run.name, sub);
+        assert!(run.blocks.iter().any(|b| matches!(b, Block::Tool { detail, .. } if detail == "whoami")));
+        assert!(run.blocks.iter().any(|b| matches!(b, Block::ToolResult { text, .. } if text == "admin")));
+        // Collapsed render: header + the call + a Done line, no sub-agent prose.
+        let lines: Vec<String> = a.build_lines(100).iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect()).collect();
+        let joined = lines.join("\n");
+        assert!(joined.contains("Network Pentest Agent  sub-agent"), "{joined}");
+        assert!(joined.contains("Shell(whoami)"), "{joined}");
+        assert!(joined.contains("Done (1 tool use"), "{joined}");
+        assert!(!joined.contains("Result: admin."), "{joined}");
+        // ctrl+o expands it.
+        a.show_full_code = true;
+        let joined: String = a.build_lines(100).iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>()).collect::<Vec<_>>().join("\n");
+        assert!(joined.contains("Result: admin."), "{joined}");
+    }
+
+    #[test]
+    fn replayed_last_chunk_is_dropped() {
+        let mut a = app();
+        let tok = |t: &str| StreamItem {
+            kind: "token".into(), agent: Some("Strobes AI Supervisor".into()), text: Some(t.into()),
+            tool_name: None, detail: None, status: None, local: false, task_id: None, call_id: None,
+        };
+        a.on_stream(tok("What would you like to do?"));
+        a.on_stream(tok("\n\nJust let me know how you'd like to proceed!"));
+        a.on_stream(tok("\n\nJust let me know how you'd like to proceed!"));
+        assert_eq!(a.stream.as_ref().unwrap().buf.matches("proceed!").count(), 1);
+        // Short pieces that genuinely repeat still get through.
+        a.on_stream(tok(" ok"));
+        a.on_stream(tok(" ok"));
+        assert!(a.stream.as_ref().unwrap().buf.ends_with(" ok ok"));
+        // History: a segment persisted twice renders once.
+        let mut h = app();
+        h.push_assistant("Strobes AI Supervisor".into(), "Hi!\n\nJust let me know how you'd like to proceed!".into());
+        h.push_assistant("Strobes AI Supervisor".into(), "Just let me know how you'd like to proceed!".into());
+        assert_eq!(h.transcript_plaintext().matches("proceed!").count(), 1);
+    }
+
+    #[test]
+    fn job_note_reads_as_a_status_line() {
+        let t = "line 1\nline 2\n\n[The user moved this command to the background — it is still running as job #7. Its full output is being written to /x/job-7.log. Continue with other work; read that file (e.g. tail it) to check progress or results later.]";
+        assert_eq!(humanize_job_note(t), "line 1\nline 2\n⟳ moved to the background · job #7 · /jobs");
+        assert_eq!(humanize_job_note("plain"), "plain");
+    }
+
+    #[test]
+    fn discovery_tools_summarize() {
+        let skill = Value::String("\n## Loaded Skill: api-pentest\n\n## Orchestrator\n- a\n- b".into());
+        assert_eq!(tool_summary("load_skill", &skill).unwrap(), "loaded · 4 lines");
+        let found = serde_json::json!({"success": true, "skills": [{"slug": "api-pentest"}, {"slug": "web-pentest"}]});
+        assert_eq!(tool_summary("search_skills", &found).unwrap(), "found 2: api-pentest, web-pentest");
+        let tools = Value::String("Loaded 1 tool(s); they are callable from your next step:\n- oob_send_smtp (oob): Actively send".into());
+        assert_eq!(tool_summary("search_tools", &tools).unwrap(), "loaded 1 tool: oob_send_smtp");
+        assert!(tool_summary("execute_command", &tools).is_none());
+        assert_eq!(tool_label("load_skill"), "Skill");
+    }
+
+    #[test]
+    fn approval_request_becomes_a_choice() {
+        let mut a = app();
+        a.on_app_event(AppEvent::ApprovalRequest {
+            id: "ap1".into(), agent: "Strobes AI Supervisor".into(),
+            module: "create_finding".into(), preview: "SQLi on /login".into(),
+        });
+        assert_eq!(a.pending_choices(), vec!["Yes", "Yes, and don't ask again this session", "No"]);
+        let (id, data) = a.submit_choice(Some(2)).unwrap();
+        assert_eq!(id, "approval:ap1");
+        assert_eq!(data, serde_json::json!({"decision": "rejected"}));
+        assert!(a.transcript_plaintext().contains("Approve: SQLi on /login"));
+    }
+
+    #[test]
+    fn fragmented_segments_rejoin_into_one_sentence() {
+        let mut a = app();
+        for part in ["Sub", "-agent dispatched and running", "; I will report", " the result in", "one line once it completes."] {
+            a.push_assistant("Strobes AI Supervisor".into(), part.into());
+        }
+        // Hidden thinking between fragments doesn't split them either.
+        a.blocks.push(Block::Thinking("IT:0 sent".into()));
+        a.push_assistant("Strobes AI Supervisor".into(), "Done. All checks passed.".into());
+        let t = a.transcript_plaintext();
+        assert!(t.contains("Sub-agent dispatched and running; I will report the result in one line once it completes.\n\nDone."), "{t}");
+    }
+
+    #[test]
+    fn builtin_commands_resolve_aliases() {
+        assert_eq!(builtin_command("clear"), Some("new"));
+        assert_eq!(builtin_command("quit"), Some("exit"));
+        assert_eq!(builtin_command("api-pentest"), None);
+    }
+
+    #[test]
+    fn big_paste_becomes_placeholder_and_expands() {
+        let mut a = app();
+        let big = (1..=10).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        a.input_insert_str("see: ");
+        a.input_paste(&big);
+        assert_eq!(a.input, "see: [Pasted text #1 +10 lines]");
+        assert_eq!(a.expand_pastes(&a.input.clone()), format!("see: {big}"));
+        a.input_paste("small");
+        assert!(a.input.ends_with("small"));
+    }
 
     fn app() -> App {
         App::new("t".into(), "http://x".into(), "ten".into(), "org".into())

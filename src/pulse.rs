@@ -32,6 +32,9 @@ pub struct StreamItem {
     pub status: Option<String>,
     pub local: bool,
     pub task_id: Option<String>,
+    /// Tool-call id (`callId` on server tool events, `requestId` on local
+    /// executions) so results land under the call they answer.
+    pub call_id: Option<String>,
 }
 
 /// A single form field requested by `request_human_input`.
@@ -40,10 +43,16 @@ pub struct Field {
     pub key: String,
     pub label: String,
     pub ftype: String, // text | password | number | select | textarea | checkbox | ...
+    /// (label, value) choices for select/radio fields.
+    pub options: Vec<(String, Value)>,
+    pub default: Option<Value>,
 }
 
 #[derive(Debug, Clone)]
 pub enum AppEvent {
+    /// Text to drop into the prompt at the cursor (e.g. references to files
+    /// just uploaded).
+    InsertInput(String),
     Connected,
     Disconnected(String),
     Stream(StreamItem),
@@ -62,6 +71,14 @@ pub enum AppEvent {
     /// (`credit.update`); `final_run=true` is the authoritative run total
     /// (from `run.completed` metrics).
     Credits { credits: f64, tokens: i64, final_run: bool },
+    /// Percent of the model's context window in use.
+    Context(f64),
+    /// A live output line from a running local command (tool call id).
+    LocalLine { call_id: String, line: String },
+    /// A backgrounded local command finished.
+    JobDone { job: u32, exit: Option<i32>, command: String },
+    /// The agent wants to do something that needs approval (ask mode).
+    ApprovalRequest { id: String, agent: String, module: String, preview: String },
     Error(String),
 }
 
@@ -110,7 +127,9 @@ impl PulseHandle {
     }
 
     pub fn send_user_message(&self, text: &str) {
-        let mut ctx = json!({ "client_type": "cli" });
+        // STROBES.md, local skills and MCP tools ride along with every message.
+        let mut ctx = crate::project::client_context();
+        ctx["client_type"] = json!("cli");
         if let Some(ws) = self.workspace_id.lock().ok().and_then(|w| w.clone()) {
             ctx["workspace_id"] = json!(ws);
         }
@@ -120,12 +139,26 @@ impl PulseHandle {
         if let Some(e) = self.reasoning_effort.lock().ok().and_then(|e| e.clone()) {
             ctx["reasoning_effort"] = json!(e);
         }
-        let frame = json!({ "type": "send_message", "text": text, "context": ctx });
+        let mut frame = json!({ "type": "send_message", "text": text, "context": ctx });
+        let atts = take_attachments();
+        if !atts.is_empty() {
+            frame["attachments"] = json!(atts);
+        }
         let _ = self.out.send(frame.to_string());
     }
 
     pub fn cancel(&self) {
         let _ = self.out.send(json!({ "type": "run.cancel" }).to_string());
+    }
+
+    /// Answer an approval request ("approved" / "rejected").
+    pub fn respond_approval(&self, approval_id: &str, approved: bool) {
+        let frame = json!({
+            "type": "approval.response",
+            "approval_id": approval_id,
+            "decision": if approved { "approved" } else { "rejected" },
+        });
+        let _ = self.out.send(frame.to_string());
     }
 
     /// Answer a `request_human_input` interrupt.
@@ -245,7 +278,8 @@ pub async fn connect(
                         }
                         Err(e) => {
                             let _ = app_tx.send(AppEvent::Disconnected(format!("reconnect failed: {e}")));
-                            delay = (delay * 2).min(20);
+                            // Capped low: a restarted server should be picked up quickly.
+                            delay = (delay * 2).min(5);
                         }
                     }
                 }
@@ -294,6 +328,13 @@ async fn run_session(
             },
             msg = read.next() => match msg {
                 Some(Ok(Message::Text(txt))) => {
+                    // STROBES_DEBUG_WS=<file> appends every raw frame (debugging aid).
+                    if let Ok(path) = std::env::var("STROBES_DEBUG_WS") {
+                        use std::io::Write;
+                        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                            let _ = writeln!(f, "{txt}");
+                        }
+                    }
                     if let Ok(v) = serde_json::from_str::<Value>(&txt) {
                         handle_frame(v, app_tx, out_tx, workspace_id, thread_id);
                     }
@@ -348,6 +389,43 @@ fn trim_code_preview(code: &str) -> String {
         format!("{first} …")
     } else {
         first.to_string()
+    }
+}
+
+/// Files uploaded with /attach, sent with the next message.
+static PENDING_ATTACHMENTS: std::sync::Mutex<Vec<Value>> = std::sync::Mutex::new(Vec::new());
+
+pub fn queue_attachment(att: Value) {
+    if let Ok(mut v) = PENDING_ATTACHMENTS.lock() {
+        v.push(att);
+    }
+}
+
+pub fn pending_attachments() -> usize {
+    PENDING_ATTACHMENTS.lock().map(|v| v.len()).unwrap_or(0)
+}
+
+pub fn take_attachments() -> Vec<Value> {
+    PENDING_ATTACHMENTS.lock().map(|mut v| std::mem::take(&mut *v)).unwrap_or_default()
+}
+
+/// Request ids of the server's internal cells seen this session, so any
+/// tool event for them is dropped too.
+static HIDDEN_CALLS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+fn hide_call(id: &str) {
+    if let Ok(mut v) = HIDDEN_CALLS.lock() {
+        v.push(id.to_string());
+        if v.len() > 256 {
+            v.remove(0);
+        }
+    }
+}
+
+fn is_hidden_call(id: Option<&str>) -> bool {
+    match id {
+        Some(id) if !id.is_empty() => HIDDEN_CALLS.lock().map(|v| v.iter().any(|x| x == id)).unwrap_or(false),
+        _ => false,
     }
 }
 
@@ -494,6 +572,17 @@ pub(crate) fn concise_args(tool: &str, v: &Value) -> String {
                 None => Some(sid),
             }
         }
+        // MCP tools: their arguments, as key=value.
+        t if t.starts_with("mcp__") => v.as_object().map(|o| {
+            o.iter()
+                .filter(|(k, _)| !k.starts_with('_'))
+                .map(|(k, val)| match val {
+                    Value::String(s) => format!("{k}={}", s.replace('\n', " ")),
+                    other => format!("{k}={other}"),
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        }),
         t if t.starts_with("browser_") => pick("url").or_else(|| pick("selector")).or_else(|| pick("script")),
         "spawn_subagent" => pick("agent_id").or_else(|| pick("task")),
         // The raw args are a full DAG (a `nodes` array whose `agent_task`
@@ -547,6 +636,20 @@ fn compact(v: &Value, limit: usize) -> String {
     }
 }
 
+/// `/permissions ask`: approval requests go to the user instead of being
+/// approved automatically.
+pub static ASK_APPROVALS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Forward job events (live lines, background completion) to the UI.
+pub fn job_sink(app_tx: mpsc::UnboundedSender<AppEvent>) -> crate::jobs::Sink {
+    std::sync::Arc::new(move |e| {
+        let _ = app_tx.send(match e {
+            crate::jobs::JobEvent::Line { call_id, line } => AppEvent::LocalLine { call_id, line },
+            crate::jobs::JobEvent::Done { job, exit, command } => AppEvent::JobDone { job, exit, command },
+        });
+    })
+}
+
 fn handle_frame(v: Value, app_tx: &mpsc::UnboundedSender<AppEvent>, out_tx: &mpsc::UnboundedSender<String>, workspace_id: Option<&str>, thread_id: &str) {
     let mtype = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
     match mtype {
@@ -556,7 +659,7 @@ fn handle_frame(v: Value, app_tx: &mpsc::UnboundedSender<AppEvent>, out_tx: &mps
                 let _ = app_tx.send(AppEvent::Stream(StreamItem {
                     kind: "note".into(), agent: None,
                     text: Some("queued — will be injected after the current turn".into()),
-                    tool_name: None, detail: None, status: None, local: false, task_id: None,
+                    tool_name: None, detail: None, status: None, local: false, task_id: None, call_id: None,
                 }));
             } else {
                 let _ = app_tx.send(AppEvent::RunStarted);
@@ -610,17 +713,25 @@ fn handle_frame(v: Value, app_tx: &mpsc::UnboundedSender<AppEvent>, out_tx: &mps
         if let Some(ws) = ws_any {
             input["_workspace_id"] = json!(ws);
         }
-        let arg_summary = tool_detail(&tool_name, &input);
-        let _ = app_tx.send(AppEvent::Stream(StreamItem {
+        // The server sends what the agent asked for (`display`) alongside the
+        // input it actually runs (wrapped with its own setup), and marks its
+        // bookkeeping cells `internal`. Show the former; run the latter.
+        let shown = b.get("display").filter(|d| d.is_object()).unwrap_or(&input);
+        let arg_summary = tool_detail(&tool_name, shown);
+        let hidden = b.get("internal").and_then(|v| v.as_bool()).unwrap_or(false);
+        if hidden {
+            hide_call(&request_id);
+        }
+        if !hidden { let _ = app_tx.send(AppEvent::Stream(StreamItem {
             kind: "tool_start".into(),
             agent,
             text: None,
             tool_name: Some(tool_name.clone()),
-            detail: Some(arg_summary),
+            detail: Some(arg_summary.clone()),
             status: Some("local_execute".into()),
             local: true,
-            task_id: None,
-        }));
+            task_id: None, call_id: Some(request_id.clone()).filter(|r| !r.is_empty()),
+        })); }
         let app_tx = app_tx.clone();
         let out_tx = out_tx.clone();
         tokio::spawn(async move {
@@ -633,7 +744,21 @@ fn handle_frame(v: Value, app_tx: &mpsc::UnboundedSender<AppEvent>, out_tx: &mps
             if let (true, Some(ws)) = (syncs, ws.as_deref()) {
                 crate::wsync::before(ws, &sandbox).await;
             }
-            let res = local::run_tool(&tool_name, &input).await;
+            // Commands stream live output and can be backgrounded/interrupted.
+            let ctx = (syncs && !hidden).then(|| crate::jobs::RunCtx {
+                call_id: request_id.clone(),
+                label: arg_summary.lines().next().unwrap_or("").to_string(),
+                sink: job_sink(app_tx.clone()),
+            });
+            // The user's hooks see the agent's calls (not the server's own
+            // setup cells); a PreToolUse hook can block one.
+            let res = match if hidden { Ok(()) } else { crate::hooks::pre_tool(&tool_name, &input).await } {
+                Ok(()) => local::run_tool_ctx(&tool_name, &input, ctx).await,
+                Err(reason) => local::LocalResult { output: String::new(), exit_code: None, error: Some(reason), captured_network: vec![] },
+            };
+            if !hidden {
+                crate::hooks::post_tool(&tool_name, &input, &res.output, res.error.as_deref()).await;
+            }
             if let (true, Some(ws)) = (syncs, ws.as_deref()) {
                 crate::wsync::after(ws, &sandbox).await;
             }
@@ -660,16 +785,25 @@ fn handle_frame(v: Value, app_tx: &mpsc::UnboundedSender<AppEvent>, out_tx: &mps
         return;
     }
 
-    // Blocking approval — auto-approve in the TUI (configurable later).
+    // Blocking approval: ask the user (/permissions ask), else auto-approve.
     if etype == "approval" && status.as_deref() == Some("requested") {
         let approval_id = sval(&b, "approvalId").or_else(|| sval(&b, "approval_id")).unwrap_or_default();
+        if ASK_APPROVALS.load(Ordering::Relaxed) {
+            let _ = app_tx.send(AppEvent::ApprovalRequest {
+                id: approval_id,
+                agent: agent.unwrap_or_default(),
+                module: sval(&b, "module").unwrap_or_default(),
+                preview: sval(&b, "preview").or_else(|| sval(&b, "description")).unwrap_or_default(),
+            });
+            return;
+        }
         let _ = out_tx.send(
             json!({ "type": "approval.response", "approval_id": approval_id, "decision": "approved" })
                 .to_string(),
         );
         let _ = app_tx.send(AppEvent::Stream(StreamItem {
             kind: "approval".into(), agent, text: sval(&b, "preview"),
-            tool_name: None, detail: sval(&b, "module"), status: Some("requested".into()), local: false, task_id: None,
+            tool_name: None, detail: sval(&b, "module"), status: Some("requested".into()), local: false, task_id: None, call_id: None,
         }));
         return;
     }
@@ -687,18 +821,32 @@ fn handle_frame(v: Value, app_tx: &mpsc::UnboundedSender<AppEvent>, out_tx: &mps
                         let key = sval(f, "key").unwrap_or_else(|| "value".into());
                         let label = sval(f, "label").unwrap_or_else(|| key.clone());
                         let ftype = sval(f, "type").unwrap_or_else(|| "text".into());
-                        fields.push(Field { key, label, ftype });
+                        // Options may be [{label, value}] or bare strings.
+                        let options = f.get("options").and_then(|o| o.as_array()).map(|arr| {
+                            arr.iter().map(|o| match o {
+                                Value::String(s) => (s.clone(), Value::String(s.clone())),
+                                Value::Object(m) => {
+                                    let value = m.get("value").cloned().unwrap_or(Value::Null);
+                                    let label = m.get("label").and_then(|l| l.as_str()).map(String::from)
+                                        .unwrap_or_else(|| value.as_str().map(String::from).unwrap_or_else(|| value.to_string()));
+                                    (label, value)
+                                }
+                                other => (other.to_string(), other.clone()),
+                            }).collect()
+                        }).unwrap_or_default();
+                        let default = f.get("default").cloned().filter(|d| !d.is_null());
+                        fields.push(Field { key, label, ftype, options, default });
                     }
                 }
                 if fields.is_empty() {
-                    fields.push(Field { key: "value".into(), label: "response".into(), ftype: "text".into() });
+                    fields.push(Field { key: "value".into(), label: "response".into(), ftype: "text".into(), options: Vec::new(), default: None });
                 }
                 let _ = app_tx.send(AppEvent::Interrupt { id, title, message, fields });
             }
             Some(other) => {
                 let _ = app_tx.send(AppEvent::Stream(StreamItem {
                     kind: "note".into(), agent: None, text: Some(format!("interrupt {other}")),
-                    tool_name: None, detail: None, status: None, local: false, task_id: None,
+                    tool_name: None, detail: None, status: None, local: false, task_id: None, call_id: None,
                 }));
             }
             None => {}
@@ -708,6 +856,13 @@ fn handle_frame(v: Value, app_tx: &mpsc::UnboundedSender<AppEvent>, out_tx: &mps
 
     // Credit/token usage (live per-call deltas).
     let sub = sval(&b, "type");
+    // How full the model's context window is (drives the footer hint).
+    if sub.as_deref() == Some("context.usage") {
+        if let Some(pct) = b.get("context_pct").and_then(|x| x.as_f64()) {
+            let _ = app_tx.send(AppEvent::Context(pct));
+        }
+        return;
+    }
     if etype == "credit.update" || sub.as_deref() == Some("credit.update") {
         let credits = b.get("credits_used").and_then(|x| x.as_f64()).unwrap_or(0.0);
         let it = b.get("input_tokens").and_then(|x| x.as_i64()).unwrap_or(0);
@@ -729,7 +884,7 @@ fn handle_frame(v: Value, app_tx: &mpsc::UnboundedSender<AppEvent>, out_tx: &mps
                 let _ = app_tx.send(AppEvent::Stream(StreamItem {
                     kind: "task".into(), agent, text: Some(title),
                     tool_name: None, detail: None, status: Some(status),
-                    local: false, task_id: tid,
+                    local: false, task_id: tid, call_id: None,
                 }));
             }
         }
@@ -737,8 +892,13 @@ fn handle_frame(v: Value, app_tx: &mpsc::UnboundedSender<AppEvent>, out_tx: &mps
     }
 
     // Run lifecycle → finished.
+    // A run cancelled before a worker started it only ever sends
+    // run.canceled (no run.completed), so that ends the turn too.
+    let canceled = matches!(etype, "run.canceled" | "run.cancelled")
+        || (etype == "system" && matches!(sub.as_deref(), Some("run.canceled") | Some("run.cancelled")));
     let terminal = etype == "run.completed"
         || etype == "run.failed"
+        || canceled
         || (etype == "system"
             && matches!(sub.as_deref(), Some("run.completed") | Some("run.failed")));
 
@@ -746,13 +906,14 @@ fn handle_frame(v: Value, app_tx: &mpsc::UnboundedSender<AppEvent>, out_tx: &mps
         "token" => Some(StreamItem {
             kind: "token".into(), agent,
             text: sval(&v, "content").or_else(|| sval(&b, "text")).or_else(|| sval(&b, "content")),
-            tool_name: None, detail: None, status: None, local: false, task_id: None,
+            tool_name: None, detail: None, status: None, local: false, task_id: None, call_id: None,
         }),
         "thinking" => Some(StreamItem {
             kind: "thinking".into(), agent,
             text: sval(&v, "content").or_else(|| sval(&b, "text")).or_else(|| sval(&b, "content")),
-            tool_name: None, detail: None, status: None, local: false, task_id: None,
+            tool_name: None, detail: None, status: None, local: false, task_id: None, call_id: None,
         }),
+        "tool" if is_hidden_call(sval(&b, "callId").or_else(|| sval(&b, "requestId")).as_deref()) => None,
         "tool" => {
             let name = sval(&b, "toolName");
             match status.as_deref() {
@@ -760,7 +921,7 @@ fn handle_frame(v: Value, app_tx: &mpsc::UnboundedSender<AppEvent>, out_tx: &mps
                     let detail = tool_detail(name.as_deref().unwrap_or(""), b.get("arguments").unwrap_or(&Value::Null));
                     Some(StreamItem {
                         kind: "tool_start".into(), agent, text: None, tool_name: name,
-                        detail: Some(detail), status: Some("start".into()), local: false, task_id: None,
+                        detail: Some(detail), status: Some("start".into()), local: false, task_id: None, call_id: sval(&b, "callId").or_else(|| sval(&b, "call_id")).or_else(|| sval(&b, "requestId")),
                     })
                 }
                 Some("output") => {
@@ -776,16 +937,19 @@ fn handle_frame(v: Value, app_tx: &mpsc::UnboundedSender<AppEvent>, out_tx: &mps
                             | Some("remove_todo") | Some("clear_todos")
                     );
                     let result = b.get("result").unwrap_or(&Value::Null);
-                    let detail = if is_todo_tool { result.to_string() } else { compact(result, 600) };
+                    // Keep the full structure (newlines included) so the
+                    // transcript can show the first lines of the output.
+                    let full = result.to_string();
+                    let detail = if is_todo_tool || full.len() <= 20_000 { full } else { compact(result, 4000) };
                     Some(StreamItem {
                         kind: "tool_output".into(), agent, text: None, tool_name: name,
                         detail: Some(detail),
-                        status: b.get("durationMs").map(|d| format!("{d}ms")), local: false, task_id: None,
+                        status: b.get("durationMs").map(|d| format!("{d}ms")), local: false, task_id: None, call_id: sval(&b, "callId").or_else(|| sval(&b, "call_id")).or_else(|| sval(&b, "requestId")),
                     })
                 }
                 Some("failed") => Some(StreamItem {
                     kind: "tool_failed".into(), agent, text: None, tool_name: name,
-                    detail: sval(&b, "error"), status: Some("failed".into()), local: false, task_id: None,
+                    detail: sval(&b, "error"), status: Some("failed".into()), local: false, task_id: None, call_id: sval(&b, "callId").or_else(|| sval(&b, "call_id")).or_else(|| sval(&b, "requestId")),
                 }),
                 _ => None,
             }
@@ -794,23 +958,23 @@ fn handle_frame(v: Value, app_tx: &mpsc::UnboundedSender<AppEvent>, out_tx: &mps
             kind: "task".into(), agent,
             text: sval(&b, "title").or_else(|| sval(&b, "taskId")),
             tool_name: None, detail: sval(&b, "error"), status: sval(&b, "status"), local: false,
-            task_id: sval(&v, "taskId").or_else(|| sval(&b, "taskId")),
+            task_id: sval(&v, "taskId").or_else(|| sval(&b, "taskId")), call_id: None,
         }),
         "artifact" => Some(StreamItem {
             kind: "note".into(), agent,
             text: Some(format!("artifact {}: {}", sval(&b, "status").unwrap_or_default(), sval(&b, "name").unwrap_or_default())),
-            tool_name: None, detail: sval(&b, "downloadUrl"), status: None, local: false, task_id: None,
+            tool_name: None, detail: sval(&b, "downloadUrl"), status: None, local: false, task_id: None, call_id: None,
         }),
         "system" => {
             let kind = sval(&b, "type").unwrap_or_default();
             Some(StreamItem {
                 kind: "system".into(), agent, text: Some(kind),
-                tool_name: None, detail: None, status: None, local: false, task_id: None,
+                tool_name: None, detail: None, status: None, local: false, task_id: None, call_id: None,
             })
         }
         s if s.starts_with("run.") => Some(StreamItem {
             kind: "system".into(), agent, text: Some(s.to_string()),
-            tool_name: None, detail: None, status: None, local: false, task_id: None,
+            tool_name: None, detail: None, status: None, local: false, task_id: None, call_id: None,
         }),
         _ => None,
     };
@@ -827,7 +991,9 @@ fn handle_frame(v: Value, app_tx: &mpsc::UnboundedSender<AppEvent>, out_tx: &mps
                 let _ = app_tx.send(AppEvent::Credits { credits, tokens, final_run: true });
             }
         }
-        let label = if etype.ends_with("failed") || sval(&b, "type").as_deref() == Some("run.failed") {
+        let label = if canceled {
+            "cancelled".into()
+        } else if etype.ends_with("failed") || sval(&b, "type").as_deref() == Some("run.failed") {
             format!("failed: {}", sval(&b, "error").unwrap_or_default())
         } else {
             "completed".into()

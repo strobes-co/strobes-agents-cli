@@ -98,7 +98,22 @@ cp target/release/strobes /usr/local/bin/
 Requirements: **Rust** (`rustup`). Chrome/Chromium is optional — only needed
 for the `browser_*` tools in chat and DAST scanning.
 
-## Configure
+## Sign in
+
+```bash
+strobes login            # opens your browser: pick the organization and workspace, click Authorize
+strobes login --key      # headless/CI: paste a MasterKey instead
+strobes logout
+```
+
+`strobes login` asks for your Strobes URL (default `https://app.strobes.co`, then
+whatever you used last), shows a code, and opens the browser. Confirm the code,
+choose the organization and workspace, and the CLI is configured — no keys to
+copy. Inside the chat, `/login` switches org/workspace the same way. Set
+`STROBES_NO_BROWSER=1` to just print the link (SSH), and `--web-url` /
+`STROBES_WEB_URL` when the web app isn't served from the API host (local dev).
+
+## Configure (MasterKey)
 
 Get a MasterKey from **Strobes UI → Organization → API access**:
 
@@ -348,44 +363,141 @@ jobs:
 
 ---
 
-## Interactive Chat (`strobes chat`)
-
-Opens a full terminal UI that streams a remote agent run and executes
-its tools (shell, code, browser) on your local machine.
+## Chat
 
 ```bash
-strobes status                  # check connectivity
-strobes workspaces              # list remote workspaces
-strobes threads                 # list your threads
-strobes chat                    # interactive chat (thread picker)
-strobes chat --thread <UUID> --model 18    # resume a thread (Sonnet 4.6)
-strobes bind --download         # pick + download a workspace locally
-strobes pull --workspace <UUID> # download workspace files to a folder
-strobes export -w <UUID>        # export thread transcripts (Markdown + index.md)
-strobes export -w <UUID> --format json --dir out/   # raw event JSON
-strobes update                  # self-update to the latest release
-strobes --version               # print the version
+strobes                                  # start chatting (logs you in on first run)
+strobes "find exposed admin panels on example.com"   # start with a prompt
+strobes -c                               # continue the last chat
+strobes -r                               # resume: opens the chat list (or -r <thread-id>)
+strobes -p "summarize open findings"     # print the answer and exit — scriptable
+cat scan.log | strobes -p "triage this"  # stdin is appended to the prompt
+strobes -w <workspace-id> -m 18          # pick workspace / model for this run
 ```
 
-### In-chat keys
+The agent streams in your terminal and runs its tools (shell, code, browser)
+on your machine. Type `/` for commands and `?` for shortcuts.
+
+### Commands
+
+| Command | Does |
+|---------|------|
+| `/help` | Commands and shortcuts |
+| `/new` (`/clear`) | Start a new chat |
+| `/resume` | Switch to another chat |
+| `/workspace` | Switch or bind a workspace |
+| `/model` | Choose the AI model |
+| `/findings` · `/approvals` · `/files` | Browse the workspace |
+| `/copy` · `/status` · `/thinking` · `/exit` | Copy transcript · where you are · show reasoning · quit |
+| `/login` · `/logout` | Sign in through the browser (switch org/workspace) · sign out |
+| `/jobs` | Local commands: running/background status, log tail, `x` to stop |
+| `/browser` | The agent's local browser — `open <url>` to sign in, `show`/`hide`, `attach 9222`, `close` |
+| `/permissions` | Toggle: confirm approval-gated actions yourself, or approve automatically |
+| `/api [METHOD] <path> [json]` | Call the Strobes API from the chat |
+| `/agent [id]` | Start a chat with a specialist (vuln triage, threat intel, AWS pentest, …) |
+| `/attach <file>…` | Attach images, HAR files, Burp exports or logs to your next message |
+| `/artifacts` · `get`/`open <path> [--pdf]` | Files this chat produced: list, save here, open |
+| `/evidence <ev-id>…` | The request and response behind an `ev-…` id the agent cites |
+| `/memory` · `search` · `add` · `rm` | Workspace memory (start a message with `#` to save a note) |
+| `/creds <NAME> KEY=VALUE…` | Hand the agent a credential as `NAME_KEY` env vars, kept out of history (`/creds aws <id>` for stored ones) |
+| `/background <prompt>` · `/runs` | Run a prompt in the cloud on this chat and keep going · list or cancel runs |
+| `/schedule` · `add daily 09:00 <prompt>` | Recurring runs: list, add, `pause`/`resume`/`run`/`rm` |
+| `/report` · `new [csv\|threat\|cve]` · `get <name>` | Workspace reports |
+| `/fork [title]` · `/share` | Branch this chat · copy a link for a teammate |
+| `/skills` · `show` · `push <dir>` · `enable`/`disable` | Local and organization skills |
+| `/init` | Write a starter `STROBES.md` for this project |
+| `/mcp` · `trust` · `reload` | MCP servers the agent can use from here |
+| `/hooks` | Your scripts around the agent's local tool calls |
+| `!<command>` | Run a shell command locally in the agent's sandbox |
+| `@<file>` | Mention a file from the current folder (inserts its path) |
+
+Agent skills (e.g. `/api-pentest`) appear in the same `/` menu after the built-ins.
+
+### Keys
 
 | Key | Action |
 |-----|--------|
-| `Enter` | Send message |
-| `/` | Slash-command autocomplete (Tab/Enter to complete) |
-| `^W` | Workspaces browser → Enter binds, then pick a thread |
-| `^O` | Threads browser (Enter switches) |
-| `^F` / `^A` | Findings / approvals for the bound workspace |
-| `^L` | List synced local workspace files |
-| `^E` | Open the local workspace folder in Finder / Explorer |
-| `^Y` | Copy the full transcript to the clipboard |
-| `^T` / `^R` | Toggle thinking / markdown |
-| `^C` | Cancel the running turn (or quit when idle) |
-| `Esc` | Back (chat → threads → workspaces) · PgUp/PgDn / ↑↓ scroll |
+| `Enter` · `\`+`Enter` | Send · newline (also `Ctrl-J`, or Shift/Alt+Enter on kitty-protocol terminals) |
+| `Esc` | Interrupt the agent · press twice to clear the prompt |
+| `Ctrl-C` | Interrupt · clear the prompt · press twice to quit (`Ctrl-D` quits too) |
+| `↑` / `↓` | Previous prompts (history is kept across sessions) |
+| `PgUp` / `PgDn`, mouse wheel | Scroll the chat |
+| Paste | Long pastes collapse to `[Pasted text #1 +40 lines]` and are sent in full |
+| `Ctrl-O` | Expand tool output |
+| `Ctrl-P` · `Ctrl-W` · `Ctrl-F` · `Ctrl-A` | Model · workspaces · findings · approvals |
+| `Ctrl-R` | Search prompt history |
+| `Ctrl-B` | Move the running local command to the background (the agent carries on) |
+| `Ctrl-T` · `Ctrl-Y` · `Ctrl-S` | Thinking · copy transcript · select mode (`/markdown` toggles raw markdown) |
 
-Mouse isn't captured, so terminal native **click-drag selection + copy** still
-works in the transcript. A spinner appears while a turn is running. The CLI
-checks for newer releases on chat start and suggests the update one-liner.
+### Project instructions, local skills, MCP and hooks
+
+Like Claude Code's `CLAUDE.md`, skills, `.mcp.json` and hooks:
+
+- **`STROBES.md`** — scope, rules of engagement, test accounts. Read from your
+  config dir and from the project root down to the current folder, and sent
+  with every message (edits apply on the next turn). `/init` writes a starter.
+- **Local skills** — `.strobes/skills/<slug>/SKILL.md` (front matter `name`,
+  `description`) in the project, or `skills/` in the config dir. The agent sees
+  them as `local:<slug>` and loads one on demand; the SKILL.md and its scripts
+  stay on your machine. `/skills push <slug>` uploads one to the organization.
+- **MCP servers** — `.mcp.json` (Claude Code's format, so existing files work),
+  `.strobes/mcp.json`, or `mcp.json` in the config dir; stdio and streamable
+  HTTP. Their tools reach the agent as `server · tool (MCP)` and run here.
+  A project's servers start only after `/mcp trust` (they run commands from
+  the repo); your own `mcp.json` is trusted.
+- **Hooks** — `hooks.json` in the config dir or `.strobes/hooks.json`
+  (trusted projects), in Claude Code's format. A `PreToolUse` hook that exits 2
+  blocks the call and its stderr tells the agent why — e.g. a scope guard:
+
+  ```json
+  {"hooks": {"PreToolUse": [{"matcher": "Shell|Run code",
+    "hooks": [{"type": "command", "command": "./scope-guard.sh"}]}]}}
+  ```
+
+**Strobes in other tools:** `strobes mcp serve` is an MCP server (workspaces,
+findings, threads, `ask` the agent, read-only API), using this CLI's login:
+
+```bash
+claude mcp add strobes -- strobes mcp serve
+```
+
+### Local commands, background jobs and the browser
+
+- Commands the agent runs on your machine stream their output live under the
+  call. **Ctrl-B** moves a long one (a scan, a crawl) to the background: the
+  agent gets the output so far plus the job's log file and carries on; **/jobs**
+  lists them (x stops one). **Esc** stops the running command along with the turn.
+- **/browser** shows the agent's local browser sessions and tabs.
+  `/browser open https://target.example` opens it (visible) so you can sign in —
+  the agent continues in that session. `show`/`hide` switch visible/headless,
+  `attach 9222` drives your own Chrome, `close` stops it.
+
+### Many targets at once
+
+```bash
+strobes batch -f targets.txt -j 4 "Assess {target} for exposed admin panels" --out results/
+```
+
+Runs one agent per target, N at a time, with live progress; writes
+`results/<target>.md` and a `results/index.md` summary (exit 1 if any failed).
+
+### Strobes API
+
+```bash
+strobes api /cli/workspaces/ -q limit=5            # org-relative, auth filled in
+strobes api -X POST /cli/threads/create/ -d '{"title":"x"}'
+strobes api /v1/organizations/{org}/master_key/    # explicit path
+```
+
+The chat commands work from scripts too: `strobes agents`, `strobes skills
+push ./my-skill`, `strobes memory search cors`, `strobes runs all`,
+`strobes schedule add daily 09:00 "…"`, `strobes report new csv`,
+`strobes artifacts <thread> get report.md`, `strobes evidence <thread> ev-…`,
+`strobes mcp list`.
+
+Other commands: `strobes status`, `strobes workspaces`, `strobes threads`,
+`strobes bind --download`, `strobes pull`, `strobes export -w <id>`,
+`strobes update`. `strobes chat` still opens the workspace → thread pickers.
 
 **Browser setup:** `browser_*` tools need Google Chrome / Chromium — detected
 automatically. Point at a non-standard install with `STROBES_AI_CHROME=/path/to/chrome`,
@@ -394,14 +506,13 @@ or set `STROBES_AI_BROWSER_AUTOINSTALL=1` to download Chrome for Testing on firs
 **Browser isolation:** parallel agents each get their own CDP tab within a
 shared Chrome process per workspace.
 
-**Model picker ids:** `4` Haiku 4.5 · `18` Sonnet 4.6 · `21` Opus 4.7
-(Bedrock), or your org's BYOM id.
+**Models:** `/model` lists your org's models (custom ones included);
+`/model sonnet` or `-m 46` picks one by name or id.
 
 ### Credits & tokens
 
-The status bar shows **AI credits + token usage**: the current run's usage
-while streaming (`◈ 0.036 cr · 1.8k tok`), and the session total (`◈ Σ …`)
-once idle.
+The line above the prompt shows elapsed time and tokens while the agent works;
+the footer shows this chat's total credits. `/status` has the full breakdown.
 
 ---
 

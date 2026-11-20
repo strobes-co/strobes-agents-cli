@@ -641,7 +641,7 @@ pub async fn run(
                     KeyCode::Down => app.move_cursor(false),
                     KeyCode::Enter => {
                         if let Some(tid) = app.selected_thread_id() {
-                            let _ = crate::run_chat(terminal, &tenant, profile.clone(), tid, None, None, None).await;
+                            let _ = crate::run_chat(terminal, &tenant, profile.clone(), tid, None, None, None, false).await;
                             terminal.clear()?;
                         }
                     }

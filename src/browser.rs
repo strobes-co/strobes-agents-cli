@@ -211,14 +211,125 @@ async fn start_capture(page: &Page) -> Option<CaptureGuard> {
 
 struct AgentSession {
     _browser: Browser,
-    _child: std::process::Child,
+    /// None when attached to the user's own Chrome (never kill that).
+    _child: Option<std::process::Child>,
     page: Page,
 }
 
 impl Drop for AgentSession {
     fn drop(&mut self) {
-        let _ = self._child.kill();
+        if let Some(c) = self._child.as_mut() {
+            let _ = c.kill();
+        }
     }
+}
+
+// --- User controls (/browser in the chat) ---
+
+#[derive(Clone, Default)]
+struct Mode {
+    /// None → STROBES_AI_BROWSER_HEADLESS decides.
+    headless: Option<bool>,
+    /// DevTools endpoint of the user's own Chrome to drive instead of launching one.
+    attach: Option<String>,
+}
+
+fn mode() -> &'static StdMutex<Mode> {
+    static M: OnceLock<StdMutex<Mode>> = OnceLock::new();
+    M.get_or_init(|| StdMutex::new(Mode { headless: None, attach: std::env::var("STROBES_AI_BROWSER_CDP").ok() }))
+}
+
+fn headless_now() -> bool {
+    mode().lock().unwrap().headless.unwrap_or_else(|| std::env::var("STROBES_AI_BROWSER_HEADLESS").as_deref() == Ok("1"))
+}
+
+/// Close every browser the agent opened (attached Chrome is left running).
+pub async fn close_all() -> usize {
+    let state = pool().lock().await;
+    let mut n = 0;
+    for cell in &state.sessions {
+        let mut g = cell.lock().await;
+        if g.take().is_some() {
+            n += 1;
+        }
+    }
+    n
+}
+
+/// Show (headed) or hide (headless) the agent's browser. Takes effect on the
+/// next launch, so running browsers are closed.
+pub async fn set_headless(headless: bool) -> usize {
+    mode().lock().unwrap().headless = Some(headless);
+    close_all().await
+}
+
+/// Drive the user's own Chrome (started with --remote-debugging-port).
+pub async fn attach(endpoint: &str) -> Result<String> {
+    let ep = if endpoint.chars().all(|c| c.is_ascii_digit()) {
+        format!("http://127.0.0.1:{endpoint}")
+    } else {
+        endpoint.trim_end_matches('/').to_string()
+    };
+    let v: Value = reqwest::get(format!("{ep}/json/version"))
+        .await
+        .map_err(|_| anyhow!(
+            "no Chrome DevTools at {ep}. Start Chrome with remote debugging, e.g.\n  \
+             \"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome\" --remote-debugging-port=9222 --user-data-dir=$HOME/.strobes-chrome"
+        ))?
+        .json()
+        .await
+        .unwrap_or_default();
+    close_all().await;
+    mode().lock().unwrap().attach = Some(ep.clone());
+    Ok(v.get("Browser").and_then(|b| b.as_str()).unwrap_or("Chrome").to_string())
+}
+
+pub async fn detach() {
+    mode().lock().unwrap().attach = None;
+    close_all().await;
+}
+
+/// Open the agent's browser at `url` (visible), e.g. so the user can sign in
+/// to a target; later browser_* calls reuse the session's cookies.
+pub async fn open_for_user(url: &str) -> Result<()> {
+    if mode().lock().unwrap().attach.is_none() && headless_now() {
+        set_headless(false).await;
+    }
+    let (idx, cell) = acquire_slot().await;
+    let res = async {
+        let mut g = cell.lock().await;
+        let s = ensure(&mut g, idx).await?;
+        s.page.goto(url).await.map_err(|e| anyhow!("navigate failed: {e}"))?;
+        let _ = s.page.bring_to_front().await;
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    release_slot(idx).await;
+    res
+}
+
+/// One-paragraph status for `/browser`.
+pub async fn status() -> String {
+    let m = mode().lock().unwrap().clone();
+    let how = match &m.attach {
+        Some(ep) => format!("attached to your Chrome at {ep}"),
+        None if headless_now() => "headless (hidden)".into(),
+        None => "visible window".into(),
+    };
+    let state = pool().lock().await;
+    let mut pages = Vec::new();
+    for (i, cell) in state.sessions.iter().enumerate() {
+        if let Ok(g) = cell.try_lock() {
+            if let Some(s) = g.as_ref() {
+                let url = s.page.url().await.ok().flatten().unwrap_or_default();
+                pages.push(format!("#{} {}", i + 1, if url.is_empty() { "about:blank".into() } else { url }));
+            }
+        } else {
+            pages.push(format!("#{} (busy)", i + 1));
+        }
+    }
+    let open = if pages.is_empty() { "no browser open".to_string() } else { pages.join(" · ") };
+    format!("browser: {how} · {open}")
 }
 
 struct PoolState {
@@ -294,7 +405,20 @@ async fn ensure<'a>(guard: &'a mut Option<AgentSession>, slot_index: usize) -> R
             }
         };
 
-        let headless = std::env::var("STROBES_AI_BROWSER_HEADLESS").as_deref() == Ok("1");
+        // Attached to the user's Chrome: drive it instead of launching one.
+        let attach = mode().lock().unwrap().attach.clone();
+        if let Some(ep) = attach {
+            let (browser, mut handler) = Browser::connect(&ep).await
+                .map_err(|e| anyhow!("couldn't attach to your Chrome at {ep}: {e} — /browser detach to go back"))?;
+            tokio::spawn(async move {
+                while let Some(_event) = handler.next().await {}
+            });
+            let page = browser.new_page("about:blank").await
+                .map_err(|e| anyhow!("could not open a tab in your Chrome: {e}"))?;
+            *guard = Some(AgentSession { _browser: browser, _child: None, page });
+            return Ok(guard.as_mut().unwrap());
+        }
+        let headless = headless_now();
         let profile = slot_profile_dir(slot_index);
         let _ = std::fs::create_dir_all(&profile);
 
@@ -355,7 +479,7 @@ async fn ensure<'a>(guard: &'a mut Option<AgentSession>, slot_index: usize) -> R
         // Open the agent's single tab immediately so it's ready on first use.
         let page = browser.new_page("about:blank").await
             .map_err(|e| anyhow!("could not open initial tab: {e}"))?;
-        *guard = Some(AgentSession { _browser: browser, _child: child, page });
+        *guard = Some(AgentSession { _browser: browser, _child: Some(child), page });
     }
     Ok(guard.as_mut().unwrap())
 }
