@@ -93,6 +93,10 @@ check "Esc interrupts" "Interrupted" 30
 
 echo "▸ sub-agents"
 wait_idle 60
+# The supervisor sometimes relays the sub-agent's whole report; give the
+# group room to stay on screen instead of scrolling off a 32-row window.
+tmux resize-window -t $S -x 100 -y 80 2>/dev/null
+keys "/new" Enter; sleep 3
 keys "Delegate to a sub-agent (not yourself): have it run the shell command 'echo e2e-sub-5150' and report back. Then reply in one line." Enter
 check "sub-agent gets its own group" "sub-agent$" 180
 check "its tool calls are listed in the group" "⎿  Shell\(echo e2e-sub-5150" 180
@@ -103,6 +107,7 @@ keys C-o; sleep 0.5
 check "ctrl+o expands the sub-agent transcript" "^     +⏺ " 5
 keys C-o; sleep 0.3
 
+tmux resize-window -t $S -x 100 -y 32 2>/dev/null
 echo "▸ quit"
 wait_idle 30
 keys C-c; check "first Ctrl-C asks to confirm" "Press Ctrl-C again to exit" 3
