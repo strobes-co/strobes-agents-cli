@@ -378,6 +378,8 @@ pub struct App {
     context_pct: Option<f64>,
     /// Sub-agent runs, each with its own transcript (see Block::SubAgent).
     subs: Vec<SubAgentRun>,
+    /// Something other than reply text happened since the last token.
+    stream_break: bool,
     /// Duration of the tool result about to be attached (one-shot).
     next_result_ms: Option<u64>,
     /// Latest output lines of running local commands, by tool-call id.
@@ -566,6 +568,7 @@ impl App {
             status: "connecting…".into(),
             connected: false,
             running: false,
+            stream_break: false,
             show_thinking: false,
             markdown: true,
             show_full_code: false,
@@ -864,8 +867,16 @@ impl App {
                 return;
             }
         }
+        let resumed = std::mem::take(&mut self.stream_break);
         match &mut self.stream {
-            Some(s) if s.thinking == thinking => s.buf.push_str(&text),
+            Some(s) if s.thinking == thinking => {
+                // The reply picked up again after other work (a sub-agent ran
+                // meanwhile): join like separate segments, not glued words.
+                if resumed {
+                    s.buf.push_str(segment_joint(&s.buf, &text));
+                }
+                s.buf.push_str(&text)
+            }
             _ => {
                 self.flush_stream();
                 self.stream = Some(Stream {
@@ -1178,9 +1189,14 @@ impl App {
     fn on_stream(&mut self, item: StreamItem) {
         let agent = item.agent.clone().unwrap_or_default();
         if is_main_agent(&agent) || item.kind == "approval" {
+            if !matches!(item.kind.as_str(), "token" | "thinking") {
+                self.stream_break = true;
+            }
             self.on_stream_main(item);
         } else {
             self.in_agent_ctx(&agent, |s| s.on_stream_main(item));
+            // Set after: the sub-agent's own text goes through feed() too.
+            self.stream_break = true;
         }
     }
 
@@ -4426,6 +4442,23 @@ mod input_editor_tests {
             local,
             task_id: None, call_id: None,
         }
+    }
+
+    #[test]
+    fn reply_resuming_after_a_sub_agent_is_not_glued() {
+        let mut a = App::new("t".into(), "http://x".into(), "ten".into(), "org".into());
+        a.on_app_event(AppEvent::RunStarted);
+        let tok = |agent: &str, t: &str| AppEvent::Stream(StreamItem {
+            kind: "token".into(), agent: Some(agent.into()), text: Some(t.into()),
+            tool_name: None, detail: None, status: None, local: false, task_id: None, call_id: None,
+        });
+        a.on_app_event(tok("Strobes AI Supervisor", "Waiting on its report."));
+        a.on_app_event(tok("Web Pentest Agent", "working"));
+        a.on_app_event(tok("Strobes AI Supervisor", "Sub-agent ran it."));
+        a.on_app_event(tok("Strobes AI Supervisor", " Done"));
+        let text = a.transcript_plaintext();
+        assert!(!text.contains("report.Sub-agent"), "{text}");
+        assert!(text.contains("ran it. Done"), "{text}");
     }
 
     #[test]
